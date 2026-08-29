@@ -18,10 +18,11 @@ from mcp.server.fastmcp import FastMCP
 ROLE = (sys.argv[1] if len(sys.argv) > 1 else "").strip().lower()
 if ROLE not in {
     "billingbear", "replio", "clickup", "messaging", "esound-admin", "lyra-admin",
+    "esound-identity",
 }:
     raise SystemExit(
         "usage: support_mcp_simulator.py "
-        "billingbear|replio|clickup|messaging|esound-admin|lyra-admin"
+        "billingbear|replio|clickup|messaging|esound-admin|lyra-admin|esound-identity"
     )
 
 mcp = FastMCP(ROLE)
@@ -857,3 +858,22 @@ if ROLE == "messaging":
 
 if __name__ == "__main__":
     mcp.run()
+
+
+if ROLE == "esound-identity":
+
+    @mcp.tool()
+    async def delete_account(email: str) -> dict[str, Any]:
+        """SIMULATOR ONLY. Never destroys anything; mirrors the real contract.
+
+        `deleted` is the only field that says what happened, and the no-account
+        answer deliberately keeps `ok` false: the real endpoint used to answer
+        a 404 with ok=true, which read as "your account has been deleted" to a
+        caller trusting the generic success flag.
+        """
+        address = str(email or "").strip().lower()
+        if address.endswith("@unknown.test"):
+            return {"ok": False, "deleted": False, "reason": "no_account",
+                    "email": address, "simulated": True}
+        return {"ok": True, "deleted": True, "user_id": "sim-user",
+                "email": address, "simulated": True, "externalMutation": False}

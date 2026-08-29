@@ -1576,6 +1576,20 @@ def _cancellation_phase(thread: Any, message: str) -> str:
     return "ask"
 
 
+# Deletion is permanent, so the gate is the same shape as the cancellation one
+# and for the same reason: the word "yes" alone is not an order. The vault's
+# B-DELETE demands the deletion-pending tag AND a previous outbound that asked
+# AND a last inbound that IS the confirmation.
+def _deletion_phase(thread: Any, message: str) -> str:
+    if (
+        "deletion-pending" in _thread_tags(thread)
+        and _we_asked_to_confirm(thread)
+        and _is_confirmed(message)
+    ):
+        return "execute"
+    return "ask"
+
+
 def _recent_exchange(thread: Any, limit: int = 4) -> list[dict[str, str]]:
     """The last few turns, trimmed, as plain direction/text pairs.
 
@@ -3223,10 +3237,46 @@ def _fallback_reply(state: SupportState) -> str:
             "For this account operation, write from its verified email address and describe the exact change requested."
         )
     if state.outcome == "account_delete_confirmation_required":
+        # The subscription warning is part of the same sentence on purpose:
+        # someone who deletes the account without cancelling the store
+        # subscription keeps being charged for a product they can no longer
+        # reach, and after the deletion we cannot even look them up.
+        warn = state.facts.get("delete_warns_active_subscription")
+        if warn:
+            return (
+                "La cancellazione è permanente e irreversibile: perderai playlist "
+                "e libreria. Attenzione: NON disdice l’abbonamento, che va "
+                "annullato a parte nello store dove l’hai preso, altrimenti "
+                "continuerà ad addebitare. Rispondi CONFERMO per procedere."
+                if italian else
+                "Deleting is permanent and irreversible: you will lose your "
+                "playlists and library. Note it does NOT cancel your "
+                "subscription, which has to be cancelled separately in the "
+                "store you bought it from or it keeps charging you. Reply "
+                "CONFERMO to go ahead."
+            )
         return (
-            "Conferma esplicitamente che vuoi eliminare definitivamente l’account e i relativi dati."
+            "La cancellazione è permanente e irreversibile: perderai playlist e "
+            "libreria. Rispondi CONFERMO per procedere."
             if italian else
-            "Please explicitly confirm that you want to permanently delete the account and its associated data."
+            "Deleting is permanent and irreversible: you will lose your "
+            "playlists and library. Reply CONFERMO to go ahead."
+        )
+    if state.outcome == "account_deleted":
+        return (
+            "Fatto: l’account e i dati associati sono stati cancellati. "
+            "Riceverai un’email di conferma."
+            if italian else
+            "Done: the account and its associated data have been deleted. You "
+            "will receive a confirmation email."
+        )
+    if state.outcome == "account_delete_no_account":
+        return (
+            "Non risulta nessun account registrato con questo indirizzo, quindi "
+            "non c’è nulla da cancellare."
+            if italian else
+            "There is no account registered with this address, so there is "
+            "nothing to delete."
         )
     if state.outcome == "duplicate_refund_simulated":
         return (
@@ -3617,6 +3667,9 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 # Receipts a customer acts on: a refund, a cancellation, a created task, a
 # handoff. Those sentences stay deterministic.
 _MUTATION_KINDS = frozenset({
+    # The most irreversible of them all: after this the customer's account is
+    # gone and we cannot even look them up to check what we told them.
+    "account_deletion",
     "duplicate_refund", "subscription_cancel", "subscription_refund",
     "refund_link", "task_create", "task_comment", "task_link", "task_reopen",
     "owner_notified",
@@ -3920,7 +3973,10 @@ async def _compose_local(
         return await _fallback_in_language(
             agent, event, state, session_id, "billing_policy",
         )
-    if state.outcome == "account_delete_confirmation_required":
+    if state.outcome in {
+        "account_deleted", "account_delete_no_account",
+        "account_delete_confirmation_required",
+    }:
         # The one sentence that stands between a customer and a deleted
         # account. Measured with the composer live: given this outcome the
         # model wrote "Certo, posso aiutarti a cancellare il tuo account. Per
@@ -4792,6 +4848,88 @@ async def _refuse_to_repeat(
     )
 
 
+def _receipt_payloads(receipt: Any) -> list[dict[str, Any]]:
+    """Every dict an MCP receipt can hide its fields in, outermost first."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(receipt, dict):
+        return out
+    out.append(receipt)
+    structured = receipt.get("structuredContent")
+    if isinstance(structured, dict):
+        out.append(structured)
+    for item in receipt.get("content") or []:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            out.append(parsed)
+    return out
+
+
+async def _delete_account(pool: Any, state: SupportState, email: str) -> None:
+    """Run the deletion, and say only what the receipt proves.
+
+    The tool reports the OUTCOME in ``deleted``, not the transport: a call that
+    returns 200 without deleting anything is not a deletion, and the eSound
+    purge is known to be able to stop half way (an identity left locked out
+    while the app row is already gone, so the customer cannot even re-register
+    with the same address). So a success sentence is emitted only for
+    ``deleted: true``, and anything else keeps the thread open for a person.
+    """
+    await _record_action(
+        state, pool, "esound-identity",
+        ("esound_identity_delete_account", "delete_account"),
+        {"email": email},
+        "account_deletion",
+    )
+    receipt = next(
+        (a.get("receipt") for a in reversed(state.actions)
+         if a.get("kind") == "account_deletion"),
+        None,
+    )
+    # `deleted` is read explicitly and nothing else is trusted. The generic
+    # success flag keys on `ok`, and the endpoint answers "there was no such
+    # account" with ok=true - which is honest about the CALL and says nothing
+    # about a deletion. Measured in test: keying on it produced "Done: the
+    # account and its associated data have been deleted" for an account that
+    # had never existed.
+    reason = ""
+    deleted = False
+    for payload in _receipt_payloads(receipt):
+        if not reason:
+            reason = str(payload.get("reason") or "")
+        if payload.get("deleted") is True:
+            deleted = True
+    if deleted:
+        state.decision = "self_help"
+        state.outcome = "account_deleted"
+        state.facts["account_deleted"] = True
+        await _record_tags(state, pool, ["account", "account-deleted"])
+        return
+    if reason == "no_account":
+        # Nothing was destroyed: there is no account on that address. Saying
+        # "deleted" here would be a fabrication about the one thing the
+        # customer cannot check for themselves.
+        state.decision = "self_help"
+        state.outcome = "account_delete_no_account"
+        return
+    state.decision = "human"
+    state.outcome = "account_delete_failed_human"
+    state.human_reason = (
+        "confirmed deletion request, but the deletion endpoint did not report "
+        f"the account as deleted ({reason or 'no reason returned'})"
+    )
+    state.instructions.append(
+        "Do NOT say the account was deleted: it was not confirmed."
+    )
+
+
 async def _queue_for_human(pool: Any, state: SupportState) -> bool:
     """Tag the thread and put it in the human queue. Idempotent per turn.
 
@@ -5226,6 +5364,19 @@ async def run(
             state.intent = "cancel_subscription"
             state.facts["intent_from_pending_cancellation"] = True
 
+        # The same recovery for a pending DELETION. A bare "CONFERMO" carries
+        # no topic of its own, so without this the confirmation we asked for
+        # comes back, classifies as `general`, and is answered with "tell me
+        # more about the behaviour, device and app version" - to someone who
+        # has just authorised the destruction of their account.
+        if (
+            "deletion-pending" in _thread_tags(thread)
+            and _we_asked_to_confirm(thread)
+            and state.intent in ("general", "acknowledgement", "resolved_confirmation")
+        ):
+            state.intent = "account_delete"
+            state.facts["intent_from_pending_deletion"] = True
+
         # A bare email or account id is an answer to us. Recover the topic
         # from what was actually being discussed, never from the fragment.
         if state.intent == "general" and _identifier_only(message):
@@ -5430,36 +5581,54 @@ async def run(
                 pool, state,
                 "esound/procedures/customer-response/user-account-management.md",
             )
-            formal = bool(re.search(
-                r"\b(?:gdpr|right to erasure|legal request|cancellazione dati formale)\b",
-                message,
-                re.I,
-            ))
-            if formal:
-                await _read_policy(
-                    pool, state,
-                    "esound/procedures/customer-response/anti-fabrication.md",
-                )
-                state.decision = "human"
-                state.outcome = "account_delete_formal_human"
-                state.human_reason = "formal GDPR/right-to-erasure request"
-            elif not sender_email:
+            await _read_policy(
+                pool, state,
+                "esound/procedures/customer-response/triage-workflow.md",
+            )
+            # GDPR wording does NOT make this a legal matter to escalate.
+            # triage-workflow.md, dated and signed: "una richiesta di
+            # CANCELLARE il proprio account -- anche se cita GDPR / Article 17
+            # / right to erasure -- NON fa scattare l'HARD STOP legale. E' una
+            # B-DELETE: ESEGUI la cancellazione." Silence and hand-off were
+            # both explicitly ruled out there; the controller used to do both.
+            if not sender_email:
+                # Ownership is proved by the TRANSPORT-authenticated sender and
+                # by nothing else: `_extract_verified_sender_email` reads only
+                # the channel's own sender fields, so an address typed into the
+                # body, a store review or a DM can never satisfy this. That is
+                # the whole gate - a separate channel allowlist would only be a
+                # second, weaker copy of it.
                 state.decision = "ask_information"
                 state.outcome = "account_delete_identity_required"
-            elif not _is_confirmed(message):
+            elif _deletion_phase(thread, message) != "execute":
                 state.decision = "ask_information"
                 state.outcome = "account_delete_confirmation_required"
-            else:
-                # The current first-class esound-admin MCP exposes lookup and
-                # billing operations, not the isolated IdentityServer delete
-                # endpoint.  After verified ownership + explicit confirmation,
-                # unavailable authority is a legitimate human boundary.
-                state.decision = "human"
-                state.outcome = "account_delete_execution_human"
-                state.human_reason = (
-                    "verified account deletion request; delete endpoint is not exposed "
-                    "through the current first-class MCP"
+                await _record_tags(state, pool, ["account", "deletion-pending"])
+                # The subscription guard: deleting the account does not stop a
+                # store subscription, and someone who deletes without
+                # cancelling keeps being charged for a product they can no
+                # longer reach.
+                billing = await _billing_lookup(
+                    pool, app_user_id, sender_email, state.tenant,
                 )
+                premium, store, _version, _subs = _customer_lookup_state(billing)
+                state.facts["isPremium"] = premium
+                state.facts["store"] = store
+                if premium:
+                    state.facts["delete_warns_active_subscription"] = True
+            elif _money_execution_blocked(state):
+                # The request was inferred from the wording, not stated. An
+                # inferred label may reach this route and explain it; it may
+                # never destroy an account on an inference.
+                state.decision = "human"
+                state.outcome = "account_delete_inferred_intent_human"
+                state.human_reason = (
+                    "confirmed deletion, but the request was inferred from the "
+                    "wording rather than stated: a person confirms before an "
+                    "account is destroyed"
+                )
+            else:
+                await _delete_account(pool, state, sender_email)
         elif state.intent == "account_change":
             await _read_policy(
                 pool, state,

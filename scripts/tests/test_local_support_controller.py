@@ -553,7 +553,9 @@ class _Doubles:
         create_ok: bool = True,
         link_ok: bool = True,
         respond_results: list[dict[str, Any]] | None = None,
+        deletion_result: dict[str, Any] | None = None,
     ) -> None:
+        self._deletion_result = deletion_result
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._thread = thread or {}
         self._customer = customer
@@ -583,6 +585,12 @@ class _Doubles:
             if thread_id in self._links:
                 payload["external_task_id"] = self._links[thread_id]
             return payload
+
+        async def delete_account(email: str) -> dict[str, Any]:
+            self._log("esound_identity_delete_account", email=email)
+            if self._deletion_result is not None:
+                return self._deletion_result
+            return {"ok": True, "deleted": True, "user_id": "u-1", "email": email}
 
         async def vault_read_note(path: str) -> dict[str, Any]:
             self._log("vault_read_note", path=path)
@@ -669,6 +677,9 @@ class _Doubles:
             "vault": _Toolkit({"vault_read_note": vault_read_note}),
             "billingbear": _Toolkit({
                 "billingbear_get_v1_customers_by_appUserId": customers,
+            }),
+            "esound-identity": _Toolkit({
+                "esound_identity_delete_account": delete_account,
             }),
             "clickup": _Toolkit({
                 "clickup_get_workspace_tasks": workspace_tasks,
@@ -907,8 +918,16 @@ async def t_feature_request(_ctx: TestContext) -> None:
     assert "roadmap includes" not in low and "we will add" not in low, output["reply"]
 
 
-@test("local_support_controller", "deletion needs verified sender then explicit confirmation")
+@test("local_support_controller", "a deletion is executed, but only on the full three-part gate")
 async def t_account_delete_gates(_ctx: TestContext) -> None:
+    """triage-workflow.md B-DELETE, in order.
+
+    Deletion is permanent, so the word "yes" alone is never an order: the gate
+    is the deletion-pending tag AND a previous outbound that asked AND a last
+    inbound that IS the confirmation. Once all three hold, the controller runs
+    it - the vault says "ESEGUI la cancellazione (autonoma, ha gia' la
+    capability)" and handing it to a person instead was the deviation.
+    """
     # Body prose is not ownership proof: no transport-verified sender, no gate.
     unverified = _Doubles()
     first = await _drive(
@@ -916,28 +935,80 @@ async def t_account_delete_gates(_ctx: TestContext) -> None:
         thread_id="t-del-1",
     )
     assert first["outcome"] == "account_delete_identity_required", first
-    assert first["decision"] == "ask_information", first
-    assert "replio_threads_mark_for_human" not in unverified.names, unverified.names
+    assert "esound_identity_delete_account" not in unverified.names, unverified.names
 
-    # Verified sender, but no explicit confirmation yet.
+    # Verified sender, but nothing has been asked yet: phase 1, and the thread
+    # is tagged so phase 2 can recognise itself later.
     verified = _Doubles(thread={"author_email": "owner@example.com"})
     second = await _drive(verified, "Please delete my account", thread_id="t-del-2")
     assert second["outcome"] == "account_delete_confirmation_required", second
-    assert second["decision"] == "ask_information", second
-    assert "replio_threads_mark_for_human" not in verified.names, verified.names
+    assert "esound_identity_delete_account" not in verified.names, verified.names
     assert "permanent" in second["reply"].lower(), second["reply"]
+    assert "deletion-pending" in doubles_tags(verified), verified.calls
 
-    # Verified sender plus confirmation: authority is unavailable, so a human
-    # takes it - and the reply must never claim the account was deleted.
-    confirmed = _Doubles(thread={"author_email": "owner@example.com"})
+    # A confirmation with no prior ask is still phase 1: "I confirm" arriving
+    # first is not an answer to a question nobody put.
+    premature = _Doubles(thread={"author_email": "owner@example.com"})
     third = await _drive(
-        confirmed, "I confirm: delete my account permanently.", thread_id="t-del-3",
+        premature, "I confirm: delete my account permanently.", thread_id="t-del-3",
     )
-    assert third["outcome"] == "account_delete_execution_human", third
-    assert third["decision"] == "human", third
-    assert "human_handoff" in _succeeded_kinds(third), third["actions"]
-    _assert_human_tags(confirmed, "account")
-    assert "deleted" not in third["reply"].lower(), third["reply"]
+    assert third["outcome"] == "account_delete_confirmation_required", third
+    assert "esound_identity_delete_account" not in premature.names, premature.names
+
+    # All three: tag, our question, their confirmation. Now it runs.
+    ready = _Doubles(thread={
+        "author_email": "owner@example.com",
+        "tags": ["account", "deletion-pending"],
+        "messages": [
+            {"direction": "inbound", "body_text": "Please delete my account"},
+            {"direction": "outbound",
+             "body_text": "Deleting is permanent and irreversible. Reply CONFERMO to go ahead."},
+            {"direction": "inbound", "body_text": "CONFERMO"},
+        ],
+    })
+    done = await _drive(ready, "CONFERMO", thread_id="t-del-4")
+    assert done["outcome"] == "account_deleted", done
+    assert "esound_identity_delete_account" in ready.names, ready.names
+    assert ready.args_for("esound_identity_delete_account")[0]["email"] == "owner@example.com"
+    assert "replio_threads_mark_for_human" not in ready.names, ready.names
+    assert "account-deleted" in doubles_tags(ready), ready.calls
+
+    # `deleted: false` is not a deletion. The customer is told the truth and
+    # the reply may never say the account is gone.
+    absent = _Doubles(
+        thread={
+            "author_email": "owner@example.com",
+            "tags": ["deletion-pending"],
+            "messages": [
+                {"direction": "inbound", "body_text": "Please delete my account"},
+                {"direction": "outbound", "body_text": "Reply CONFERMO to go ahead."},
+                {"direction": "inbound", "body_text": "CONFERMO"},
+            ],
+        },
+        deletion_result={"ok": False, "deleted": False, "reason": "no_account"},
+    )
+    missing = await _drive(absent, "CONFERMO", thread_id="t-del-5")
+    assert missing["outcome"] == "account_delete_no_account", missing
+    assert "account-deleted" not in doubles_tags(absent), absent.calls
+
+    # An endpoint that neither deletes nor explains itself is a person's
+    # problem, and the reply must not claim success.
+    broken = _Doubles(
+        thread={
+            "author_email": "owner@example.com",
+            "tags": ["deletion-pending"],
+            "messages": [
+                {"direction": "inbound", "body_text": "Please delete my account"},
+                {"direction": "outbound", "body_text": "Reply CONFERMO to go ahead."},
+                {"direction": "inbound", "body_text": "CONFERMO"},
+            ],
+        },
+        deletion_result={"ok": False, "deleted": False},
+    )
+    failed = await _drive(broken, "CONFERMO", thread_id="t-del-6")
+    assert failed["outcome"] == "account_delete_failed_human", failed
+    assert failed["decision"] == "human", failed
+    assert "deleted" not in failed["reply"].lower(), failed["reply"]
 
 
 def doubles_tags(doubles: _Doubles) -> list[str]:
@@ -959,19 +1030,40 @@ def _assert_human_tags(doubles: _Doubles, *expected: str) -> None:
     assert not missing, (missing, tags)
 
 
-@test("local_support_controller", "formal GDPR skips the confirmation gate and goes to a human")
+@test("local_support_controller", "a GDPR erasure request is served, not escalated")
 async def t_formal_gdpr(_ctx: TestContext) -> None:
-    doubles = _Doubles()
-    output = await _drive(
-        doubles, "This is a formal GDPR right to erasure request.", thread_id="t-gdpr",
-    )
+    """triage-workflow.md, dated and signed by the owner:
 
-    assert output["outcome"] == "account_delete_formal_human", output
-    assert output["decision"] == "human", output
-    assert "human_handoff" in _succeeded_kinds(output), output["actions"]
-    # A formal legal request must not be gated behind "please confirm".
-    assert "anti-fabrication.md" in " ".join(output["policy_paths"]), output["policy_paths"]
-    assert "legal advice" not in output["reply"].lower(), output["reply"]
+        "una richiesta di CANCELLARE il proprio account/dati -- anche se cita
+         GDPR / Article 17 / right to erasure -- NON fa scattare l'HARD STOP
+         legale. E' una B-DELETE: ESEGUI la cancellazione. NON silenziare,
+         NON solo-notificare."
+
+    The controller used to route exactly this to a human, which is the one
+    thing the rule forbids. Citing the law changes nothing about the route: it
+    is the same B-DELETE gate as any other deletion request.
+    """
+    # No verified sender: identity first, as for any deletion - but never a
+    # legal escalation and never silence.
+    anonymous = _Doubles()
+    output = await _drive(
+        anonymous, "This is a formal GDPR right to erasure request.",
+        thread_id="t-gdpr",
+    )
+    assert output["intent"] == "account_delete", output
+    assert output["outcome"] == "account_delete_identity_required", output
+    assert output["decision"] != "human", output
+    assert "replio_threads_mark_for_human" not in anonymous.names, anonymous.names
+    assert output["reply"], "a data-deletion request is never answered with silence"
+
+    # From the account's own address, it walks the ordinary gate.
+    verified = _Doubles(thread={"author_email": "owner@example.com"})
+    asked = await _drive(
+        verified, "Under Article 17 GDPR I request erasure of my account.",
+        thread_id="t-gdpr-2",
+    )
+    assert asked["outcome"] == "account_delete_confirmation_required", asked
+    assert "replio_threads_mark_for_human" not in verified.names, verified.names
 
 
 @test("local_support_controller", "password reset is a blocked capability, not an invented action")
@@ -1551,8 +1643,8 @@ async def t_draft_rung_is_narrow(_ctx: TestContext) -> None:
     os.environ[lsc._DRAFTS_ENV] = "1"
     os.environ.pop(lsc._WRITES_ENV, None)
     try:
-        # A confirmed deletion request routes to a human, which on a full write
-        # rung would tag the thread AND call mark_for_human for real.
+        # A deletion request on a fresh thread is phase 1, which on a full
+        # write rung would tag the thread for real.
         result = await lsc.run(
             agent=SimpleNamespace(_mcp=pool, model=_Model()),
             event={"slug": "replio-thread", "model": ""},
@@ -1569,9 +1661,13 @@ async def t_draft_rung_is_narrow(_ctx: TestContext) -> None:
             os.environ[lsc._DRAFTS_ENV] = previous
 
     output = json.loads(result.text)
-    assert output["decision"] == "human", output
-    # Nothing was executed: no handoff, no tag, no patch.
-    assert not any(a.get("success") for a in output["actions"]), output["actions"]
+    assert output["outcome"] == "account_delete_confirmation_required", output
+    # Nothing was executed: no tag, no patch, and above all no deletion.
+    assert not any(
+        a.get("success") and a.get("kind") != "customer_draft"
+        for a in output["actions"]
+    ), output["actions"]
+    assert "esound_identity_delete_account" not in doubles.names, doubles.names
     assert "replio_threads_mark_for_human" not in doubles.names, doubles.names
     assert "replio_threads_tags_add" not in doubles.names, doubles.names
 

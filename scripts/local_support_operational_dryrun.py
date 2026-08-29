@@ -592,7 +592,7 @@ CASES = (
         "italian-deletion-asks-confirmation-in-italian",
         "Thread sim-it-delete: voglio cancellare il mio account, per favore.",
         "ask_information",
-        forbidden_tools=("clickup_", "billingbear_", "mark_for_human"),
+        forbidden_tools=("clickup_", "mark_for_human", "esound_identity_"),
         # Stem, not the exact form: "confermi" and "confermare" are the same
         # assertion and the test was failing on inflection alone.
         reply_any=("conferm", "definitiv"),
@@ -636,27 +636,36 @@ CASES = (
         "account-delete-needs-confirmation",
         "Thread sim-delete: Please delete my account.",
         "ask_information",
-        forbidden_tools=("clickup_", "mark_for_human", "billingbear_"),
+        # The lookup is the subscription guard, which the policy requires:
+        # deleting the account does not stop a store subscription, and after
+        # the deletion we cannot look them up to tell them so.
+        forbidden_tools=("clickup_", "mark_for_human", "esound_identity_"),
         reply_any=("confirm", "permanent"),
         forbidden_reply=("deleted", "team will"),
     ),
     OperationalCase(
-        "account-delete-confirmed-human",
+        "account-delete-confirmed-a-confirmation-alone-is-still-phase-1",
         "Thread sim-delete-confirm: I confirm: delete my account permanently.",
-        "human",
-        expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
-        forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("colleague", "teammate", "collega", "person", "someone"),
-        forbidden_reply=("specialist human review", "account was deleted", "we deleted"),
+        "ask_information",
+        # Deletion is permanent, so "I confirm" arriving before we asked
+        # anything is not an order: the deletion-pending tag and our own
+        # question are the other two legs of the gate.
+        forbidden_tools=("clickup_", "esound_identity_", "mark_for_human"),
+        reply_any=("confirm", "permanent"),
+        forbidden_reply=("account was deleted", "we deleted", "specialist human review"),
     ),
     OperationalCase(
-        "formal-gdpr-human",
+        "formal-gdpr-is-served-not-escalated",
         "Thread sim-gdpr: This is a formal GDPR right-to-erasure request.",
-        "human",
-        expected_tools=("replio_threads_mark_for_human", "replio_threads_tags_add"),
-        forbidden_tools=("clickup_", "billingbear_"),
-        reply_any=("colleague", "teammate", "collega", "person", "someone"),
-        forbidden_reply=("specialist human review", "account was deleted", "legal advice"),
+        "ask_information",
+        # triage-workflow.md, signed by the owner: a request to delete one's
+        # own account does NOT trigger the legal hard stop even when it cites
+        # the GDPR. It is a B-DELETE and it is served. Escalating it, or
+        # answering with silence, are the two things the rule rules out.
+        forbidden_tools=("clickup_", "mark_for_human", "esound_identity_"),
+        forbidden_reply=(
+            "specialist human review", "account was deleted", "legal advice",
+        ),
     ),
     OperationalCase(
         "refund-apple-goes-to-apple",
@@ -1020,7 +1029,7 @@ def _clone_and_patch_db(
         simulator = Path(__file__).resolve().with_name("support_mcp_simulator.py")
         for name in (
             "billingbear", "replio", "clickup", "messaging",
-            "esound-admin", "lyra-admin",
+            "esound-admin", "lyra-admin", "esound-identity",
         ):
             dst.execute(
                 """
