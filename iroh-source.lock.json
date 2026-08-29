@@ -1,0 +1,12 @@
+{
+  "lock_version": 1,
+  "package": "iroh",
+  "package_version": "0.35.0",
+  "repository": "https://github.com/n0-computer/iroh-ffi",
+  "source_commit": "4b19fa519f0871a7336772a571b2f0e8091d0b55",
+  "archive_url": "https://codeload.github.com/n0-computer/iroh-ffi/tar.gz/4b19fa519f0871a7336772a571b2f0e8091d0b55",
+  "archive_sha256": "645f7484d688e8f45574ce85c5c13274a6b63bd11bafe86e0ba233e185083b18",
+  "rust_toolchain": "1.83.0",
+  "maturin_version": "1.9.6",
+  "uniffi_bindgen_version": "0.28.3"
+}

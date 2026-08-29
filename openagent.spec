@@ -21,6 +21,7 @@ reuse that cache and start in under a second.
 """
 
 import os
+import platform
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import (
@@ -42,13 +43,20 @@ import jinja2  # noqa: F401 — src.workflow.templating
 import markupsafe  # noqa: F401 — jinja2's required runtime dep
 import groq  # noqa: F401 — src.models.providers.groq (optional provider SDK, must ship in bundle)
 import litellm  # noqa: F401 — TTS / STT dispatch (channels/tts.py, channels/voice.py)
-import faster_whisper  # noqa: F401 — local-first STT fallback
 import psutil  # noqa: F401 — cross-platform host telemetry (api/system.py)
 import iroh  # noqa: F401 — P2P transport (src.network.iroh_node) — Rust FFI dylib must be bundled
 import pydantic  # noqa: F401 — runtime calls importlib.metadata.version("pydantic")
 import email_validator  # noqa: F401 — pydantic.EmailStr validation calls version("email-validator")
 import telegram  # noqa: F401 — Telegram bridge is a first-class production channel
 import numpy  # noqa: F401 — src.memory.semantic_index cosine (fast path; a pure-Python fallback covers a missing numpy, but bundle it for speed)
+
+# Upstream CTranslate2 and Piper publish no Windows ARM64 distributions. The
+# dependency markers intentionally keep local STT/TTS off that one platform;
+# cloud voice remains available through LiteLLM. Everywhere else, retain the
+# strict build guard so a missing local Whisper runtime still aborts packaging.
+_windows_arm64 = sys.platform == "win32" and platform.machine().upper() == "ARM64"
+if not _windows_arm64:
+    import faster_whisper  # noqa: F401 — local-first STT fallback
 
 # ``collect_all`` returns (datas, binaries, hiddenimports) for the WHOLE numpy
 # package — the only reliable way to bundle its C extensions for numpy 2.x
@@ -135,9 +143,10 @@ hiddenimports = [
     # src.models.providers.groq.groq — must be bundled.
     *collect_submodules("groq"),
     # Voice: faster-whisper (local STT) loaded lazily inside _load_local_model;
-    # ctranslate2 is its native runtime backend.
-    *collect_submodules("faster_whisper"),
-    *collect_submodules("ctranslate2"),
+    # ctranslate2 is its native runtime backend. Both are deliberately absent
+    # only from Windows ARM64, matching the package markers above.
+    *([] if _windows_arm64 else collect_submodules("faster_whisper")),
+    *([] if _windows_arm64 else collect_submodules("ctranslate2")),
     # psutil ships per-OS C extension modules (_psutil_osx, _psutil_windows,
     # _psutil_linux) loaded via getattr/importlib — explicit collect so the
     # platform-correct one ends up in the frozen bundle.

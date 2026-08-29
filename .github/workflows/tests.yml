@@ -36,3 +36,99 @@ jobs:
 
       - name: Run end-to-end suite
         run: bash scripts/test_openagent.sh
+
+  windows-arm64-native-release:
+    name: Windows ARM64 native release
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Acquire checksum-pinned Windows ARM64 inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST_TOOLS_WHEEL="$RUNNER_TEMP/openagent_host_tools-0.1.2-py3-none-any.whl"
+          python scripts/acquire-host-tools.py \
+            --platform win32-arm64 \
+            --output "$RUNNER_TEMP/openagent-host-tools" \
+            --wheel-output "$HOST_TOOLS_WHEEL"
+          python scripts/acquire-iroh-source.py --output "$RUNNER_TEMP/iroh-ffi"
+          echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/win32-arm64" >> "$GITHUB_ENV"
+
+      - name: Build and expose native Iroh ARM64 wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/build-iroh-wheel.py \
+            --source "$RUNNER_TEMP/iroh-ffi" \
+            --output "$RUNNER_TEMP/iroh-wheels"
+          echo "PIP_FIND_LINKS=$RUNNER_TEMP/iroh-wheels" >> "$GITHUB_ENV"
+
+      - name: Install and verify native server dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --only-binary cryptography,iroh -e ".[all]" pyinstaller
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+          import platform
+
+          import cryptography
+          import iroh
+          import litellm
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          assert platform.machine().upper() == "ARM64"
+          assert cryptography.__version__ == "46.0.3"
+          assert pathlib.Path(iroh.__file__).is_file()
+          assert pathlib.Path(litellm.__file__).is_file()
+          key = Ed25519PrivateKey.generate()
+          message = b"openagent-windows-arm64-ci"
+          key.public_key().verify(key.sign(message), message)
+          assert importlib.util.find_spec("faster_whisper") is None
+          assert importlib.util.find_spec("piper") is None
+          print(iroh.__file__)
+          PY
+
+      - name: Build Node MCPs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for mcp_dir in src/mcp/servers/web-search src/mcp/servers/editor src/mcp/servers/messaging src/mcp/servers/vault; do
+            (cd "$mcp_dir" && npm ci --silent && npm run build --silent)
+          done
+          (cd src/mcp/servers/agent-in-chrome/host && npm ci --silent)
+
+      - name: Build and stage the frozen Windows ARM64 server
+        shell: bash
+        env:
+          OPENAGENT_RELEASE_BUILD: '1'
+        run: |
+          set -euo pipefail
+          pyinstaller openagent.spec --clean --noconfirm
+          cp "$OPENAGENT_HOST_TOOLS_BUNDLE/node.exe" dist/node.exe
+          cp "$OPENAGENT_HOST_TOOLS_BUNDLE/openagent-computer-control.exe" dist/openagent-computer-control.exe
+
+      - name: Verify exact native ARM64 release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/package-release.sh openagent dist
+          version=$(python -c 'from src import __version__; print(__version__)')
+          test -f "dist/openagent-$version-windows-arm64.zip"
+          test -f "dist/openagent-$version-windows-arm64.zip.sha256"
+          test ! -e "dist/openagent-$version-windows-x64.zip"
+          bash scripts/test-release-package.sh dist

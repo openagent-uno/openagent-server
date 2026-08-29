@@ -12,7 +12,7 @@
 #               sign-notarize-macos.sh. We just shasum it.
 #   Linux     — tar the bare binary into ``<app>-<ver>-linux-<arch>.tar.gz``
 #               and shasum the archive.
-#   Windows   — zip the ``.exe`` into ``<app>-<ver>-windows-x64.zip`` and
+#   Windows   — zip the ``.exe`` into ``<app>-<ver>-windows-<arch>.zip`` and
 #               shasum the archive. Works under Git Bash on GHA's
 #               windows-latest runner (tar/sha256sum are present; we
 #               shell out to PowerShell for Compress-Archive).
@@ -35,18 +35,37 @@ case "${RUNNER_OS:-$(uname -s)}" in
     *) echo "Unsupported OS: ${RUNNER_OS:-$(uname -s)}" >&2; exit 1 ;;
 esac
 
-ARCH_RAW="$(uname -m)"
-case "$ARCH_RAW" in
-    x86_64|amd64)  ARCH="x64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
-    *) ARCH="$ARCH_RAW" ;;
-esac
+normalize_arch() {
+    case "$1" in
+        X64|x64|x86_64|amd64|AMD64) printf '%s\n' x64 ;;
+        ARM64|arm64|aarch64)         printf '%s\n' arm64 ;;
+        *)
+            echo "Unsupported architecture: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Git Bash can be x64-emulated on a native Windows ARM64 runner, so ``uname``
+# describes Bash rather than the PyInstaller executable. The build interpreter
+# is authoritative; when Actions also supplies RUNNER_ARCH, require both
+# independent signals to agree before naming an artifact.
+PYTHON_BIN="${PYTHON:-python}"
+PYTHON_ARCH_RAW="$("$PYTHON_BIN" -c 'import platform; print(platform.machine())')"
+ARCH="$(normalize_arch "$PYTHON_ARCH_RAW")"
+if [ -n "${RUNNER_ARCH:-}" ]; then
+    RUNNER_ARCH_NORMALIZED="$(normalize_arch "$RUNNER_ARCH")"
+    if [ "$RUNNER_ARCH_NORMALIZED" != "$ARCH" ]; then
+        echo "Architecture mismatch: RUNNER_ARCH=$RUNNER_ARCH but build Python reports $PYTHON_ARCH_RAW" >&2
+        exit 1
+    fi
+fi
 
 # Distribution metadata normalizes ``X.Y.Z-beta.N`` to ``X.Y.ZbN``. Release
 # tags, updater lookup, checksums, and filenames use the external SemVer form,
 # so read the deliberately lightweight source constant instead. This runs in
 # the repo root, before ``cd dist``, and cannot be shadowed by PyInstaller.
-VERSION="$(python -c "from src import __version__; print(__version__)")"
+VERSION="$("$PYTHON_BIN" -c "from src import __version__; print(__version__)")"
 
 # Unified SHA-256 helper — macOS has ``shasum``, Linux/Git Bash have
 # ``sha256sum``. ``shasum -a 256`` on macOS and ``sha256sum`` on Linux
