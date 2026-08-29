@@ -169,9 +169,17 @@ jobs:
           - os: windows-2025
             host_platform: win32-x64
             cc_ext: '.exe'
-          - os: windows-11-arm
-            host_platform: win32-arm64
-            cc_ext: '.exe'
+          # win32-arm64 is deliberately absent, and putting it back needs more
+          # than a matrix line. cryptography stopped publishing a win_arm64
+          # wheel after 46.0.3 (October 2025), so this runner has no binary to
+          # install: pip falls back to a source build and dies compiling
+          # openssl-sys. The only pin that restores the wheel freezes a
+          # security-critical library ten months back for every platform, which
+          # is a worse trade than not shipping this one target. Restore it when
+          # cryptography publishes win_arm64 again, or when this job carries its
+          # own Rust + OpenSSL toolchain to build it. Until then the whole
+          # release is gated on a job that cannot pass — no other target ships
+          # either, which is how v0.20.0 and v0.20.1 both failed to publish.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -294,7 +302,7 @@ jobs:
             echo "::error::Could not prove that release $GITHUB_REF_NAME is absent"
             exit 1
           fi
-      - name: Attest all six release packages
+      - name: Attest every release package
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
           subject-path: |
@@ -302,7 +310,6 @@ jobs:
             artifacts/openagent-*-linux-x64.tar.gz
             artifacts/openagent-*-macos-arm64.pkg
             artifacts/openagent-*-macos-x64.pkg
-            artifacts/openagent-*-windows-arm64.zip
             artifacts/openagent-*-windows-x64.zip
       - name: Upload an unpublished draft release
         id: draft
@@ -318,8 +325,6 @@ jobs:
             artifacts/openagent-*-macos-arm64.pkg.sha256
             artifacts/openagent-*-macos-x64.pkg
             artifacts/openagent-*-macos-x64.pkg.sha256
-            artifacts/openagent-*-windows-arm64.zip
-            artifacts/openagent-*-windows-arm64.zip.sha256
             artifacts/openagent-*-windows-x64.zip
             artifacts/openagent-*-windows-x64.zip.sha256
           generate_release_notes: true

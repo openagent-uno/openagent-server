@@ -107,7 +107,14 @@ dependencies = [
     # Already pulled in transitively by anthropic/openai but declared
     # explicitly because the network layer imports the Ed25519 APIs
     # directly — a transitive bump must not silently drop it.
-    "cryptography>=42",
+    # Upper bound is a WHEEL AVAILABILITY constraint, not an API one: 49.0.0
+    # stopped publishing a macOS x86_64 (universal2) wheel. Without one, pip
+    # builds cryptography from source on the Intel macOS runner against that
+    # runner's OpenSSL, and the PACKAGED binary then dies at startup on
+    # `Symbol not found: _SSL_get0_group_name` — the release matrix has failed
+    # there every time it has run. Raise this only together with evidence that
+    # a macOS x86_64 wheel exists again for the new floor.
+    "cryptography>=42,<49",
     # CBOR: device-cert payload encoding. Compact and deterministic
     # (canonical CBOR), which matters because we sign the encoded bytes.
     "cbor2>=5.5",
