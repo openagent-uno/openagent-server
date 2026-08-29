@@ -2974,3 +2974,39 @@ async def t_tags_remove_uses_singular_tag(_ctx: TestContext) -> None:
         _Pool({"replio": plural}), "replio", "replio_threads_tags_remove",
         {"thread_id": "t-1", "tags": ["diagnostics-active"]},
     ) == {"thread_id": "t-1", "tags": ["diagnostics-active"]}
+
+
+@test("local_support_controller", "the evidence comment names a tool ClickUp actually has")
+async def t_clickup_comment_tool_is_resolvable(_ctx: TestContext) -> None:
+    """The controller asked for `create_task_comment`; the server has `create_comment`.
+
+    `_pick_tool` finds nothing for it (no exact, prefixed or suffix match), so
+    `_record_action` raised out of the turn at the one step that puts evidence
+    on the task. Verified against the live ClickUp MCP tool list: it exposes
+    `clickup_create_comment`, `clickup_get_comments`, `clickup_update_comment`,
+    and the arguments were right all along.
+    """
+    from src.core.local_support_controller import _pick_tool
+
+    live = _Toolkit({
+        "clickup_create_comment": lambda **_: None,
+        "clickup_get_comments": lambda **_: None,
+        "clickup_update_comment": lambda **_: None,
+    })
+    candidates = (
+        "clickup_create_comment", "create_comment",
+        "clickup_create_task_comment", "create_task_comment",
+    )
+    assert _pick_tool(
+        _Pool({"clickup": live}), "clickup", candidates,
+    ) == "clickup_create_comment"
+
+    # A server that does use the older name still resolves.
+    legacy = _Toolkit({"clickup_create_task_comment": lambda **_: None})
+    assert _pick_tool(
+        _Pool({"clickup": legacy}), "clickup", candidates,
+    ) == "clickup_create_task_comment"
+
+    # An update is not a create: never silently pick the wrong verb.
+    only_update = _Toolkit({"clickup_update_comment": lambda **_: None})
+    assert _pick_tool(_Pool({"clickup": only_update}), "clickup", candidates) is None

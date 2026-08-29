@@ -4400,7 +4400,10 @@ async def _execute_bug_receipts(pool: Any, state: SupportState) -> None:
         state,
         pool,
         "clickup",
-        ("clickup_create_task_comment", "create_task_comment"),
+        (
+            "clickup_create_comment", "create_comment",
+            "clickup_create_task_comment", "create_task_comment",
+        ),
         {"task_id": task_id, "comment_text": evidence},
         "task_comment",
     )
@@ -4750,7 +4753,10 @@ async def _collect_bug_diagnostics(pool: Any, state: SupportState) -> None:
     excerpt = _diagnostic_log_excerpt(log_result)
     commented = await _record_action(
         state, pool, "clickup",
-        ("clickup_create_task_comment", "create_task_comment"),
+        (
+            "clickup_create_comment", "create_comment",
+            "clickup_create_task_comment", "create_task_comment",
+        ),
         {
             "task_id": state.linked_task_id,
             "comment_text": (
