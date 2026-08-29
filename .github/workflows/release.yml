@@ -169,17 +169,9 @@ jobs:
           - os: windows-2025
             host_platform: win32-x64
             cc_ext: '.exe'
-          # win32-arm64 is deliberately absent, and putting it back needs more
-          # than a matrix line. cryptography stopped publishing a win_arm64
-          # wheel after 46.0.3 (October 2025), so this runner has no binary to
-          # install: pip falls back to a source build and dies compiling
-          # openssl-sys. The only pin that restores the wheel freezes a
-          # security-critical library ten months back for every platform, which
-          # is a worse trade than not shipping this one target. Restore it when
-          # cryptography publishes win_arm64 again, or when this job carries its
-          # own Rust + OpenSSL toolchain to build it. Until then the whole
-          # release is gated on a job that cannot pass — no other target ships
-          # either, which is how v0.20.0 and v0.20.1 both failed to publish.
+          - os: windows-11-arm
+            host_platform: win32-arm64
+            cc_ext: '.exe'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -195,16 +187,55 @@ jobs:
             --platform '${{ matrix.host_platform }}' \
             --output "$RUNNER_TEMP/openagent-host-tools" \
             --wheel-output "$HOST_TOOLS_WHEEL"
-          echo "OPENAGENT_HOST_TOOLS_WHEEL=$HOST_TOOLS_WHEEL" >> "$GITHUB_ENV"
           echo "OPENAGENT_HOST_TOOLS_BUNDLE=$RUNNER_TEMP/openagent-host-tools/${{ matrix.host_platform }}" >> "$GITHUB_ENV"
+      - name: Build checksum-pinned Iroh wheel for Windows ARM64
+        if: matrix.host_platform == 'win32-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IROH_SOURCE="$RUNNER_TEMP/iroh-ffi"
+          IROH_WHEELS="$RUNNER_TEMP/iroh-wheels"
+          python scripts/acquire-iroh-source.py --output "$IROH_SOURCE"
+          python scripts/build-iroh-wheel.py --source "$IROH_SOURCE" --output "$IROH_WHEELS"
+          echo "PIP_FIND_LINKS=$IROH_WHEELS" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Install Python deps + PyInstaller
         shell: bash
+        # Resolve the server, its checksum-pinned host-tools URL, and every
+        # transitive dependency in one transaction. On Windows ARM64 this lets
+        # the server's cryptography==46.0.3 marker constrain MCP's pyjwt[crypto]
+        # dependency before pip can attempt an unsupported OpenSSL source build.
+        run: >-
+          python -m pip install
+          --only-binary cryptography,iroh
+          -e ".[all]" pyinstaller
+      - name: Verify native Windows ARM64 release dependencies
+        if: matrix.host_platform == 'win32-arm64'
+        shell: bash
         run: |
-          pip install "$OPENAGENT_HOST_TOOLS_WHEEL"
-          pip install -e ".[all]" pyinstaller
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+          import platform
+
+          import cryptography
+          import iroh
+          import litellm
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          assert platform.machine().upper() == "ARM64"
+          assert cryptography.__version__ == "46.0.3"
+          assert pathlib.Path(iroh.__file__).is_file()
+          assert pathlib.Path(litellm.__file__).is_file()
+          key = Ed25519PrivateKey.generate()
+          message = b"openagent-windows-arm64-release"
+          key.public_key().verify(key.sign(message), message)
+          assert importlib.util.find_spec("faster_whisper") is None
+          assert importlib.util.find_spec("piper") is None
+          print(iroh.__file__)
+          PY
       - name: Build Node MCPs
         shell: bash
         run: |
@@ -310,6 +341,7 @@ jobs:
             artifacts/openagent-*-linux-x64.tar.gz
             artifacts/openagent-*-macos-arm64.pkg
             artifacts/openagent-*-macos-x64.pkg
+            artifacts/openagent-*-windows-arm64.zip
             artifacts/openagent-*-windows-x64.zip
       - name: Upload an unpublished draft release
         id: draft
@@ -325,6 +357,8 @@ jobs:
             artifacts/openagent-*-macos-arm64.pkg.sha256
             artifacts/openagent-*-macos-x64.pkg
             artifacts/openagent-*-macos-x64.pkg.sha256
+            artifacts/openagent-*-windows-arm64.zip
+            artifacts/openagent-*-windows-arm64.zip.sha256
             artifacts/openagent-*-windows-x64.zip
             artifacts/openagent-*-windows-x64.zip.sha256
           generate_release_notes: true

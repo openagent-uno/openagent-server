@@ -980,6 +980,7 @@ async def t_release_verifier_accepts_windows_binary_marker(ctx: TestContext) -> 
         f"{base}-linux-x64.tar.gz",
         f"{base}-macos-arm64.pkg",
         f"{base}-macos-x64.pkg",
+        f"{base}-windows-arm64.zip",
         f"{base}-windows-x64.zip",
     )
     with tempfile.TemporaryDirectory() as directory:
@@ -1002,7 +1003,7 @@ async def t_release_verifier_accepts_windows_binary_marker(ctx: TestContext) -> 
             check=False,
         )
         assert result.returncode == 0, result.stderr or result.stdout
-        assert "verified 10 immutable release assets" in result.stdout
+        assert "verified 12 immutable release assets" in result.stdout
 
 
 @test("updater", "release verifier rejects a checksum target hidden in a path")
@@ -1020,6 +1021,7 @@ async def t_release_verifier_rejects_nested_checksum_target(ctx: TestContext) ->
         f"{base}-linux-x64.tar.gz",
         f"{base}-macos-arm64.pkg",
         f"{base}-macos-x64.pkg",
+        f"{base}-windows-arm64.zip",
         f"{base}-windows-x64.zip",
     )
     with tempfile.TemporaryDirectory() as directory:

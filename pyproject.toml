@@ -71,7 +71,10 @@ dependencies = [
     # Local STT fallback. Promoted from the ``voice`` extra to core so
     # the bundled installer ships voice-in working out of the box (no
     # cloud STT key required). First call downloads the model (~150 MB).
-    "faster-whisper>=1.0.0",
+    # CTranslate2 publishes neither a wheel nor an sdist for Windows ARM64,
+    # so that one platform keeps the existing cloud STT path but cannot
+    # advertise a local Whisper runtime that cannot be installed.
+    "faster-whisper>=1.0.0; platform_system != 'Windows' or platform_machine != 'ARM64'",
     # Local TTS fallback (Piper). Same rationale as faster-whisper:
     # the bundled Python release ships voice-out working out of the
     # box. First synth call downloads the voice (~25 MB) into
@@ -81,7 +84,10 @@ dependencies = [
     # cloud vendor. Pinned to >=1.3 because that's where the
     # ``PiperVoice.synthesize_wav`` entry point lands; the older
     # ``synthesize(text, wav_file)`` signature was removed.
-    "piper-tts>=1.3.0",
+    # Piper likewise has no Windows ARM64 distribution. Keep cloud TTS fully
+    # available there and make the missing local fallback an explicit package
+    # contract instead of letting release installation fail mid-resolve.
+    "piper-tts>=1.3.0; platform_system != 'Windows' or platform_machine != 'ARM64'",
     # WebSocket client for ElevenLabs streaming TTS (token-in / audio-out).
     # Already pulled in transitively by aiohttp / discord.py / openai-sdk
     # in current installs, but declaring it explicit so the streaming
@@ -114,7 +120,11 @@ dependencies = [
     # `Symbol not found: _SSL_get0_group_name` — the release matrix has failed
     # there every time it has run. Raise this only together with evidence that
     # a macOS x86_64 wheel exists again for the new floor.
-    "cryptography>=42,<49",
+    # Windows ARM64 is narrower still: 46.0.3 is the newest release with a
+    # native wheel there. Keep that platform on the exact known-good binary;
+    # every other platform retains the macOS-x64-safe rolling range above.
+    "cryptography>=42,<49; platform_system != 'Windows' or platform_machine != 'ARM64'",
+    "cryptography==46.0.3; platform_system == 'Windows' and platform_machine == 'ARM64'",
     # CBOR: device-cert payload encoding. Compact and deterministic
     # (canonical CBOR), which matters because we sign the encoded bytes.
     "cbor2>=5.5",

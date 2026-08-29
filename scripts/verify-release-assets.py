@@ -35,15 +35,14 @@ args = parser.parse_args()
 
 base = f"openagent-{args.version}"
 # Mirrors the release workflow's build matrix exactly: this check exists to
-# catch a target that built but failed to upload, so it must not demand a
-# target the matrix does not build. windows/arm64 is absent for the reason
-# spelled out in .github/workflows/release.yml - cryptography publishes no
-# win_arm64 wheel after 46.0.3.
+# catch a target that built but failed to upload, so every matrix target must
+# have one archive and one adjacent checksum marker.
 release_targets = (
     ("linux", "arm64", "tar.gz"),
     ("linux", "x64", "tar.gz"),
     ("macos", "arm64", "pkg"),
     ("macos", "x64", "pkg"),
+    ("windows", "arm64", "zip"),
     ("windows", "x64", "zip"),
 )
 archives = {
