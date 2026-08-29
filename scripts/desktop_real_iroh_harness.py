@@ -184,7 +184,11 @@ async def run(root: Path) -> None:
             "Client paths are never server paths."
         ),
         mcp_pool=pool,
-        memory=None,
+        # The harness is a production-shaped vertical slice: Agent lifecycle
+        # services and Gateway REST surfaces must share the coordinator's
+        # canonical store.  A separate/absent DB leaves Custom Views without
+        # an authoritative repository and makes Gateway startup fail.
+        memory=db,
     )
     state = await NetworkState.from_db(db=db, identity_path=identity_path)
     gateway = Gateway(agent=agent, network_state=state)
