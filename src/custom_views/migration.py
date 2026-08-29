@@ -41,9 +41,25 @@ async def _verify(conn: Any) -> None:
     missing = REQUIRED_TABLES - present
     if missing:
         raise CustomViewMigrationError("custom-views-v1 is missing required tables")
-    fk = await (await conn.execute("PRAGMA foreign_key_check")).fetchall()
-    if fk:
-        raise CustomViewMigrationError("custom-views-v1 foreign key verification failed")
+    # Scoped to the tables THIS migration owns, one PRAGMA per table.
+    #
+    # The unscoped `PRAGMA foreign_key_check` checks the whole database, so a
+    # dangling row anywhere — an old `task_runs` row whose `scheduled_tasks`
+    # parent was deleted, an `event_deliveries` row for a removed event —
+    # failed this migration and, because `connect()` raises, stopped the agent
+    # from booting AT ALL. Measured on a three-month-old production agent: 8
+    # such rows, none of them in a `ui_*` table, and the process died in
+    # `_serve` before the HTTP server ever came up. A migration that adds seven
+    # tables must not adjudicate the integrity of the rest of the database, and
+    # certainly must not make old orphan rows an unbootable condition.
+    for table in sorted(REQUIRED_TABLES):
+        fk = await (
+            await conn.execute(f"PRAGMA foreign_key_check({table})")
+        ).fetchall()
+        if fk:
+            raise CustomViewMigrationError(
+                f"custom-views-v1 foreign key verification failed on {table}"
+            )
 
 
 async def ensure_custom_views_storage(conn: Any, *, app_version: str) -> bool:

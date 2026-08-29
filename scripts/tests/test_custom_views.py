@@ -1635,3 +1635,63 @@ async def t_custom_view_rest(ctx: TestContext) -> None:
                 await service.close()
             await client.close()
             await db.close()
+
+
+@test("custom_views", "an old orphan row elsewhere is not an unbootable condition")
+async def t_migration_fk_check_is_scoped(ctx: TestContext) -> None:
+    """The verify used an unscoped `PRAGMA foreign_key_check`.
+
+    A three-month-old production agent had 8 dangling rows - `task_runs` whose
+    `scheduled_tasks` parent was deleted, `event_deliveries` for a removed
+    event - none of them in a `ui_*` table. The whole-database check failed the
+    migration, `connect()` raised, and the process died inside `_serve` before
+    the HTTP server came up: the agent could not boot at all.
+    """
+    from src.custom_views.migration import (
+        CustomViewMigrationError,
+        REQUIRED_TABLES,
+        ensure_custom_views_storage,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="oa-ui-fk-") as raw:
+        root = Path(raw)
+        db = await _db(root)
+        try:
+            conn = await db._ensure_connected()
+            # A dangling child in a table this migration does not own. Written
+            # with the enforcement pragma off, exactly as the rows that
+            # accumulated in production did.
+            await conn.execute("PRAGMA foreign_keys=OFF")
+            await conn.execute(
+                "INSERT INTO task_runs (id, task_id, status, started_at) "
+                "VALUES ('run-orphan', 'task-that-was-deleted', 'done', 0)"
+            )
+            await conn.commit()
+            violations = await (
+                await conn.execute("PRAGMA foreign_key_check")
+            ).fetchall()
+            assert violations, "fixture must actually violate a foreign key"
+            assert all(
+                str(row[0]) not in REQUIRED_TABLES for row in violations
+            ), violations
+
+            # Re-verifying the already-complete migration must still pass.
+            assert not await ensure_custom_views_storage(conn, app_version="test")
+
+            # A violation INSIDE the migration's own tables is still fatal.
+            await conn.execute(
+                "INSERT INTO ui_view_revisions "
+                "(view_id, tenant_id, revision, bundle_path, bundle_sha256, "
+                " bundle_size_bytes, created_by_principal_id, created_at_ms) "
+                "VALUES ('view-that-does-not-exist', 'tenant-a', 1, 'p', ?, 0, 'user:alice', 0)",
+                ("0" * 64,)
+            )
+            await conn.commit()
+            try:
+                await ensure_custom_views_storage(conn, app_version="test")
+            except CustomViewMigrationError as exc:
+                assert "ui_view_revisions" in str(exc), exc
+            else:
+                raise AssertionError("an orphan ui_* row must still fail verification")
+        finally:
+            await db.close()
