@@ -577,6 +577,58 @@ async def t_general_local_composer(_ctx: TestContext) -> None:
     assert "quello che mi manca \u00e8 il passaggio" in followup_reply, followup_reply
 
 
+@test(
+    "local_support_controller",
+    "a report detailed across three messages is not evidence-poor",
+)
+async def t_bug_evidence_reads_the_whole_thread(_ctx: TestContext) -> None:
+    """A fault is described over several messages, and the gates must read all
+    of them.
+
+    The form fills the trailer ONCE, on the first message; the exact sequence
+    usually arrives on the third. Reading only the message in hand made every
+    follow-up look like a report with no version and no device, so the task was
+    never filed and the customer was asked again for what he had already sent.
+    """
+    from src.core import local_support_controller as controller
+
+    first = (
+        "Su Android Auto non parte niente.\n---\n"
+        "app_version: 1.4.11\ndevice: samsung SM-S947B\n"
+        "os: Android 16\nplatform: android"
+    )
+    steps = (
+        "Apro la libreria in auto, tocco una playlist, parte. Poi tocco la "
+        "seconda playlist e continua a suonare la prima, ogni volta."
+    )
+    thread = {
+        "messages": [
+            {"direction": "inbound", "body_text": first},
+            {"direction": "outbound", "body_text": "Ci guardiamo, grazie."},
+            {"direction": "inbound", "body_text": steps},
+        ],
+    }
+
+    # What the customer has actually told us, across the thread.
+    joined = controller._customer_text(thread, steps)
+    assert "app_version: 1.4.11" in joined, joined
+    assert "seconda playlist" in joined, joined
+
+    # Judged on the last message alone the version and the device are gone.
+    alone = controller._bug_evidence_missing(steps)
+    assert any("version" in item for item in alone), alone
+
+    # Judged on the thread they are present, so nothing is asked for twice.
+    together = controller._bug_evidence_missing(joined)
+    assert not any("version" in item for item in together), together
+    assert not any("device" in item for item in together), together
+
+    # And the form context the filing gate depends on is recognised.
+    fields = controller._form_fields_in_thread(thread, steps)
+    assert fields.get("app_version") == "1.4.11", fields
+    assert fields.get("device") == "samsung SM-S947B", fields
+
+
 class _Doubles:
     """Replio/vault/BillingBear/ClickUp doubles that record every call.
 

@@ -206,6 +206,13 @@ class SupportState:
     # Everything this side already said on the thread, oldest first. Used to
     # refuse to send the same answer a second time in any language.
     prior_support_replies: list[str] = field(default_factory=list)
+    # Everything the CUSTOMER has written on the thread, oldest first. The bug
+    # evidence gates read this rather than the latest message alone: a report
+    # becomes detailed over two or three messages, and judging only the last
+    # one made every follow-up look evidence-poor - so the task was never
+    # filed and the version was asked for again. Capped; falls back to the
+    # single message when the thread cannot be read.
+    thread_customer_text: str = ""
     corrections: list[str] = field(default_factory=list)
     tenant: Tenant = field(default_factory=lambda: _TENANTS[_DEFAULT_TENANT])
     # Sensitive routing material stays out of ``facts`` (which is handed to
@@ -1623,6 +1630,35 @@ def _recent_exchange(thread: Any, limit: int = 4) -> list[dict[str, str]]:
     return out
 
 
+def _customer_text(thread: Any, message: str, limit: int = 20000) -> str:
+    """Every inbound message on the thread, oldest first, then this one.
+
+    The bug-evidence gates used to read `state.customer_message` alone. A
+    customer describes a fault across several messages - the form trailer with
+    the version and device on the first, the exact sequence on the third - so
+    the message that finally carries the detail is also the one with no
+    trailer. Judged on its own it reads as an evidence-poor report: no task is
+    filed and the version is requested again, from someone who gave it on
+    message one.
+    """
+    parts: list[str] = []
+    messages = (thread or {}).get("messages") if isinstance(thread, dict) else None
+    if isinstance(messages, list):
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("direction") or "").lower() != "inbound":
+                continue
+            for key in ("body_text", "text", "body", "content"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value.strip())
+                    break
+    if message and message.strip() and (not parts or parts[-1] != message.strip()):
+        parts.append(message.strip())
+    return "\n".join(parts)[:limit]
+
+
 def _support_replies(thread: Any, limit: int = 6) -> list[str]:
     """The outbound bodies already sent on this thread, oldest first.
 
@@ -2855,13 +2891,19 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
         return
     urgent = _is_urgent(state.customer_message)
     state.facts["urgent"] = urgent
-    missing = _bug_evidence_missing(state.customer_message)
+    missing = _bug_evidence_missing(
+        state.thread_customer_text or state.customer_message
+    )
     # The web form and the store reviews already attach the client version and
     # the device/OS. When the ONLY thing left is the exact sequence, holding
     # the report back means the queue never hears about a defect the form
     # already described well enough to route. File it, and ask for the steps
     # in the same breath. (Owner decision, 2026-08-22.)
-    fields = _form_fields(state.customer_message)
+    # From the whole thread (see `already_known_from_form`), not from the
+    # message in hand: the form fills the trailer once, on the first message.
+    fields = state.facts.get("already_known_from_form") or _form_fields(
+        state.customer_message
+    )
     form_gave_context = bool(
         (fields.get("app_version") or fields.get("native_version"))
         and fields.get("device")
@@ -5383,6 +5425,7 @@ async def run(
                 thread = full_thread
     state.recent_exchange = _recent_exchange(thread)
     state.prior_support_replies = _support_replies(thread)
+    state.thread_customer_text = _customer_text(thread, message)
     # Replio's realtime webhook includes ``payload.message``, but its guarded
     # reconciliation sweep intentionally rebuilds an event from the thread
     # row and therefore carries no message body.  The thread brief is the
@@ -5937,7 +5980,9 @@ async def run(
                         await _read_policy(pool, state, path)
                     state.decision = "ask_information"
                     state.outcome = "refund_malfunction_resolve_first"
-                    state.facts["missing_evidence"] = _bug_evidence_missing(message)
+                    state.facts["missing_evidence"] = _bug_evidence_missing(
+                        state.thread_customer_text or message
+                    )
                     state.instructions.append(
                         "The refund is asked because the app misbehaves: offer to fix it first. "
                         "Ask for device, OS, app version and the exact step that fails. "
