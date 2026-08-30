@@ -5107,6 +5107,28 @@ def _receipt_payloads(receipt: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _routing_evidence(state: SupportState) -> dict[str, Any]:
+    """The PII-free trace of how this turn was routed, for the done event."""
+    facts = state.facts
+    evidence: dict[str, Any] = {
+        "intent_source": str(facts.get("intent_source") or "term"),
+    }
+    semantic = facts.get("intent_semantic")
+    if isinstance(semantic, dict):
+        evidence["semantic_score"] = semantic.get("score")
+        evidence["semantic_margin"] = semantic.get("margin")
+        evidence["semantic_runner_up"] = semantic.get("runner_up")
+    if facts.get("semantic_skipped_thin_body"):
+        evidence["semantic_skipped"] = "thin_body"
+    if facts.get("paid_claim_semantic"):
+        evidence["paid_claim"] = True
+    if facts.get("repeated_reply_semantic"):
+        evidence["repeat_blocked"] = True
+    if facts.get("money_execution_requires_human"):
+        evidence["inferred_money_label"] = True
+    return evidence
+
+
 async def _delete_account(pool: Any, state: SupportState, email: str) -> None:
     """Run the deletion, and say only what the receipt proves.
 
@@ -6543,6 +6565,13 @@ async def run(
         decision=state.decision,
         outcome=state.outcome,
         actions=len(state.actions),
+        # How the intent was reached, and what the semantic layer said. Without
+        # these the routing layer is invisible in production: the run report
+        # carries them but is not kept, so after a day of live traffic the only
+        # answerable question was "did the exemplar bank get built", never "did
+        # meaning change a route, and into what". All PII-free: a label, two
+        # numbers and three flags, never customer text.
+        **_routing_evidence(state),
     )
     return ControllerResult(
         session_id=session_id,

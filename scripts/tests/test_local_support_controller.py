@@ -3170,3 +3170,38 @@ async def t_clickup_comment_tool_is_resolvable(_ctx: TestContext) -> None:
     # An update is not a create: never silently pick the wrong verb.
     only_update = _Toolkit({"clickup_update_comment": lambda **_: None})
     assert _pick_tool(_Pool({"clickup": only_update}), "clickup", candidates) is None
+
+
+@test("local_support_controller", "the done event says how the turn was routed")
+async def t_routing_evidence(_ctx: TestContext) -> None:
+    """A routing layer nobody can audit is a routing layer nobody can trust.
+    Measured after a day of live traffic: the exemplar bank had been built 31
+    times, and there was no way to answer "did meaning change a route, and into
+    what" - the run report carries `intent_source` but is not kept."""
+    from src.core import local_support_controller as lsc
+
+    plain = lsc.SupportState(thread_id="t", customer_message="", channel="email")
+    assert lsc._routing_evidence(plain) == {"intent_source": "term"}
+
+    routed = lsc.SupportState(thread_id="t", customer_message="", channel="email")
+    routed.facts.update({
+        "intent_source": "semantic",
+        "intent_semantic": {
+            "label": "duplicate_charge", "score": 0.673,
+            "margin": 0.069, "runner_up": "billing_dispute",
+        },
+        "money_execution_requires_human": True,
+        "paid_claim_semantic": {"label": "paid_entitlement_claim", "score": 0.72},
+    })
+    evidence = lsc._routing_evidence(routed)
+    assert evidence["intent_source"] == "semantic", evidence
+    assert evidence["semantic_score"] == 0.673, evidence
+    assert evidence["semantic_runner_up"] == "billing_dispute", evidence
+    assert evidence["inferred_money_label"] is True, evidence
+    assert evidence["paid_claim"] is True, evidence
+
+    # Nothing that could carry a customer's words or address.
+    for value in evidence.values():
+        assert not isinstance(value, dict), evidence
+        if isinstance(value, str):
+            assert "@" not in value, evidence
