@@ -629,6 +629,53 @@ async def t_bug_evidence_reads_the_whole_thread(_ctx: TestContext) -> None:
     assert fields.get("device") == "samsung SM-S947B", fields
 
 
+@test(
+    "local_support_controller",
+    "the account email survives past the message that carried it",
+)
+async def t_account_email_read_from_the_thread(_ctx: TestContext) -> None:
+    """The form declares the address once and the customer then writes prose.
+
+    A cancellation request on 30-Aug-2026: message one carried
+    `account_email:` in the trailer, message two was "directly from there"
+    plus a signature. With the address read from the message in hand there was
+    nothing to look up, so he was asked where he had bought it and then for an
+    order number or receipt — while the by-email lookup already answers the
+    store, the renewal and the expiry.
+    """
+    from src.core import local_support_controller as controller
+
+    first = (
+        "Vorrei disdire l'abbonamento\n---\n"
+        "account_email: someone@example.com\n"
+        "account_user_id: b3f9114dfb8b89fa64f24dfb37a2b814\n"
+        "app_version: 1.4.12\nplatform: android\npremium: yes"
+    )
+    followup = "Direttamente da lì\n\nMario Rossi - tel - +39000000000"
+    thread = {
+        "messages": [
+            {"direction": "inbound", "body_text": first},
+            {"direction": "outbound", "body_text": "Dove l'hai acquistato?"},
+            {"direction": "inbound", "body_text": followup},
+        ],
+    }
+
+    # Nothing to look up when only the message in hand is read.
+    assert controller._extract_email({}, followup) == "", followup
+
+    # The declared field is still there, on the thread.
+    trailer = controller._form_fields_in_thread(thread, followup)
+    assert trailer.get("account_email") == "someone@example.com", trailer
+
+    # And only the declared field: an address quoted in prose is not an account.
+    quoted = {"messages": [
+        {"direction": "inbound", "body_text": "ho scritto a support@lyramusic.app"},
+    ]}
+    assert not controller._form_fields_in_thread(quoted, "ancora niente").get(
+        "account_email"
+    )
+
+
 class _Doubles:
     """Replio/vault/BillingBear/ClickUp doubles that record every call.
 

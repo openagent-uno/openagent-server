@@ -5733,6 +5733,23 @@ async def run(
         app_user_id = _extract_app_user_id({"payload": payload, "thread": thread}, message)
         email = _extract_email({"payload": payload, "thread": thread}, message)
         sender_email = _extract_verified_sender_email({"payload": payload, "thread": thread})
+        if not email:
+            # The address the form declared, from ANY message on the thread.
+            # `_extract_email` falls back to a regex over the message in hand,
+            # and the trailer carrying `account_email` is on the FIRST one — so
+            # from the second message onward the account could not be looked up
+            # at all. Observed 30-Aug-2026: a customer asking to cancel a web
+            # subscription was asked where he had bought it, and then for the
+            # order number or receipt. The by-email lookup answers all of it
+            # (appUserId, store, willRenew, expiry) and was never reached,
+            # because his reply was the word "directly from there" and his
+            # signature. Read the declared field, not any address in the prose:
+            # a quoted support address must never become the account we check.
+            email = str(
+                (_form_fields_in_thread(thread, message).get("account_email") or "")
+            ).strip()
+            if email:
+                state.facts["account_email_from_thread"] = True
         state.account_ref = app_user_id or email
         state.account_email = email
         state.facts.update({
