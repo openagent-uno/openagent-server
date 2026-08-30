@@ -36,8 +36,7 @@ from src.core._runner.utils.agent import (
     collect_joint_videos,
 )
 from src.core._runner.utils.events import (
-    create_tool_call_completed_event,
-    create_tool_call_error_event,
+    create_tool_call_terminal_event,
     create_tool_call_started_event,
     handle_event,
 )
@@ -656,8 +655,7 @@ def run_tool(
     # Team-level tools need team event creators since TeamRunOutput has team_id, not agent_id.
     if team_mode:
         from src.core._runner.utils.events import (
-            create_team_tool_call_completed_event,
-            create_team_tool_call_error_event,
+            create_team_tool_call_terminal_event,
             create_team_tool_call_started_event,
         )
 
@@ -695,7 +693,7 @@ def run_tool(
                 if stream_events:
                     if team_mode:
                         yield handle_event(  # type: ignore
-                            create_team_tool_call_completed_event(
+                            create_team_tool_call_terminal_event(
                                 from_run_response=run_response,  # type: ignore[arg-type]
                                 tool=tool,
                                 content=call_result.content,  # type: ignore
@@ -704,35 +702,15 @@ def run_tool(
                             events_to_skip=agent.events_to_skip,  # type: ignore
                             store_events=agent.store_events,
                         )
-                        if tool.tool_call_error:
-                            yield handle_event(  # type: ignore
-                                create_team_tool_call_error_event(
-                                    from_run_response=run_response,  # type: ignore[arg-type]
-                                    tool=tool,
-                                    error=str(tool.result),  # type: ignore
-                                ),
-                                run_response,
-                                events_to_skip=agent.events_to_skip,  # type: ignore
-                                store_events=agent.store_events,
-                            )
                     else:
                         yield handle_event(  # type: ignore
-                            create_tool_call_completed_event(
+                            create_tool_call_terminal_event(
                                 from_run_response=run_response, tool=tool, content=call_result.content
                             ),
                             run_response,
                             events_to_skip=agent.events_to_skip,  # type: ignore
                             store_events=agent.store_events,
                         )
-                        if tool.tool_call_error:
-                            yield handle_event(  # type: ignore
-                                create_tool_call_error_event(
-                                    from_run_response=run_response, tool=tool, error=str(tool.result)
-                                ),
-                                run_response,
-                                events_to_skip=agent.events_to_skip,  # type: ignore
-                                store_events=agent.store_events,
-                            )
         # Yield CustomEvent instances from sync tool generators
         elif isinstance(call_result, CustomEvent):
             if stream_events:
@@ -769,8 +747,7 @@ async def arun_tool(
     # team_mode=True when called from team continue path with a TeamRunOutput.
     if team_mode:
         from src.core._runner.utils.events import (
-            create_team_tool_call_completed_event,
-            create_team_tool_call_error_event,
+            create_team_tool_call_terminal_event,
             create_team_tool_call_started_event,
         )
 
@@ -809,7 +786,7 @@ async def arun_tool(
                 if stream_events:
                     if team_mode:
                         yield handle_event(  # type: ignore
-                            create_team_tool_call_completed_event(
+                            create_team_tool_call_terminal_event(
                                 from_run_response=run_response,  # type: ignore[arg-type]
                                 tool=tool,
                                 content=call_result.content,  # type: ignore
@@ -818,35 +795,15 @@ async def arun_tool(
                             events_to_skip=agent.events_to_skip,  # type: ignore
                             store_events=agent.store_events,
                         )
-                        if tool.tool_call_error:
-                            yield handle_event(  # type: ignore
-                                create_team_tool_call_error_event(
-                                    from_run_response=run_response,  # type: ignore[arg-type]
-                                    tool=tool,
-                                    error=str(tool.result),  # type: ignore
-                                ),
-                                run_response,
-                                events_to_skip=agent.events_to_skip,  # type: ignore
-                                store_events=agent.store_events,
-                            )
                     else:
                         yield handle_event(  # type: ignore
-                            create_tool_call_completed_event(
+                            create_tool_call_terminal_event(
                                 from_run_response=run_response, tool=tool, content=call_result.content
                             ),
                             run_response,
                             events_to_skip=agent.events_to_skip,  # type: ignore
                             store_events=agent.store_events,
                         )
-                        if tool.tool_call_error:
-                            yield handle_event(  # type: ignore
-                                create_tool_call_error_event(
-                                    from_run_response=run_response, tool=tool, error=str(tool.result)
-                                ),
-                                run_response,
-                                events_to_skip=agent.events_to_skip,  # type: ignore
-                                store_events=agent.store_events,
-                            )
         # Yield CustomEvent instances from async tool generators
         elif isinstance(call_result, CustomEvent):
             if stream_events:

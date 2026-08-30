@@ -820,20 +820,20 @@ async def t_verify_new_binary(ctx: TestContext) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         good = tmp / "good"
-        good.write_text('#!/bin/sh\nif [ "$1" = "selfcheck" ]; then echo "9.9.9"; exit 0; fi\nexit 2\n')
+        good.write_text('#!/bin/sh\ncase " $* " in *" selfcheck "*) echo "9.9.9"; exit 0;; esac\nexit 2\n')
         good.chmod(0o755)
         # Should not raise.
         updater.verify_new_binary(good, expected_version="9.9.9")
 
         mismatch = tmp / "mismatch"
         mismatch.write_text(
-            '#!/bin/sh\nif [ "$1" = "selfcheck" ]; then echo "8.8.8"; exit 0; fi\nexit 0\n'
+            '#!/bin/sh\ncase " $* " in *" selfcheck "*) echo "8.8.8"; exit 0;; esac\nexit 0\n'
         )
         mismatch.chmod(0o755)
         try:
             updater.verify_new_binary(mismatch, expected_version="9.9.9")
         except RuntimeError as exc:
-            assert "exactly match" in str(exc).lower(), exc
+            assert "exact-version" in str(exc).lower(), exc
         else:
             raise AssertionError("a runnable binary reporting another version must be rejected")
 
@@ -846,6 +846,97 @@ async def t_verify_new_binary(ctx: TestContext) -> None:
             assert "self-check" in str(exc).lower() or "exit" in str(exc).lower(), exc
         else:
             raise AssertionError("a binary that fails selfcheck must be rejected")
+
+
+@test("updater", "candidate selfcheck uses an isolated accessible cwd, agent dir, and frozen env")
+async def t_verify_new_binary_isolated_context(ctx: TestContext) -> None:
+    """Regression for Friday's v0.20.5 -> v0.20.6 false rejection.
+
+    ``runuser -u friday`` inherited ``/root``. The candidate tried to stat
+    ``openagent.yaml`` there, exited 1, and the updater mislabeled that as a
+    version mismatch. The candidate must never inherit that cwd/config scope.
+    """
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch as _patch
+    import src.updater as updater
+
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured.update(command=command, kwargs=kwargs)
+        probe_dir = Path(kwargs["cwd"])
+        assert probe_dir.is_dir() and os.access(probe_dir, os.W_OK)
+        assert command[1:3] == ["--agent-dir", str(probe_dir)]
+        assert command[3:] == ["selfcheck", "--quiet", "--expect", "0.20.6"]
+        return subprocess.CompletedProcess(command, 0, b"0.20.6\n", b"")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        candidate = Path(tmp) / "openagent"
+        candidate.write_bytes(b"candidate")
+        candidate.chmod(0o755)
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(candidate.parent)
+            with (
+                _patch.dict(
+                    os.environ,
+                    {
+                        "_PYI_ARCHIVE_FILE": "/old/openagent",
+                        "LD_LIBRARY_PATH": "/tmp/_MEI-old",
+                        "LD_LIBRARY_PATH_ORIG": "/usr/local/lib",
+                    },
+                    clear=True,
+                ),
+                _patch.object(updater.subprocess, "run", side_effect=fake_run),
+            ):
+                updater.verify_new_binary(
+                    Path(candidate.name),
+                    expected_version="0.20.6",
+                )
+        finally:
+            os.chdir(previous_cwd)
+
+    env = captured["kwargs"]["env"]
+    assert Path(captured["command"][0]) == candidate.resolve()
+    assert env["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    assert env["LD_LIBRARY_PATH"] == "/usr/local/lib"
+    assert "_PYI_ARCHIVE_FILE" in env, "private bootloader variables are not edited directly"
+    assert not Path(captured["kwargs"]["cwd"]).exists(), "probe dir must be disposable"
+
+
+@test("updater", "failed candidate selfcheck reports bounded rc/stdout/stderr diagnostics")
+async def t_verify_new_binary_diagnostics(ctx: TestContext) -> None:
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    from unittest.mock import patch as _patch
+    import src.updater as updater
+
+    with tempfile.TemporaryDirectory() as tmp:
+        candidate = Path(tmp) / "openagent"
+        candidate.write_bytes(b"candidate")
+        candidate.chmod(0o755)
+        failed = subprocess.CompletedProcess(
+            [str(candidate)],
+            1,
+            b"discard-me-" + b"x" * 2000,
+            b"discard-me-" + b"y" * 2000 + b" PermissionError: openagent.yaml",
+        )
+        with _patch.object(updater.subprocess, "run", return_value=failed):
+            try:
+                updater.verify_new_binary(candidate, expected_version="0.20.6")
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("a non-zero candidate selfcheck must fail")
+
+    assert "exit=1" in message
+    assert "PermissionError: openagent.yaml" in message
+    assert "discard-me" not in message
+    assert len(message) < 1400, len(message)
 
 
 @test("updater", "selfcheck validates packaged operational SQL resources")

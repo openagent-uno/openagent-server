@@ -2185,9 +2185,16 @@ class NativeProvider(BaseModel):
                             emitted += len(marker)
                             yield marker
                     elif isinstance(event, tool_error_types):
+                        tool_exec = getattr(event, "tool", None)
+                        # Failed calls no longer arrive as a synthetic
+                        # completed+error pair.  They are still real tool
+                        # executions and must remain visible to the quality /
+                        # reply-guard trace; only vault recall attribution is
+                        # success-only.
+                        tool_trace.record_execution(tool_exec)
                         if on_status is not None:
                             await self._emit_agno_tool_status(
-                                on_status, getattr(event, "tool", None),
+                                on_status, tool_exec,
                                 error_text=getattr(event, "error", None),
                             )
                     elif isinstance(event, run_completed_types):

@@ -1070,6 +1070,9 @@ class Agent:
         # Pass an empty pool if not provided so dormant detection / system
         # prompt building still work without crashing.
         self._mcp = mcp_pool if mcp_pool is not None else MCPPool([])
+        bind_agent_runtime = getattr(self._mcp, "bind_agent_runtime", None)
+        if callable(bind_agent_runtime):
+            bind_agent_runtime(self)
 
         # Runtime DB; the long-term knowledge base still lives in the Obsidian vault via MCP.
         if isinstance(memory, str):
@@ -1402,6 +1405,7 @@ class Agent:
             try:
                 db_path = getattr(self._db, "db_path", None)
                 new_pool = await MCPPool.from_db(self._db, db_path=db_path)
+                new_pool.bind_agent_runtime(self)
                 self._mcp = new_pool
                 self._mcps_last_updated = await self._db.mcps_max_updated()
             except Exception as exc:  # noqa: BLE001 — leave the existing pool untouched

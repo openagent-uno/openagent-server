@@ -610,6 +610,11 @@ async def _arun_runtime_stream(
             elif isinstance(event, tool_error_event_types):
                 tool = getattr(event, "tool", None)
                 err_text = getattr(event, "error", None)
+                # A failed call has one terminal error event (not a preceding
+                # fake completion), but it still belongs in the run's compact
+                # execution trace. Vault recall intentionally remains
+                # success-only in the completed branch above.
+                tool_trace.record_execution(tool)
                 await _emit_status(tool, error_text=err_text)
             elif isinstance(event, run_completed_event_types):
                 # Reconcile media on the parent completion frame in case a

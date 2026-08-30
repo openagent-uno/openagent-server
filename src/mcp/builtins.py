@@ -416,6 +416,20 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
             "pin one for the current session, set the entry/router model"
         ),
     },
+    "agent-manager": {
+        # In-process by design: the update is authorized against the exact
+        # authenticated turn principal, then hot-applied to the one live Agent
+        # and Gateway. A subprocess would need a reusable owner credential and
+        # could only edit YAML without updating the running identity.
+        "in_process": True,
+        "adapter_module": "src.mcp.servers.agent_manager.adapters",
+        "runtime_toolkit_factory": "build_runtime_toolkit",
+        "description": (
+            "inspect and update this agent's display name and user-defined "
+            "persona/system prompt. It never exposes or changes OpenAgent's "
+            "immutable framework prompt"
+        ),
+    },
     "workflow-manager": {
         "dir": "workflow_manager",
         "command": ["python", "-m", "src.mcp.servers.workflow_manager.server"],
@@ -552,6 +566,7 @@ DEFAULT_MCPS: list[dict[str, Any]] = [
     {"builtin": "scheduler", "_default": True},
     {"builtin": "mcp-manager", "_default": True},
     {"builtin": "model-manager", "_default": True},
+    {"builtin": "agent-manager", "_default": True},
     {"builtin": "workflow-manager", "_default": True},
     {"builtin": "events-manager", "_default": True},
     # On by default: a spend cap the agent can't see is one it can't reason

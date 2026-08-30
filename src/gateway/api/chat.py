@@ -175,7 +175,10 @@ async def handle_chat(request: web.Request) -> web.Response:
     from src.core.on_behalf_context import OnBehalfIdentity
 
     try:
-        on_behalf_identity = OnBehalfIdentity.from_certificate(device_cert)
+        on_behalf_identity = OnBehalfIdentity.from_certificate(
+            device_cert,
+            auth_kind=str(request.get("auth_kind") or ""),
+        )
     except PermissionError:
         # The auth middleware normally makes this impossible.  Keeping the
         # missing value is safer than manufacturing a local superuser: the

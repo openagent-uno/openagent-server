@@ -194,6 +194,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # fallback on a repaired-retry failure or a recovery bug. Fake Model, no
     # live LLM. Sits by test_credential_pool: same fallback.py error boundary.
     "test_inplace_recovery",
+    # Owner-only management of the user-defined agent name/persona. Pins the
+    # immutable framework-prompt boundary, atomic YAML preservation, optimistic
+    # revisions, hot runtime application, redacted audit/broadcast payloads,
+    # in-process MCP registration and the shared REST contract. Pure-unit.
+    "test_agent_identity",
     # Every tool name the framework / dream prompts hand the model must
     # resolve to a real MCP registration. Pure-unit: introspects the
     # adapters + parses the vendored vault server; no Node, no subprocess.
@@ -298,6 +303,11 @@ _TEST_MODULES: tuple[str, ...] = (
     # delegated specialists' tool calls + content surface with the
     # specialist's own model attribution. Pure-unit; no gateway needed.
     "test_rehydration_parity",
+    # Runtime providers report failed tools on their generic completion frame.
+    # The runner must translate that frame into ONE terminal event: completed
+    # for success, error for failure.  Pure-unit coverage spans agent/team
+    # response handling and sync/async continued-tool execution.
+    "test_tool_terminal_events",
     "test_db_providers",
     # Generic LLM gateway (POST /api/llm/chat/completions) — a stateless,
     # product-neutral chat-completions passthrough over the providers

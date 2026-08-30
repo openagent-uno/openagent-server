@@ -696,6 +696,71 @@ def apply_update(new_exe: Path) -> None:
 
 
 _SELFCHECK_TIMEOUT_S = 60
+_SELFCHECK_DIAGNOSTIC_LIMIT = 512
+
+
+def _independent_binary_env() -> dict[str, str]:
+    """Return an environment suitable for launching another frozen binary.
+
+    The updater normally runs *inside* a PyInstaller onefile executable.
+    Letting the candidate inherit that process environment can make its
+    bootloader reuse private ``_PYI_*`` state or the current bundle's shared
+    library path.  The public reset switch tells the candidate bootloader to
+    start a genuinely independent application instance.  Restoring the
+    original POSIX library path prevents the old bundle's temporary ``_MEI``
+    directory from leaking into the candidate before it installs its own
+    runtime path.
+
+    Do not edit the private ``_PYI_*`` variables directly: their schema is an
+    implementation detail owned by the PyInstaller bootloader.
+    """
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    for key in (
+        "LD_LIBRARY_PATH",
+        "LIBPATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ):
+        original_key = f"{key}_ORIG"
+        if original_key in env:
+            env[key] = env[original_key]
+        else:
+            env.pop(key, None)
+    return env
+
+
+def _probe_diagnostic(data: bytes) -> str:
+    """Return a bounded, single-line tail for a failed candidate probe."""
+    text = data.decode("utf-8", "replace")
+    text = " ".join(text.split())
+    if len(text) > _SELFCHECK_DIAGNOSTIC_LIMIT:
+        text = "..." + text[-_SELFCHECK_DIAGNOSTIC_LIMIT:]
+    return text or "<empty>"
+
+
+@contextlib.contextmanager
+def _isolated_probe_dir(new_exe: Path):
+    """Give a candidate selfcheck an accessible, disposable cwd/agent dir.
+
+    An update may be requested with ``--agent-dir /srv/agent`` while the
+    invoking shell's cwd is inaccessible to the service user (for example
+    ``runuser`` inherited ``/root``).  The CLI group resolves
+    ``openagent.yaml`` before dispatching ``selfcheck``; inheriting that cwd
+    therefore turns a healthy candidate into a misleading version mismatch.
+    Keep every relative config/log lookup inside the already-private update
+    extraction tree instead.
+    """
+    # A macOS candidate lives inside the signed ``.app``.  Writing the probe
+    # directory into ``Contents/MacOS`` would mutate that bundle after the
+    # release signature was verified, so place it beside the extracted app.
+    bundle = _find_app_bundle(new_exe)
+    probe_parent = bundle.parent if bundle is not None else new_exe.parent
+    with tempfile.TemporaryDirectory(
+        prefix=".openagent_selfcheck_",
+        dir=str(probe_parent),
+    ) as probe_dir:
+        yield Path(probe_dir)
 
 
 def verify_new_binary(new_exe: Path, expected_version: str | None = None) -> None:
@@ -713,76 +778,96 @@ def verify_new_binary(new_exe: Path, expected_version: str | None = None) -> Non
     ``--version`` then ``--help`` for binaries that predate ``selfcheck``.
     A non-zero exit, a timeout, or a version mismatch raises.
 
-    NOTE: this runs under the updater's process environment, which may
-    differ from the supervisor's (launchd/systemd) env. It catches
-    "can't start at all"; the post-restart boot guard
+    The candidate runs from a private, writable cwd/agent directory and as an
+    independent PyInstaller instance.  It catches "can't start at all"; the
+    post-restart boot guard
     (:mod:`src.update_guard`) catches "starts here but unhealthy under
     the supervisor". The two layers are complementary.
     """
-    if expected_version:
-        try:
-            proc = subprocess.run(
-                [
-                    str(new_exe),
-                    "selfcheck",
-                    "--quiet",
-                    "--expect",
-                    expected_version,
-                ],
-                capture_output=True,
-                timeout=_SELFCHECK_TIMEOUT_S,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError(f"Downloaded binary is not executable: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("Downloaded binary version self-check timed out") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError("Downloaded binary version self-check could not run") from exc
-        reported = proc.stdout.decode("utf-8", "replace").strip().splitlines()
-        reported_version = reported[-1].strip() if reported else ""
-        if proc.returncode != 0 or reported_version != expected_version:
-            raise RuntimeError(
-                "Downloaded binary version does not exactly match the selected release"
-            )
-        logger.info("Pre-swap version self-check passed")
-        return
+    # Every child runs from the disposable probe directory below.  Resolve the
+    # candidate first so callers may safely pass the relative path returned by
+    # a custom downloader without making it relative to that new cwd.
+    new_exe = new_exe.resolve()
+    env = _independent_binary_env()
+    with _isolated_probe_dir(new_exe) as probe_dir:
+        if expected_version:
+            try:
+                proc = subprocess.run(
+                    [
+                        str(new_exe),
+                        "--agent-dir",
+                        str(probe_dir),
+                        "selfcheck",
+                        "--quiet",
+                        "--expect",
+                        expected_version,
+                    ],
+                    capture_output=True,
+                    timeout=_SELFCHECK_TIMEOUT_S,
+                    cwd=str(probe_dir),
+                    env=env,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(f"Downloaded binary is not executable: {exc}") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError("Downloaded binary version self-check timed out") from exc
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError("Downloaded binary version self-check could not run") from exc
+            reported = proc.stdout.decode("utf-8", "replace").strip().splitlines()
+            reported_version = reported[-1].strip() if reported else ""
+            if proc.returncode != 0 or reported_version != expected_version:
+                raise RuntimeError(
+                    "Downloaded binary failed the exact-version self-check "
+                    f"(expected={expected_version!r}, exit={proc.returncode}, "
+                    f"stdout={_probe_diagnostic(proc.stdout)!r}, "
+                    f"stderr={_probe_diagnostic(proc.stderr)!r})"
+                )
+            logger.info("Pre-swap version self-check passed")
+            return
 
-    # Probes from strongest to weakest. The FIRST one that exits cleanly
-    # proves the binary can start, and we accept. We deliberately do NOT
-    # hard-fail on an individual probe's non-zero exit: ``selfcheck`` can
-    # fail for an ENVIRONMENTAL reason (e.g. a malformed ``openagent.yaml``
-    # in the service's cwd that the CLI group callback loads) on a binary
-    # that is otherwise perfectly healthy. ``--help`` is eager in Click —
-    # it builds (hence imports) the whole command tree but runs no
-    # callback body / config load — so it's the robust floor: if it
-    # exits 0, the bundle extracted, Python started, and the import graph
-    # is intact. We only reject when EVERY probe fails (i.e. the binary
-    # genuinely can't start at all).
-    errors: list[str] = []
-    for args in (["selfcheck"], ["--version"], ["--help"]):
-        try:
-            proc = subprocess.run(
-                [str(new_exe), *args],
-                capture_output=True,
-                timeout=_SELFCHECK_TIMEOUT_S,
-            )
-        except FileNotFoundError as e:
-            # Not executable at all — no probe can succeed; fail fast.
-            raise RuntimeError(f"Downloaded binary is not executable: {e}") from e
-        except subprocess.TimeoutExpired:
-            errors.append(f"`{' '.join(args)}` timed out (>{_SELFCHECK_TIMEOUT_S}s)")
-            continue
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"`{' '.join(args)}` could not run: {e}")
-            continue
+        # Probes from strongest to weakest. The FIRST one that exits cleanly
+        # proves the binary can start, and we accept. We deliberately do NOT
+        # hard-fail on an individual probe's non-zero exit. ``--help`` is eager
+        # in Click — it builds (hence imports) the whole command tree but runs
+        # no callback body / config load — so it is the robust floor.
+        probes = (
+            ["--agent-dir", str(probe_dir), "selfcheck"],
+            ["--version"],
+            ["--help"],
+        )
+        errors: list[str] = []
+        for args in probes:
+            display_args = [arg for arg in args if arg != str(probe_dir)]
+            try:
+                proc = subprocess.run(
+                    [str(new_exe), *args],
+                    capture_output=True,
+                    timeout=_SELFCHECK_TIMEOUT_S,
+                    cwd=str(probe_dir),
+                    env=env,
+                )
+            except FileNotFoundError as e:
+                # Not executable at all — no probe can succeed; fail fast.
+                raise RuntimeError(f"Downloaded binary is not executable: {e}") from e
+            except subprocess.TimeoutExpired:
+                errors.append(
+                    f"`{' '.join(display_args)}` timed out (>{_SELFCHECK_TIMEOUT_S}s)"
+                )
+                continue
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"`{' '.join(display_args)}` could not run: {e}")
+                continue
 
-        out = (proc.stdout + proc.stderr).decode("utf-8", "replace")
-        if proc.returncode != 0:
-            errors.append(f"`{' '.join(args)}` exit {proc.returncode}: {out.strip()[:200]}")
-            continue
+            if proc.returncode != 0:
+                errors.append(
+                    f"`{' '.join(display_args)}` exit {proc.returncode}: "
+                    f"stdout={_probe_diagnostic(proc.stdout)!r}, "
+                    f"stderr={_probe_diagnostic(proc.stderr)!r}"
+                )
+                continue
 
-        logger.info("Pre-swap self-check passed (`%s`)", " ".join(args))
-        return
+            logger.info("Pre-swap self-check passed (`%s`)", " ".join(display_args))
+            return
 
     raise RuntimeError(
         "Downloaded binary failed every self-check probe — refusing to "

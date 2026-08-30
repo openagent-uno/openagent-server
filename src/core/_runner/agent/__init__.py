@@ -28,6 +28,7 @@ from src.core._run_state.agent import (
     RunPausedEvent,
     RunStartedEvent,
     ToolCallCompletedEvent,
+    ToolCallErrorEvent,
     ToolCallStartedEvent,
 )
 
@@ -58,6 +59,7 @@ __all__ = [
     "ReasoningCompletedEvent",
     "ToolCallStartedEvent",
     "ToolCallCompletedEvent",
+    "ToolCallErrorEvent",
     "get_agent_by_id",
     "get_agents",
 ]

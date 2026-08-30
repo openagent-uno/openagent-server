@@ -83,6 +83,7 @@ Server → Client::
     {"type": "context_report", "session_id": "...", "report": {...}}
     {"type": "pong"}
     {"type": "resource_event", "resource": "...", "action": "...", "id": "..."}
+    {"type": "agent_identity_changed", "name": "...", "revision": "..."}
     {"type": "system_snapshot", "snapshot": {host, cpu, memory, swap, disks, network, processes, timestamp}}
 
 The gateway also uses one private WebSocket close code.  When a freshly
@@ -197,6 +198,9 @@ QUEUED = "queued"
 PING = "ping"
 PONG = "pong"
 RESOURCE_EVENT = "resource_event"
+# Owner-controlled display identity changed.  The persona itself is never put
+# on the wire: clients only need the public display name and a revision hint.
+AGENT_IDENTITY_CHANGED = "agent_identity_changed"
 # Periodic host telemetry push (CPU/RAM/disk/network/processes). One
 # emission every ~2s when at least one client is connected. See
 # ``api/system.py``.

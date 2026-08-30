@@ -644,6 +644,48 @@ def create_team_tool_call_error_event(
     )
 
 
+def create_tool_call_terminal_event(
+    from_run_response: RunOutput, tool: ToolExecution, content: Optional[Any] = None
+) -> Union[ToolCallCompletedEvent, ToolCallErrorEvent]:
+    """Create the one terminal event for an agent tool execution.
+
+    Providers report both successful and failed executions through their
+    ``tool_call_completed`` model-response frame.  A failed execution is
+    terminally an error, not a completion followed by an error: emitting both
+    gives stream consumers two mutually exclusive states for the same call.
+    The final ``ToolExecution`` remains on ``RunOutput.tools`` either way, so
+    durable history keeps the result and error flag unchanged.
+    """
+    if tool.tool_call_error:
+        return create_tool_call_error_event(
+            from_run_response=from_run_response,
+            tool=tool,
+            error=str(tool.result),
+        )
+    return create_tool_call_completed_event(
+        from_run_response=from_run_response,
+        tool=tool,
+        content=content,
+    )
+
+
+def create_team_tool_call_terminal_event(
+    from_run_response: TeamRunOutput, tool: ToolExecution, content: Optional[Any] = None
+) -> Union[TeamToolCallCompletedEvent, TeamToolCallErrorEvent]:
+    """Create the one terminal event for a team tool execution."""
+    if tool.tool_call_error:
+        return create_team_tool_call_error_event(
+            from_run_response=from_run_response,
+            tool=tool,
+            error=str(tool.result),
+        )
+    return create_team_tool_call_completed_event(
+        from_run_response=from_run_response,
+        tool=tool,
+        content=content,
+    )
+
+
 def create_run_output_content_event(
     from_run_response: RunOutput,
     content: Optional[Any] = None,

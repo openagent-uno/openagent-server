@@ -29,7 +29,7 @@ from src.gateway.capabilities import (
     CapabilityRegistry,
     ClientCapabilityError,
 )
-from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api, operational as operational_api, artifacts as artifacts_api, custom_views as custom_views_api
+from src.gateway.api import vault, config, health, logs, control, usage, providers, models, scheduled_tasks, workflow_tasks, mcps, marketplace, sessions as sessions_api, system as system_api, network as network_api, chat as chat_api, terminals as terminals_api, commands as commands_api, events as events_api, budgets as budgets_api, quality as quality_api, llm as llm_api, skills as skills_api, accounts as accounts_api, operational as operational_api, artifacts as artifacts_api, custom_views as custom_views_api, agent_identity as agent_identity_api
 from src.network import peers as peers_api
 from src.network.auth.middleware import make_auth_middleware
 from src.network.transport.aiohttp_iroh_site import IrohSite
@@ -165,6 +165,16 @@ class Gateway:
         self.config_path = config_path
         self._stop_event = stop_event
         self.sessions = SessionManager(agent_name=agent.name)
+        # The MCP pool is already connected when the Gateway is constructed.
+        # Bind lazily-consumed live state so agent-manager can update session
+        # prefixes and notify clients without a second process credential.
+        bind_gateway_runtime = getattr(
+            getattr(self.agent, "_mcp", None),
+            "bind_gateway_runtime",
+            None,
+        )
+        if callable(bind_gateway_runtime):
+            bind_gateway_runtime(self)
         # PTY-backed interactive terminals (the "SSH terminal" surface).
         # Keyed by (connection_id, terminal_id); device identity is audit/auth
         # metadata only. This lets Desktop and CLI share a device certificate
@@ -1374,6 +1384,8 @@ class Gateway:
             ("GET", "/api/config", config.handle_get),
             ("PUT", "/api/config", config.handle_put),
             ("PATCH", "/api/config/{section}", config.handle_patch),
+            ("GET", "/api/agent/identity", agent_identity_api.handle_get),
+            ("PATCH", "/api/agent/identity", agent_identity_api.handle_patch),
             ("GET", "/api/scheduled-tasks", scheduled_tasks.handle_list),
             ("POST", "/api/scheduled-tasks", scheduled_tasks.handle_create),
             ("GET", "/api/scheduled-tasks/{id}", scheduled_tasks.handle_get),
@@ -2280,7 +2292,10 @@ class Gateway:
                         client_id,
                         data,
                         handle=cert.handle,
-                        on_behalf_identity=OnBehalfIdentity.from_certificate(cert),
+                        on_behalf_identity=OnBehalfIdentity.from_certificate(
+                            cert,
+                            auth_kind=str(request.get("auth_kind") or ""),
+                        ),
                         trusted_bridge="bridge" in set(cert.capabilities or ()),
                         connection_id=connection_id,
                         device_pubkey=cert.device_pubkey,

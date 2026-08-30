@@ -27,9 +27,19 @@ class OnBehalfIdentity:
     principal_type: str
     handle: str
     device_id: str
+    # Provenance of the authenticated ingress. Identity-changing capabilities
+    # require device-certificate proof; a full HTTP token is an integration
+    # credential and must not become an owner impersonation primitive merely
+    # through X-OpenAgent-Handle.
+    auth_kind: str = "device_cert"
 
     @classmethod
-    def from_certificate(cls, cert: Any) -> "OnBehalfIdentity":
+    def from_certificate(
+        cls,
+        cert: Any,
+        *,
+        auth_kind: str = "device_cert",
+    ) -> "OnBehalfIdentity":
         if cert is None:
             raise PermissionError("authenticated device context is required")
         tenant = str(getattr(cert, "network_id", "") or "").strip()
@@ -41,7 +51,7 @@ class OnBehalfIdentity:
             raise PermissionError("authenticated device context is incomplete")
         if any(len(value) > 1024 for value in (tenant, handle, device)):
             raise PermissionError("authenticated device context is invalid")
-        return cls(tenant, principal_type, handle, device)
+        return cls(tenant, principal_type, handle, device, auth_kind)
 
 
 _identity_var: contextvars.ContextVar[OnBehalfIdentity | None] = contextvars.ContextVar(

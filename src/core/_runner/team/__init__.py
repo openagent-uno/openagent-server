@@ -16,6 +16,7 @@ from src.core._run_state.team import (
     TeamRunOutput,
     TeamRunOutputEvent,
     ToolCallCompletedEvent,
+    ToolCallErrorEvent,
     ToolCallStartedEvent,
 )
 from src.core._runner.team.mode import TeamMode
@@ -42,6 +43,7 @@ __all__ = [
     "ReasoningCompletedEvent",
     "ToolCallStartedEvent",
     "ToolCallCompletedEvent",
+    "ToolCallErrorEvent",
     "get_team_by_id",
     "get_teams",
 ]

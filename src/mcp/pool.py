@@ -610,6 +610,12 @@ class MCPPool:
         # ``from_config`` callers (tests) — reload is a no-op in that mode.
         self._db: Any = None
         self._db_path: str | None = None
+        # Live process objects for principal-bound management MCPs. They are
+        # never serialized into subprocess MCPs; in-process adapters resolve
+        # them lazily at call time so pool construction can still precede the
+        # Gateway lifecycle.
+        self.agent_runtime: Any | None = None
+        self.gateway_runtime: Any | None = None
         # Installed by the live Scheduler.  It is deliberately an in-process
         # callback rather than durable state: only a synchronous
         # ``workflow-manager.run_workflow(wait=True)`` call made inside a
@@ -622,6 +628,16 @@ class MCPPool:
         # may change ``self._tool_counts``. The render is a 1-2ms walk
         # that adds up across every prompt construction.
         self._catalog_summary_cache: str | None = None
+
+    def bind_agent_runtime(self, agent: Any | None) -> None:
+        """Attach the one live Agent to in-process management toolkits."""
+
+        self.agent_runtime = agent
+
+    def bind_gateway_runtime(self, gateway: Any | None) -> None:
+        """Attach the live Gateway once it exists (after MCP pool startup)."""
+
+        self.gateway_runtime = gateway
 
     def bind_interactive_workflow_runner(self, runner: Any | None) -> None:
         """Bind the live, non-durable workflow executor entry point.

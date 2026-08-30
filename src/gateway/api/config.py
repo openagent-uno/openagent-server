@@ -62,6 +62,7 @@ async def handle_get(request):
 #: yaml — creating them there is a silent no-op at runtime and confuses
 #: users who expect edits to take effect.
 DB_OWNED_SECTIONS = frozenset({"providers", "models", "mcp", "mcps", "scheduled", "scheduled_tasks"})
+IDENTITY_SECTIONS = frozenset({"name", "system_prompt"})
 
 
 def _strip_db_owned(data: dict) -> dict:
@@ -72,6 +73,24 @@ def _strip_db_owned(data: dict) -> dict:
 async def handle_put(request):
     from aiohttp import web
     data = await request.json()
+    if not isinstance(data, dict):
+        return web.json_response({"error": "config body must be an object"}, status=400)
+    current = _read_raw(request)
+    # A full replacement has no revision field and historically bypassed all
+    # identity ACL/validation. Keep it for non-identity configuration, but
+    # require the dedicated owner-scoped PATCH surface for these two fields.
+    missing = object()
+    identity_changed = any(
+        data.get(section, missing) != current.get(section, missing)
+        for section in IDENTITY_SECTIONS
+    )
+    if identity_changed:
+        return web.json_response({
+            "error": (
+                "name and system_prompt cannot be changed through full config PUT; "
+                "use PATCH /api/agent/identity"
+            ),
+        }, status=400)
     _write_raw(request, _strip_db_owned(data))
     elog("config.update", section="full")
     return web.json_response({"ok": True, "restart_required": True})
@@ -101,6 +120,34 @@ def _merge_section(existing: Any, patch: Any) -> Any:
 async def handle_patch(request):
     from aiohttp import web
     section = request.match_info["section"]
+    if section in IDENTITY_SECTIONS:
+        # Compatibility route for released clients. It delegates to the exact
+        # same owner-bound service as /api/agent/identity, so old clients do
+        # not become an ACL/CAS/hot-apply bypass on an upgraded gateway.
+        from . import agent_identity as agent_identity_api
+
+        try:
+            try:
+                value = await request.json()
+            except Exception as exc:  # noqa: BLE001
+                from src.core.agent_identity import AgentIdentityInputError
+
+                raise AgentIdentityInputError(
+                    "request body must contain valid JSON",
+                ) from exc
+            kwargs = {section: value}
+            result = await agent_identity_api.service_for_request(request).update(
+                agent_identity_api.actor_for_request(request),
+                **kwargs,
+            )
+            return web.json_response({
+                "ok": True,
+                "restart_required": False,
+                section: result[section],
+                "revision": result["revision"],
+            })
+        except Exception as exc:  # noqa: BLE001
+            return agent_identity_api.error_response(exc)
     if section in DB_OWNED_SECTIONS:
         return web.json_response(
             {
