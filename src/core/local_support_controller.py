@@ -2244,6 +2244,44 @@ def _form_fields(text: str) -> dict[str, str]:
     return out
 
 
+def _form_fields_in_thread(thread: Any, message: str) -> dict[str, str]:
+    """Every form field the customer has given ANYWHERE on this thread.
+
+    `_form_fields` reads one message, and the trailer only rides on the FIRST
+    one: a web form posts `app_version` / `device` / `os` once and every reply
+    after it is plain prose. Reading only the latest message therefore made the
+    thread forget, on turn two, everything the form had said on turn one - and
+    the generic fallback then asked for it again. Measured 30-Aug-2026: a
+    customer whose first message carried `app_version: 1.4.11` and `device:
+    samsung SM-S947B` was answered "mi servono piu' dettagli sul dispositivo e
+    sulla versione dell'app" when he asked whether his bug had been fixed. He
+    wrote back that he had not expected reporting a bug to mean being a guinea
+    pig.
+
+    Oldest first, later values overriding earlier ones, so a device the
+    customer corrects by hand ("actually I'm on the S26+") wins over the
+    trailer. The current message is merged last for the same reason.
+    """
+    known: dict[str, str] = {}
+    messages = (thread or {}).get("messages") if isinstance(thread, dict) else None
+    if isinstance(messages, list):
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("direction") or "").lower() != "inbound":
+                continue
+            text = ""
+            for key in ("body_text", "text", "body", "content"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    text = value
+                    break
+            if text:
+                known.update(_form_fields(text))
+    known.update(_form_fields(message or ""))
+    return known
+
+
 def _bug_evidence_missing(text: str) -> list[str]:
     low = text.lower()
     fields = _form_fields(text)
@@ -3331,12 +3369,18 @@ def _fallback_reply(state: SupportState) -> str:
                 "No diagnostic log has arrived yet. Reproduce the issue once more while the app is online, then leave it open and in the foreground for about 30 seconds before replying here - the upload only runs while the app is in front. Diagnostics remain active."
             )
         if state.outcome.endswith("_human"):
+            # "It needs manual review" is triage language: true, and it tells
+            # the customer nothing about why he is waiting. Same fact said as a
+            # person would say it, with the reason attached — and still no
+            # promise about who answers or when, which nothing here can back.
             return (
-                "Grazie per la segnalazione. Serve una verifica manuale prima "
-                "di poter confermare la causa o una correzione."
+                "Grazie della segnalazione. Prima di indicarti una causa o una "
+                "correzione serve una verifica fatta a mano: preferiamo "
+                "controllare piuttosto che darti una risposta sbagliata."
                 if italian else
-                "Thanks for the report. It needs manual review before we can "
-                "confirm a cause or a fix."
+                "Thanks for the report. Before we name a cause or a fix it "
+                "needs a manual check: we would rather look properly than give "
+                "you a wrong answer."
             )
         if state.outcome == "bug_created":
             task = state.facts.get("clickup_task") or {}
@@ -3442,20 +3486,41 @@ def _fallback_reply(state: SupportState) -> str:
             if italian else
             "Thanks for writing. We are looking at this and will answer you here."
         )
-    if state.outcome == "general_needs_detail" and state.facts.get(
-        "already_known_from_form"
-    ):
+    # The last resort, and therefore the sentence a customer is most likely to
+    # get when nothing else matched — including in answer to a question we
+    # could not route. It used to be a bare demand for the device and the app
+    # version: sent 35 times in a fortnight and, in one case, to a man who had
+    # given both in his first message and was only asking whether his bug had
+    # been fixed. He replied that he had not expected reporting a bug to mean
+    # being a guinea pig. Two rules now:
+    #
+    #   * never ask for what the thread already carries —
+    #     `already_known_from_form` is read across the whole thread, so the
+    #     trailer on message one still counts on message five;
+    #   * say what we have and why the rest is needed. "I need more detail" is
+    #     an order; "I have your device and version, what I am missing is the
+    #     step" is somebody who actually read.
+    known = state.facts.get("already_known_from_form") or {}
+    if known:
         return (
-            "Ho già dispositivo, sistema operativo e versione dell’app. Dimmi "
-            "cosa succede esattamente e in quale passaggio."
+            "Dispositivo, sistema operativo e versione dell’app ce li ho già, "
+            "grazie. Quello che mi manca è il passaggio: dimmi cosa fai "
+            "nell’app e cosa succede al posto di quello che ti aspetti, così "
+            "provo a riprodurlo."
             if italian else
-            "I already have the device, OS, and app version. Tell me exactly "
-            "what happens and at which step."
+            "I already have your device, OS and app version, thank you. What "
+            "I am missing is the step itself: tell me what you do in the app "
+            "and what happens instead of what you expect, and I will try to "
+            "reproduce it."
         )
     return (
-        "Mi servono più dettagli sul comportamento, sul dispositivo e sulla versione dell’app."
+        "Per capire cosa sta succedendo mi servirebbe qualche dettaglio in "
+        "più: cosa fai nell’app, cosa succede al posto di quello che ti "
+        "aspetti e, se ce l’hai sottomano, dispositivo e versione dell’app."
         if italian else
-        "I need more detail about the behavior, device, and app version."
+        "To work out what is happening I need a little more: what you do in "
+        "the app, what happens instead of what you expect and, if you have "
+        "them to hand, your device and app version."
     )
 
 
@@ -5463,7 +5528,8 @@ async def run(
         # Everything the form already told us. Asking a customer to repeat it
         # is the single most mechanical thing the agent can do.
         known = {
-            key: value for key, value in _form_fields(message).items()
+            key: value
+            for key, value in _form_fields_in_thread(thread, message).items()
             if key in ("app_version", "native_version", "device", "os", "platform")
             and value
         }

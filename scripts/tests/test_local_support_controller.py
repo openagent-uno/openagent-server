@@ -513,7 +513,10 @@ async def t_general_local_composer(_ctx: TestContext) -> None:
     assert model.saw_empty_tools is True
     assert model.saw_strict_local is True
     assert "premium is active" not in output["reply"].lower(), output
-    assert "more detail" in output["reply"].lower(), output
+    # Asked for what is missing, and asked as a person: the old wording here
+    # was the bare order "I need more detail about the behavior, device, and
+    # app version."
+    assert "what you do in the app" in output["reply"].lower(), output
 
     known_result = await run(
         agent=SimpleNamespace(_mcp=pool, model=model),
@@ -532,7 +535,46 @@ async def t_general_local_composer(_ctx: TestContext) -> None:
     known_reply = known_output["reply"].lower()
     assert known_output["outcome"] == "general_needs_detail", known_output
     assert "already have" in known_reply, known_output
-    assert "tell me exactly what happens" in known_reply, known_output
+    assert "what i am missing is the step" in known_reply, known_output
+
+    # The trailer rides on the FIRST message only. A customer who then writes
+    # a bare follow-up - "have you fixed it?" - must still count as known, or
+    # the fallback asks him for the version printed at the top of his own
+    # thread. That is what reached a real customer on 30-Aug-2026, and what he
+    # answered by saying he had not signed up to be a guinea pig.
+    async def threads_get_with_history(thread_id: str) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "id": thread_id,
+            "messages": [
+                {"direction": "inbound", "body_text": (
+                    "Non funziona.\n---\napp_version: 1.4.11\n"
+                    "device: samsung SM-S947B\nos: Android 16\nplatform: android"
+                )},
+                {"direction": "outbound", "body_text": "Ci stiamo guardando."},
+                {"direction": "inbound", "body_text": "Avete sistemato?"},
+            ],
+        }
+
+    history_pool = _Pool({
+        "replio": _Toolkit({"replio_threads_get": threads_get_with_history}),
+        "vault": _Toolkit({"vault_read_note": vault_read_note}),
+    })
+    followup = await run(
+        agent=SimpleNamespace(_mcp=history_pool, model=model),
+        event={"slug": "replio-thread", "model": ""},
+        payload={"payload": {
+            "thread_id": "thread-general-followup",
+            "message": {"body_text": "Avete sistemato?"},
+        }},
+        session_id="test-general-followup",
+        delivery_id="test-general-followup-delivery",
+    )
+    followup_reply = json.loads(followup.text)["reply"].lower()
+    # The "we already have it" branch, reached from the thread rather than
+    # from this message: nothing is asked for a second time.
+    assert "ce li ho gi\u00e0" in followup_reply, followup_reply
+    assert "quello che mi manca \u00e8 il passaggio" in followup_reply, followup_reply
 
 
 class _Doubles:
