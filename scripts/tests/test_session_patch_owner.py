@@ -71,6 +71,12 @@ class _FakeRequest(dict):
         agent.memory_db = db
         gateway = _Holder()
         gateway.agent = agent
+        gateway.broadcasts = []
+
+        async def _broadcast(resource, action, resource_id=None):
+            gateway.broadcasts.append((resource, action, resource_id))
+
+        gateway.broadcast_resource = _broadcast
         self.app = {"gateway": gateway}
         self.match_info = {"session_id": session_id}
         self._body = body
@@ -104,6 +110,24 @@ async def t_handle_wins(ctx: TestContext) -> None:
     # on every device the user owns.
     assert db.calls == [{"session_id": "s1", "client_id": "marco",
                          "title": "ciao", "model": None}], db.calls
+
+
+@test("session_patch_owner", "a committed rename notifies connected clients")
+async def t_rename_broadcasts_after_commit(ctx: TestContext) -> None:
+    db = _FakeDB()
+    request = _FakeRequest(
+        db,
+        {"title": "New durable title"},
+        values={"user_handle": "marco", "client_id": "marco-device"},
+    )
+    from src.gateway.api import sessions as api
+
+    response = await api.handle_patch_metadata(request)
+    assert response.status == 200
+    assert request.app["gateway"].broadcasts == [
+        ("session", "created", "s1"),
+    ]
+    assert json.loads(response.body.decode())["title"] == "New durable title"
 
 
 @test("session_patch_owner", "agent certificates retain their typed principal")

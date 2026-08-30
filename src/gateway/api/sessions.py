@@ -953,7 +953,28 @@ async def handle_patch_metadata(request):
         title=title,
         model=model,
     )
-    return web.json_response({"session_id": session_id, "ok": True})
+    # The row and its normalized history projection are committed before any
+    # client is told to refresh. This keeps other signed-in devices in sync
+    # after an explicit rename instead of requiring an app restart. Older
+    # test/headless gateways may not expose the broadcaster, hence the
+    # capability check rather than making persistence depend on fan-out.
+    gateway = request.app.get("gateway")
+    broadcast = getattr(gateway, "broadcast_resource", None)
+    if callable(broadcast):
+        try:
+            await broadcast(
+                "session",
+                "created" if legacy_row is None else "updated",
+                session_id,
+            )
+        except Exception as exc:  # pragma: no cover - production fan-out is best effort
+            logger.debug("session metadata broadcast failed for %s: %s", session_id, exc)
+    return web.json_response({
+        "session_id": session_id,
+        "ok": True,
+        **({"title": title} if title else {}),
+        **({"model": model} if model else {}),
+    })
 
 
 async def handle_get(request):
