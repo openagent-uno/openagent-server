@@ -615,6 +615,15 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+_ACTIVITY_PARENT_TITLE_SQL = (
+    "CASE a.parent_type "
+    "WHEN 'workflow' THEN (SELECT name FROM workflow_tasks WHERE id=a.parent_id) "
+    "WHEN 'scheduled_task' THEN (SELECT name FROM scheduled_tasks WHERE id=a.parent_id) "
+    "WHEN 'event' THEN (SELECT name FROM events WHERE id=a.parent_id) "
+    "END AS parent_title"
+)
+
+
 async def _activity_rows(conn: Any, access: AccessContext, filters: dict[str, Any]) -> list[Any]:
     clauses = [
         "a.tenant_id=?",
@@ -685,7 +694,7 @@ def _activity_json(row: Any) -> dict[str, Any]:
         parent = {
             "kind": str(row["parent_type"]),
             "id": str(row["parent_id"]),
-            "title": str(row["parent_id"]),
+            "title": str(row["parent_title"] or row["parent_id"]),
         }
     status = row["status"]
     return {
@@ -879,7 +888,8 @@ async def handle_history(request: web.Request) -> web.Response:
         for activity_id in selected_ids:
             row = await (
                 await conn.execute(
-                    "SELECT a.*, COALESCE(s.completeness, 'unknown') AS completeness "
+                    "SELECT a.*, COALESCE(s.completeness, 'unknown') AS completeness, "
+                    f"{_ACTIVITY_PARENT_TITLE_SQL} "
                     "FROM activity_items a LEFT JOIN sessions_v2 s "
                     "ON a.resource_type='session' AND s.id=a.resource_id AND s.tenant_id=a.tenant_id "
                     "WHERE a.activity_id=? AND a.deleted_at_ms IS NULL",

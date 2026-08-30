@@ -1515,6 +1515,10 @@ async def t_acl_history_messages_and_snapshot(_ctx: TestContext) -> None:
             assert {item["kind"] for item in history["items"]} >= {
                 "chat", "delegated_session", "workflow_run", "scheduled_run", "event_delivery",
             }
+            history_by_kind = {item["kind"]: item for item in history["items"]}
+            assert history_by_kind["workflow_run"]["parent"]["title"] == "Orchid workflow"
+            assert history_by_kind["scheduled_run"]["parent"]["title"] == "Orchid schedule"
+            assert history_by_kind["event_delivery"]["parent"]["title"] == "Orchid event"
             assert all(item["resource_id"] != "forbidden-chat" for item in history["items"])
             assert set(history) == {"items", "next_cursor", "has_more", "revision", "snapshot"}
 
