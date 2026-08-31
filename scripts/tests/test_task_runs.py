@@ -93,6 +93,93 @@ async def t_list(ctx: TestContext) -> None:
             pass
 
 
+@test("task_runs", "an interrupted run goes back in the queue")
+async def t_requeue_interrupted(ctx: TestContext) -> None:
+    """A restart kills the firing; the reap settles the row. The work still
+    owes, so the task is re-enqueued through the same path a manual run uses."""
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-requeue-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        weekly = await db.add_task("W", "0 9 * * 1", "p")
+
+        await db.add_task_run(task_id=weekly)  # left 'running' by the restart
+        await db.reap_orphan_task_runs()
+
+        requeued = await db.requeue_interrupted_task_runs()
+        assert requeued == [weekly], requeued
+
+        pending = await db.claim_pending_task_requests(limit=10)
+        assert [r["task_id"] for r in pending] == [weekly]
+        assert pending[0]["trigger"] == "restart-requeue"
+
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "a task killed twice running is not retried into a loop")
+async def t_requeue_stops_after_second_kill(ctx: TestContext) -> None:
+    """If the run before the reaped one was ALSO reaped, we already retried and
+    got killed again — the likeliest cause is this task taking the process
+    down, so it is left for a human instead of looping."""
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-loop-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("T", "0 9 * * 1", "p")
+
+        first = await db.add_task_run(task_id=task_id)
+        await db.reap_orphan_task_runs()
+        assert await db.requeue_interrupted_task_runs() == [task_id]
+        # Drain the request so it is not the reason the second pass skips.
+        await db.claim_pending_task_requests(limit=10)
+
+        second = await db.add_task_run(task_id=task_id)
+        assert second != first
+        await db.reap_orphan_task_runs()
+
+        assert await db.requeue_interrupted_task_runs() == []
+
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "a disabled task is not resurrected by the requeue")
+async def t_requeue_skips_disabled(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-disabled-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("D", "0 9 * * 1", "p")
+        await db.update_task(task_id, enabled=0)
+
+        await db.add_task_run(task_id=task_id)
+        await db.reap_orphan_task_runs()
+
+        assert await db.requeue_interrupted_task_runs() == []
+
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("task_runs", "reap flips orphaned running rows to failed")
 async def t_reap(ctx: TestContext) -> None:
     from src.memory.db import MemoryDB

@@ -1338,6 +1338,17 @@ def _build_agent(config: dict) -> Agent:
                 int(_vgit_cfg["autocommit_seconds"]))
         except (TypeError, ValueError):
             pass
+    # Off-machine copy. A vault that is committed every 25 seconds and pushed
+    # nowhere still dies with its volume, and an agent's vault is months of
+    # accumulated operational knowledge.
+    if _vgit_cfg.get("remote"):
+        os.environ["OPENAGENT_VAULT_GIT_REMOTE"] = str(_vgit_cfg["remote"])
+    if "push_seconds" in _vgit_cfg:
+        try:
+            os.environ["OPENAGENT_VAULT_GIT_PUSH_SECONDS"] = str(
+                int(_vgit_cfg["push_seconds"]))
+        except (TypeError, ValueError):
+            pass
     for _k, _env in (("author_name", "OPENAGENT_VAULT_GIT_NAME"),
                      ("author_email", "OPENAGENT_VAULT_GIT_EMAIL")):
         if _vgit_cfg.get(_k):
@@ -1812,6 +1823,19 @@ class AgentServer:
                     reaped_tasks = await db.reap_orphan_task_runs()
                     if reaped_tasks:
                         elog("task.orphan_reaped", count=reaped_tasks)
+                    # Settling the row stops the badge spinning; it does NOT
+                    # do the work the killed firing owed. Put those tasks back
+                    # in the queue — for an hourly task the next tick would
+                    # have covered it, but a weekly one loses the week and the
+                    # only trace is a `failed` row nobody reads.
+                    if hasattr(db, "requeue_interrupted_task_runs"):
+                        requeued = await db.requeue_interrupted_task_runs()
+                        if requeued:
+                            elog(
+                                "task.interrupted_requeued",
+                                count=len(requeued),
+                                tasks=",".join(requeued[:10]),
+                            )
                 # And webhook event deliveries left mid-flight by a crash.
                 if hasattr(db, "reap_orphan_event_deliveries"):
                     reaped_ev = await db.reap_orphan_event_deliveries()

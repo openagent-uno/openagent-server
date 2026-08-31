@@ -334,6 +334,20 @@ class Scheduler:
                     if task.get("last_run"):
                         await self.db.update_task(task["id"], enabled=0, next_run=None)
                     continue
+                # A next_run already in the past is a slot that elapsed while
+                # we were down. Recalculating from `now` drops it on purpose —
+                # firing every missed window would stampede — but dropping it
+                # SILENTLY is how a weekly task goes missing for a week with no
+                # trace. Say it once, here, so the gap is searchable.
+                missed_at = task.get("next_run")
+                if isinstance(missed_at, (int, float)) and missed_at < now:
+                    elog(
+                        "scheduler.slot_missed",
+                        level="warning",
+                        task=task["name"],
+                        due=float(missed_at),
+                        late_seconds=round(now - float(missed_at)),
+                    )
                 await self.db.update_task(
                     task["id"],
                     next_run=self._next_run(

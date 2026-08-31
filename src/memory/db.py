@@ -2628,6 +2628,73 @@ class MemoryDB:
         await conn.commit()
         return reaped + (cancel_cursor.rowcount or 0)
 
+    async def requeue_interrupted_task_runs(self) -> list[str]:
+        """Re-enqueue the tasks whose firing a process restart killed.
+
+        ``reap_orphan_task_runs`` settles the zombie row so the badge stops
+        spinning, and treats that as the whole job — the docstring calls it
+        cosmetic. It is not: a firing that died under a restart never did its
+        work. For an hourly task the next tick covers it; for a weekly one
+        (``0 9 * * 1``) the week's output simply does not exist, and the only
+        trace is a ``failed`` row nobody reads. Seen on 2026-08-31: a WAL-pin
+        restart killed ``esound-manager-review`` mid-run and the Monday review
+        was lost until someone went looking for it.
+
+        So an interrupted run goes back in the queue, through the same
+        ``task_run_requests`` path a manual "run now" uses.
+
+        Two guards, both about not making it worse:
+
+        * **once per interruption.** If the run BEFORE the reaped one was
+          itself a reaped orphan, we already retried and got killed again —
+          the likeliest reason is that this task is what takes the process
+          down. Retrying it forever would turn a crash into a crash loop, so
+          it is left alone for a human.
+        * **no duplicate requests.** A task that already has an unclaimed
+          request is skipped; the pending one will fire it.
+
+        Call AFTER ``reap_orphan_task_runs``, which is what stamps the marker
+        this reads. Returns the task ids re-enqueued.
+        """
+        conn = await self._ensure_connected()
+        marker = "reaped: orphan from prior process"
+        cursor = await conn.execute(
+            "SELECT r.id, r.task_id FROM task_runs AS r "
+            "JOIN scheduled_tasks AS t ON t.id = r.task_id "
+            "WHERE r.status = 'failed' AND r.error LIKE ? AND t.enabled = 1",
+            (f"%{marker}%",),
+        )
+        candidates = [(row[0], row[1]) for row in await cursor.fetchall()]
+
+        requeued: list[str] = []
+        for run_id, task_id in candidates:
+            pending = await conn.execute(
+                "SELECT 1 FROM task_run_requests "
+                "WHERE task_id = ? AND claimed_at IS NULL LIMIT 1",
+                (task_id,),
+            )
+            if await pending.fetchone():
+                continue
+
+            # The run immediately before this one, for the same task.
+            prev = await conn.execute(
+                "SELECT error FROM task_runs "
+                "WHERE task_id = ? AND id <> ? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (task_id, run_id),
+            )
+            prev_row = await prev.fetchone()
+            if prev_row and marker in (prev_row[0] or ""):
+                continue
+
+            if task_id not in requeued:
+                await self.enqueue_task_run_request(
+                    task_id=task_id, trigger="restart-requeue",
+                )
+                requeued.append(task_id)
+
+        return requeued
+
     async def prune_task_runs(self, task_id: str, *, keep_last: int = 50) -> int:
         """Delete all but the most recent ``keep_last`` runs for a task.
         Returns the number of rows removed."""
