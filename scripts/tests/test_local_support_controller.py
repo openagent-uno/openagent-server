@@ -404,6 +404,69 @@ async def t_ads_policy_routes(_ctx: TestContext) -> None:
     assert "friends" in implicit_reply and "video" in implicit_reply, implicit
 
 
+@test("local_support_controller", "a subscriber is never told how to earn Premium free")
+async def t_ads_lane_yields_to_the_account(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import run
+
+    calls: list[str] = []
+
+    async def threads_get(thread_id: str) -> dict[str, Any]:
+        calls.append("replio_get")
+        return {"ok": True, "id": thread_id, "messages": []}
+
+    async def vault_read_note(path: str) -> dict[str, Any]:
+        calls.append("vault:" + path)
+        return {"ok": True, "content": "canonical router"}
+
+    async def by_email(projectId: str, query: dict[str, Any]) -> dict[str, Any]:
+        calls.append("billing:" + str(query.get("email")))
+        return {"ok": True, "status": 200, "appUserId": "paying-1",
+                "isPremium": True, "store": "google"}
+
+    async def customer(appUserId: str) -> dict[str, Any]:
+        calls.append("billing:" + appUserId)
+        return {
+            "ok": True,
+            "status": 200,
+            "isPremium": True,
+            "store": "google",
+            "clientVersion": "5.2.3",
+            "subscriptions": [{"id": "sub-1", "status": "active"}],
+            "entitlements": [{"id": "premium", "status": "active"}],
+        }
+
+    pool = _Pool({
+        "replio": _Toolkit({"replio_threads_get": threads_get}),
+        "vault": _Toolkit({"vault_read_note": vault_read_note}),
+        "billingbear": _Toolkit({
+            "billingbear_get_customer_by_email": by_email,
+            "billingbear_get_v1_customers_by_appUserId": customer,
+        }),
+    })
+    # Worded as a pure policy complaint - no purchase claimed - but written by
+    # somebody who is paying. `signal_present` answers None for "absent",
+    # "undecided" AND "embedder unavailable", so the account has to settle it.
+    result = await run(
+        agent=SimpleNamespace(_mcp=pool, model=_Model()),
+        event={"slug": "replio-thread", "model": ""},
+        payload={"payload": {
+            "thread_id": "ads-paying",
+            "product": "esound",
+            "message": {"body_text": (
+                "Too many ads while I listen, how do I remove them?\n"
+                "---\naccount_email: listener@example.com\nplatform: android"
+            )},
+        }},
+        session_id="ads-paying-session",
+        delivery_id="ads-paying-delivery",
+    )
+    output = json.loads(result.text)
+    assert output["outcome"] != "ads_policy_explained", output
+    assert output["facts"].get("ads_claim_overruled_by_account") is True, output
+    low = output["reply"].lower()
+    assert "invit" not in low and "referral" not in low, output["reply"]
+
+
 @test("local_support_controller", "diagnostic proof is PII-free and dry runs never authorize a claim")
 async def t_diagnostic_proof_envelope(_ctx: TestContext) -> None:
     from src.core.local_support_controller import (

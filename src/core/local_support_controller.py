@@ -6004,6 +6004,24 @@ async def run(
                 if paid_claim is not None:
                     ads_policy_only = False
                     state.facts["paid_claim_semantic"] = paid_claim.as_facts()
+                if ads_policy_only and (app_user_id or email or sender_email):
+                    # The account outranks both the regex and the embedder.
+                    # `signal_present` returns None for "absent", "undecided"
+                    # AND "embedder unavailable", so an embedder hiccup alone
+                    # was enough to send a paying customer the free-Premium
+                    # routes. Measured 31-Aug-2026: a subscriber forwarded his
+                    # Google Play receipt and was told he could earn Premium
+                    # by inviting friends. A live subscription is not an
+                    # opinion - look it up before taking that lane.
+                    verified = await _billing_lookup(
+                        pool, app_user_id, email or sender_email, state.tenant,
+                    )
+                    already_paying, _store, _version, _subs = _customer_lookup_state(
+                        verified
+                    )
+                    if already_paying:
+                        ads_policy_only = False
+                        state.facts["ads_claim_overruled_by_account"] = True
             if state.intent == "premium" and ads_policy_only:
                 # "Too many ads" is a product-policy complaint, not evidence
                 # that this person bought Premium. Give the verified exits
