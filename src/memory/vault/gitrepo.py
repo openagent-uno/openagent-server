@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -55,6 +56,14 @@ def resolve_git_bin() -> Optional[str]:
     except Exception:  # noqa: BLE001
         pass
     return shutil.which("git")
+
+
+_CREDENTIAL_IN_URL = re.compile(r"(https?://)[^/@\s]+@")
+
+
+def _redact_url(text: str) -> str:
+    """Strip ``user:token@`` out of anything we are about to log."""
+    return _CREDENTIAL_IN_URL.sub(r"\1***@", text or "")
 
 
 def _author() -> tuple[str, str]:
@@ -125,6 +134,42 @@ class VaultGit:
 
     def is_repo(self) -> bool:
         return (self.vault_root / ".git").exists()
+
+    # ── off-machine copy ──────────────────────────────────────────────
+
+    def push(self, remote_url: str, branch: str = "") -> dict:
+        """Mirror the vault's history to ``remote_url``.
+
+        Committing protects the vault from a bad edit. It does not protect it
+        from losing the disk: a vault with months of history, autocommitted
+        every 25 seconds and pushed nowhere, dies with its volume. This is the
+        other half.
+
+        The URL usually carries a token, so it is never logged and never
+        written into the repo's config: it is passed to a single push command
+        and stays in memory. Every failure is returned, not raised - a backup
+        that cannot reach its remote must not disturb the agent that is
+        running.
+        """
+        if not remote_url or not self.ensure_repo():
+            return {"ok": False, "error": "git unavailable"}
+        with self._lock:
+            target = branch.strip() or self._current_branch() or "main"
+            proc = self._git(
+                "push", remote_url, f"HEAD:refs/heads/{target}",
+                timeout=180,
+            )
+            if proc.returncode == 0:
+                return {"ok": True, "branch": target, "head": self._head()}
+            # stderr can echo the URL back, credentials included.
+            reason = _redact_url(proc.stderr or proc.stdout or "")
+            logger.warning("vault git push failed: %s", reason[:300])
+            return {"ok": False, "error": reason[:300], "branch": target}
+
+    def _current_branch(self) -> str:
+        proc = self._git("rev-parse", "--abbrev-ref", "HEAD")
+        name = (proc.stdout or "").strip()
+        return "" if name in ("", "HEAD") else name
 
     # ── repo lifecycle ────────────────────────────────────────────────
 
