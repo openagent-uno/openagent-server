@@ -979,6 +979,41 @@ CREATE INDEX IF NOT EXISTS idx_evdel_unclaimed ON event_deliveries(claimed_at);
 -- migration on a pre-existing DB, so indexing it in this base schema block —
 -- which runs BEFORE _apply_legacy_alters — crashes boot with
 -- "no such column: claim_expires". Create the index right after the ADD COLUMN.
+
+-- ``skill_events`` stores inbound/outbound events pushed by central skill
+-- runners (e.g. telegram-ingester). Keyed on (skill_id, external_id) so
+-- repeated syncs are idempotent. ``content`` is the human-readable body;
+-- ``metadata_json`` carries skill-specific structured data.
+CREATE TABLE IF NOT EXISTS skill_events (
+    id              TEXT PRIMARY KEY,
+    skill_id        TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    external_id     TEXT,
+    entity_id       TEXT,
+    timestamp       TEXT NOT NULL,
+    direction       TEXT,
+    channel         TEXT,
+    content         TEXT,
+    metadata_json   TEXT,
+    received_at     REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_events_external
+    ON skill_events (skill_id, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_skill_events_ts ON skill_events (skill_id, timestamp DESC);
+
+-- ``skill_entities`` stores contacts/groups/channels resolved by skills.
+-- Upserted on every sync; ``identifiers_json`` holds service-specific IDs
+-- (phone numbers, @handles, numeric IDs) for cross-referencing.
+CREATE TABLE IF NOT EXISTS skill_entities (
+    id              TEXT PRIMARY KEY,
+    skill_id        TEXT NOT NULL,
+    type            TEXT,
+    display_name    TEXT,
+    identifiers_json TEXT,
+    metadata_json   TEXT,
+    updated_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_entities_skill ON skill_entities (skill_id);
 """
 
 
@@ -1007,6 +1042,24 @@ def _as_epoch(value: Any) -> float:
         except ValueError:
             continue
     return 0.0
+
+
+# ── Igiene WAL ──────────────────────────────────────────────────────────────
+# Le connessioni girano in ``journal_mode=WAL`` (vedi ``connect``) ma nessuno
+# faceva mai un checkpoint. L'autocheckpoint passivo di SQLite puo' essere
+# affamato all'infinito: basta un lettore con uno snapshot aperto a impedire il
+# reset del WAL, e il file ``-wal`` cresce senza limite finche' le scritture
+# iniziano a fallire con "database is locked". Su questo processo succede
+# facilmente, perche' la stessa DB e' aperta da gateway, scheduler MCP e
+# subprocess insieme.
+#
+# Portato da Hermes (``hermes_cli/kanban_db.py``, ``_maybe_checkpoint_wal``):
+# un ``wal_checkpoint(TRUNCATE)`` esplicito a intervallo grosso, best-effort.
+# Nessun lock: la finestra di corsa produce al massimo due checkpoint
+# ravvicinati, che e' innocuo, e cosi' evitiamo di legare un asyncio.Lock a un
+# event loop al momento dell'import.
+_WAL_CHECKPOINT_INTERVAL_SECONDS = 300.0
+_LAST_WAL_CHECKPOINT: dict[str, float] = {}
 
 
 class MemoryDB:
@@ -2322,9 +2375,35 @@ class MemoryDB:
             await self._conn.close()
             self._conn = None
 
+    async def _maybe_checkpoint_wal(self) -> None:
+        """Esegue ``PRAGMA wal_checkpoint(TRUNCATE)`` a intervallo grosso.
+
+        Chiamato da ``_ensure_connected``, quindi attraversato da ogni
+        operazione: il controllo temporale è volutamente la prima cosa, così
+        il caso normale costa un confronto. Non solleva mai — il checkpoint è
+        pura igiene e non deve far fallire l'operazione che lo ha innescato.
+        """
+        conn = self._conn
+        if conn is None:
+            return
+        key = str(self.db_path)
+        now = time.monotonic()
+        last = _LAST_WAL_CHECKPOINT.get(key)
+        if last is not None and (now - last) < _WAL_CHECKPOINT_INTERVAL_SECONDS:
+            return
+        # Prenota lo slot PRIMA di lavorare, così due chiamate concorrenti sul
+        # confine dell'intervallo non fanno il checkpoint due volte.
+        _LAST_WAL_CHECKPOINT[key] = now
+        try:
+            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            # WAL occupato o lockato: si riprova al prossimo intervallo.
+            pass
+
     async def _ensure_connected(self) -> aiosqlite.Connection:
         if self._conn is None:
             await self.connect()
+        await self._maybe_checkpoint_wal()
         return self._conn
 
     async def _project_operational_session(self, session_id: str) -> None:

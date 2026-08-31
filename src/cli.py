@@ -1029,6 +1029,10 @@ def mcp_server_cmd(name: str):
         from src.mcp.servers.memory_search.server import main as memory_search_main
         memory_search_main()
         return
+    if name == "skill-data":
+        from src.mcp.servers.skill_data.server import main as skill_data_main
+        skill_data_main()
+        return
     click.echo(f"Unknown MCP server: {name}", err=True)
     raise SystemExit(1)
 
