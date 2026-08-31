@@ -978,14 +978,23 @@ def _intent(text: str, channel: str = "") -> str:
     # customer can give us; it was landing in the generic bucket.
     if _ERROR_CODE.search(low):
         return "bug"
-    # An unmistakable crash symptom decides the route before any topic word:
-    # a customer whose app closes on open is not asking about their invoice.
+    # An unmistakable technical symptom decides the route before any topic
+    # word: "I am Premium" is context, while the freeze/playback/login failure
+    # is the problem the customer actually asked us to solve.  Keeping this
+    # before the bare `premium` lane prevents a stale billing path from asking
+    # for an order number instead of investigating the app.
     # Exception: an explicit money-back request stays a refund case, because
     # policy rule 5 defers that refund while we fix it - it does not drop it.
     if not _any_term(low, (
         "refund*", "money back", "rimbors*", "remboursement", "reembols*",
     )) and _any_term(low, (
-        "crash*", "se cierra", "se sale", "fecha sozinho", "si chiude",
+        "crash*", "freez*", "hang*", "stuck", "si blocca", "si è blocc*",
+        "si e blocc*", "se congela", "travando", "bloccato", "bloccata",
+        "playback stop*", "music stop*", "stops after every song",
+        "can't log in", "cannot log in", "can't login", "cannot login",
+        "unable to log in", "can't sign in", "cannot sign in",
+        "non riesco ad accedere", "no puedo ingresar", "não entra", "nao entra",
+        "se cierra", "se sale", "fecha sozinho", "si chiude",
         "closes by itself", "keeps closing", "app close*", "kicks me out",
         "automatically close*", "close* automatically", "shuts by itself",
         "chiude da sol*", "se cierra sola", "fecha sozinho",
@@ -1007,6 +1016,8 @@ def _intent(text: str, channel: str = "") -> str:
         "download button", "download option", "downloaded songs", "offline",
         "can't download", "cannot download", "won't download",
         "can't downloading", "unable to download", "download any songs",
+        "download fails", "downloads fail", "download failed", "downloads failed",
+        "download stops", "downloads stop", "download stuck", "downloads stuck",
         "herunterladen", "downloaden", "telecharge*", "descargarlas",
         "scaricar*", "descargar*", "descargas", "descargad*", "baixar",
         "baixad*", "télécharger",

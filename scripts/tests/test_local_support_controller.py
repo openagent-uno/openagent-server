@@ -1557,6 +1557,35 @@ async def t_bug_create_and_link(_ctx: TestContext) -> None:
     assert "release" not in output["reply"].lower() or "can’t" in output["reply"], output["reply"]
 
 
+@test(
+    "local_support_controller",
+    "a Premium web form with a repeated freeze follows the bug lane",
+)
+async def t_premium_context_does_not_hide_freeze(_ctx: TestContext) -> None:
+    """Regression for the real Lyra web-form reply sent on 31-Aug-2026."""
+    doubles = _Doubles(create_id="86-premium-freeze")
+    output = await _drive(
+        doubles,
+        "Salve ho appena fatto il premium, ma si blocca in continuazione\n"
+        "app_version: 1.4.12\n"
+        "native_version: 1.4.12\n"
+        "device: iPhone 17 Pro\n"
+        "os: iOS 26.6.1\n"
+        "premium: yes\n"
+        "account_email: customer@example.test\n"
+        "account_user_id: 0123456789abcdef01234567",
+        thread_id="t-premium-freeze",
+        payload_extra={"product": "lyra"},
+    )
+
+    assert output["intent"] == "bug", output
+    assert output["decision"] == "bug_new_task", output
+    assert "clickup_create_task" in doubles.names, doubles.names
+    assert "billingbear_get_v1_customers_by_appUserId" not in doubles.names, doubles.names
+    reply = output["reply"].lower()
+    assert "ricevut" not in reply and "numero d'ordine" not in reply, output["reply"]
+
+
 @test("local_support_controller", "an actionable partial bug is tracked before asking for metadata")
 async def t_partial_bug_tracks_then_enriches(_ctx: TestContext) -> None:
     """Version/OS enrich a clear bug; their absence must not discard it."""
@@ -2083,6 +2112,21 @@ async def t_subject_as_signal(_ctx: TestContext) -> None:
     assert _intent(
         "The app stop's and automatically close some bug? Pls help me im premium"
     ) == "bug"
+    # A bare Premium mention never outranks the concrete problem. This is the
+    # sanitised 31-Aug Lyra case that was routed to `premium_inactive` and
+    # asked for an Apple receipt instead of investigating the repeated freeze.
+    assert _intent(
+        "ho appena fatto il premium, ma si blocca in continuazione"
+    ) == "bug"
+    assert _intent(
+        "I have a Premium subscription. Playback stops after every song"
+    ) == "bug"
+    assert _intent("Premium is active, but I cannot login") == "bug"
+    assert _intent("Premium is working, but downloads fail at 0%") == "offline"
+    # The subscription itself being unavailable remains an entitlement case.
+    assert _intent("I paid, but Premium is not active") == "premium"
+    # A money request still wins even when a malfunction motivated it.
+    assert _intent("Premium is active, the app freezes, I want a refund") == "refund"
     # Same rule for the wrong audio: the customer names Premium to say the
     # profile shows it, and the complaint is that the track playing is not
     # the one on screen. Filed as premium, he was asked for an order number.
