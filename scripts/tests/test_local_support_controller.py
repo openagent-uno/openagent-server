@@ -1853,6 +1853,20 @@ async def t_subject_as_signal(_ctx: TestContext) -> None:
     assert _intent(
         "The app stop's and automatically close some bug? Pls help me im premium"
     ) == "bug"
+    # Same rule for the wrong audio: the customer names Premium to say the
+    # profile shows it, and the complaint is that the track playing is not
+    # the one on screen. Filed as premium, he was asked for an order number.
+    assert _intent(
+        "Hast du Premium bereits gekauft?: Ja\n"
+        "Wo hast du Premium gekauft?: Google Play\n\n"
+        "im Profil steht Premium, aber die Wiedergabe steht auf zufällig. "
+        "Und es werden ständig andere Titel abgespielt, als angezeigt.",
+        "web_form",
+    ) == "bug"
+    assert _intent("premium user here, it plays a different song than the one shown") == "bug"
+    assert _intent("ho il premium ma parte un'altra canzone rispetto a quella scelta") == "bug"
+    # Wanting the money back is still a refund, however the defect is worded.
+    assert _intent("it plays the wrong song, I want a refund") == "refund"
 
 
 @test("local_support_controller", "an eSound email resolves through Paddle, not the customer lookup")

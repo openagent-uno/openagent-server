@@ -845,6 +845,26 @@ _RESTORE_FEATURE = re.compile(
 )
 
 
+# "it plays a different song than the one shown", "es werden andere Titel
+# abgespielt als angezeigt": the audio does not match the track on screen.
+# It is a source-matching defect, and it reaches us worded around the word
+# Premium often enough that the plain term list files it as billing.
+_WRONG_AUDIO = re.compile(
+    r"\b(?:wrong|different|another)\s+(?:song|track|audio|title|music)\b|"
+    r"\b(?:song|track|audio)\s+(?:that\s+)?(?:plays|played)\s+is\s+(?:not|different)\b|"
+    r"\bplays?\s+(?:a\s+)?(?:different|another|other)\s+(?:song|track|music)\b|"
+    r"\bander\w*\s+(?:titel|lieder|songs?)\b[^.\n]{0,60}\b(?:abgespielt|gespielt|spielt|l[aä]uft)\b|"
+    r"\bfalsch\w*\s+(?:titel|lied|song|musik|audio)\b|"
+    r"\b(?:canzone|brano|traccia|audio)\s+sbagliat\w+\b|"
+    r"\b(?:parte|suona|riproduce)\s+un.?altra\s+canzone\b|"
+    r"\b(?:canci[oó]n|audio|pista)\s+equivocad\w+\b|"
+    r"\breproduce\s+otra\s+canci[oó]n\b|"
+    r"\bm[uú]sica\s+errada\b|\btoca\s+outra\s+m[uú]sica\b|"
+    r"\bmauvais(?:e)?\s+(?:chanson|titre|audio)\b",
+    re.IGNORECASE,
+)
+
+
 # Accented characters and non-Latin scripts are a language signal in
 # themselves. Their ABSENCE is what makes a short message unidentifiable.
 _NON_ASCII_LETTER = re.compile(r"[^\x00-\x7F]")
@@ -971,6 +991,16 @@ def _intent(text: str, channel: str = "") -> str:
         "chiude da sol*", "se cierra sola", "fecha sozinho",
         "se esta cerrando", "está cerrando", "esta cerrando", "cierra sola",
         "não abre", "nao abre", "non si apre", "no abre",
+    )):
+        return "bug"
+    # The audio that plays is not the track on screen. Measured 31-Aug-2026
+    # (eSound web form, German): "im Profil steht Premium, aber ... es werden
+    # ständig andere Titel abgespielt, als angezeigt" was filed as premium on
+    # the bare word "Premium" - the first lane that mentions it - and a
+    # subscriber with an active Google Play plan was asked for his order
+    # number twice. The symptom decides the route; the mention does not.
+    if _WRONG_AUDIO.search(low) and not _any_term(low, (
+        "refund*", "money back", "rimbors*", "remboursement", "reembols*",
     )):
         return "bug"
     if _any_term(low, (
