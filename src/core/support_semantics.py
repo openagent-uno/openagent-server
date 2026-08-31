@@ -173,6 +173,13 @@ INTENT_EXEMPLARS: dict[str, tuple[str, ...]] = {
         # on `account_change` and was refused for want of a margin.
         "I tap the sign in button and nothing happens",
         "logging in with Google fails with an error every time",
+        # "I cannot get in" had no home in any bank, so it fell to the nearest
+        # neighbour: measured on live traffic, the Portuguese "Não estou
+        # conseguindo acessar" landed on `offline` at 0.593, because "I cannot
+        # <verb>" resembles "I cannot download". A customer locked out of the
+        # app was answered about downloads.
+        "I cannot get into the app at all",
+        "the app gets stuck on a screen and never finishes loading",
     ),
     "feature_request": (
         # What makes this label is ASKING FOR SOMETHING THAT IS NOT THERE, not
@@ -242,6 +249,7 @@ INTENT_NEGATIVE_EXEMPLARS: dict[str, tuple[str, ...]] = {
     "offline": (
         "I lost all my playlists after the update",
         "my library is empty, the songs I saved are gone",
+        "I cannot access the app, it will not let me in",
     ),
     "feature_request": (
         "the feature does not work properly when I use it",
