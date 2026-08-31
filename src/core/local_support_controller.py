@@ -2129,6 +2129,34 @@ async def _resolve_app_user_id(
     return ""
 
 
+_PAYMENT_EVENTS = {"purchased", "renewed", "resubscribed", "uncancelled"}
+
+
+def _last_payment_at(billing: Any, subscription: dict[str, Any]) -> str:
+    """When money last changed hands, from the customer's event history.
+
+    The customer payload carries `events` with `eventType` and `occurredAt`.
+    A renewal is a new payment, so the refund window has to be measured from
+    the newest paying event rather than from the day the subscription began.
+    """
+    if not isinstance(billing, dict):
+        return ""
+    product = str(subscription.get("productId") or "").strip()
+    newest = ""
+    for event in billing.get("events") or []:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("eventType") or "").strip().lower() not in _PAYMENT_EVENTS:
+            continue
+        event_product = str(event.get("productId") or "").strip()
+        if product and event_product and event_product != product:
+            continue
+        occurred = str(event.get("occurredAt") or "").strip()
+        if occurred > newest:
+            newest = occurred
+    return newest
+
+
 async def _billing_lookup(
     pool: Any, app_user_id: str, email: str, tenant: Tenant | None = None,
 ) -> Any:
@@ -5380,6 +5408,19 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         patch = {"waiting_for_team": False, "status": "open"}
     else:
         patch = {"waiting_for_team": False, "status": "closed"}
+    # A thread a human was already queued on stays queued. Answering it is
+    # not the same as doing what the queue was for, and clearing the flag on
+    # the way out deleted the case from the human view: measured 31-Aug-2026,
+    # a refund escalated on 20-Aug sat unworked for ten days and was then
+    # taken out of the queue by our own follow-up, which asked the customer
+    # for a receipt. Only actually executing the mutation ends the wait.
+    if (
+        state.facts.get("arrived_waiting_for_team")
+        and state.decision != "execute_mutation"
+    ):
+        patch.pop("waiting_for_team", None)
+        patch["status"] = "open"
+        state.facts["kept_waiting_for_team"] = True
     await _record_action(
         state, pool, "replio", ("replio_threads_patch", "threads_patch"),
         {"thread_id": state.thread_id, "patch": patch}, "thread_patch",
@@ -5463,6 +5504,9 @@ async def run(
     if isinstance(thread, dict):
         summary = thread.get("thread") if isinstance(thread.get("thread"), dict) else thread
         state.linked_task_id = str(summary.get("external_task_id") or "").strip()
+        state.facts["arrived_waiting_for_team"] = bool(
+            summary.get("waiting_for_team")
+        )
     if "diagnostics-active" in _thread_tags(thread) and not state.linked_task_id:
         _tool, full_thread = await _call_first(
             pool, "replio", ("replio_threads_get", "threads_get"),
@@ -6140,10 +6184,26 @@ async def run(
                         if str(item.get("status") or "").lower() == "active"
                     ), subscriptions[0] if subscriptions else {})
                     sub_id = str(active.get("id") or active.get("subscriptionId") or "")
+                    # BillingBear names none of these fields on a subscription:
+                    # it returns id, provider, startsAt, expiresAt, renewsAt,
+                    # amount, currency, status. Reading only the names above
+                    # left `paid_at` empty on EVERY web customer, so `recent`
+                    # was None and the autonomous refund - which the policy
+                    # grants inside 14 days - could never fire: it asked for a
+                    # receipt instead. Measured 31-Aug-2026 on a Brazilian
+                    # eSound customer who waited 11 days for R$6.90 and was
+                    # then asked for the order id of a purchase already in our
+                    # own database. The last PURCHASED/RENEWED event is the
+                    # exact payment date; `startsAt` is the conservative
+                    # fallback - it can only make a payment look older than it
+                    # is, never newer, so it can never open the gate wrongly.
                     paid_at = (
                         active.get("lastPaymentAt")
                         or active.get("last_payment_at")
                         or active.get("renewedAt")
+                        or _last_payment_at(billing, active)
+                        or active.get("startsAt")
+                        or active.get("starts_at")
                         or active.get("createdAt")
                     )
                     amount_raw = (

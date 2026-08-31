@@ -10,6 +10,13 @@ from typing import Any
 from ._framework import TestContext, test
 
 
+def _recent_iso(days: int = 2) -> str:
+    """An ISO timestamp `days` ago: refund eligibility is measured from now."""
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
 @test("local_support_controller", "support model calls share one bounded lane")
 async def t_support_model_calls_are_serialized(_ctx: TestContext) -> None:
     import asyncio
@@ -465,6 +472,166 @@ async def t_ads_lane_yields_to_the_account(_ctx: TestContext) -> None:
     assert output["facts"].get("ads_claim_overruled_by_account") is True, output
     low = output["reply"].lower()
     assert "invit" not in low and "referral" not in low, output["reply"]
+
+
+@test("local_support_controller", "an eligible web refund is executed, not asked about")
+async def t_web_refund_executes(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import run
+
+    calls: list[str] = []
+
+    async def threads_get(thread_id: str) -> dict[str, Any]:
+        calls.append("replio_get")
+        return {"ok": True, "id": thread_id, "messages": []}
+
+    async def vault_read_note(path: str) -> dict[str, Any]:
+        calls.append("vault:" + path)
+        return {"ok": True, "content": "refund policy"}
+
+    # The real BillingBear customer payload: a subscription carries startsAt /
+    # expiresAt / amount / status, and the payment dates live in `events`.
+    # There is no lastPaymentAt anywhere, which is what used to leave the
+    # refund window unmeasurable and every web refund unexecuted.
+    async def customer(appUserId: str) -> dict[str, Any]:
+        calls.append("billing:" + appUserId)
+        return {
+            "ok": True,
+            "status": 200,
+            "appUserId": appUserId,
+            "isPremium": True,
+            "premiumSource": "stripe",
+            "subscriptions": [{
+                "id": "8f14e45f-ceea-467a-9c1e-9b9b3fbc2a11",
+                "provider": "Stripe",
+                "status": "Active",
+                "startsAt": "2026-08-20T19:41:32+00:00",
+                "expiresAt": "2026-09-20T19:41:32+00:00",
+                "productId": "price_web_monthly",
+                "willRenew": False,
+                "currency": "USD",
+                "amount": 1.99,
+            }],
+            "events": [
+                {"eventType": "PURCHASED", "productId": "price_web_monthly",
+                 "occurredAt": _recent_iso()},
+            ],
+        }
+
+    async def refund(appUserId: str, subscriptionId: str) -> dict[str, Any]:
+        calls.append("refund:" + subscriptionId)
+        return {"ok": True, "status": 200, "success": True, "status_": "Cancelled"}
+
+    async def threads_patch(thread_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        calls.append("patch:" + json.dumps(patch, sort_keys=True))
+        return {"ok": True}
+
+    async def threads_respond(**kwargs: Any) -> dict[str, Any]:
+        calls.append("respond")
+        return {"ok": True, "id": "msg-1"}
+
+    async def tags_add(thread_id: str, tag: str) -> dict[str, Any]:
+        calls.append("tag:" + tag)
+        return {"ok": True}
+
+    pool = _Pool({
+        "replio": _Toolkit({
+            "replio_threads_get": threads_get,
+            "replio_threads_patch": threads_patch,
+            "replio_threads_respond": threads_respond,
+            "replio_threads_tags_add": tags_add,
+        }),
+        "vault": _Toolkit({"vault_read_note": vault_read_note}),
+        "billingbear": _Toolkit({
+            "billingbear_get_v1_customers_by_appUserId": customer,
+            "billingbear_post_v1_customer_center_by_appUserId_subscriptions_by_subscr_4": refund,
+        }),
+    })
+    previous = os.environ.get("OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES")
+    os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES"] = "1"
+    try:
+        result = await run(
+            agent=SimpleNamespace(_mcp=pool, model=_Model()),
+            event={"slug": "replio-thread", "model": ""},
+            payload={"payload": {
+                "thread_id": "refund-web",
+                "product": "esound",
+                "message": {"body_text": (
+                    "appUserId: web-payer - I bought Premium on the website "
+                    "and I want a refund, please."
+                )},
+            }},
+            session_id="refund-web-session",
+            delivery_id="refund-web-delivery",
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES", None)
+        else:
+            os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES"] = previous
+    output = json.loads(result.text)
+    assert output["facts"]["refund_within_14_days"] is True, output["facts"]
+    assert output["outcome"] != "refund_payment_details_required", output
+    assert any(call.startswith("refund:") for call in calls), (output["outcome"], output["facts"], calls)
+
+
+@test("local_support_controller", "answering a queued thread does not empty the human queue")
+async def t_reply_keeps_waiting_for_team(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import run
+
+    calls: list[str] = []
+
+    async def threads_get(thread_id: str) -> dict[str, Any]:
+        calls.append("replio_get")
+        # Escalated days ago and still unworked: that is what the flag means.
+        return {"ok": True, "id": thread_id, "waiting_for_team": True,
+                "status": "open", "messages": []}
+
+    async def vault_read_note(path: str) -> dict[str, Any]:
+        return {"ok": True, "content": "canonical router"}
+
+    async def threads_patch(thread_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        calls.append("patch:" + json.dumps(patch, sort_keys=True))
+        return {"ok": True}
+
+    async def threads_respond(**kwargs: Any) -> dict[str, Any]:
+        calls.append("respond")
+        return {"ok": True, "id": "msg-1"}
+
+    async def tags_add(**kwargs: Any) -> dict[str, Any]:
+        return {"ok": True}
+
+    pool = _Pool({
+        "replio": _Toolkit({
+            "replio_threads_get": threads_get,
+            "replio_threads_patch": threads_patch,
+            "replio_threads_respond": threads_respond,
+            "replio_threads_tags_add": tags_add,
+        }),
+        "vault": _Toolkit({"vault_read_note": vault_read_note}),
+    })
+    previous = os.environ.get("OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES")
+    os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES"] = "1"
+    try:
+        result = await run(
+            agent=SimpleNamespace(_mcp=pool, model=_Model()),
+            event={"slug": "replio-thread", "model": ""},
+            payload={"payload": {
+                "thread_id": "queued-thread",
+                "product": "esound",
+                "message": {"body_text": "I still have not had my premium sorted"},
+            }},
+            session_id="queued-session",
+            delivery_id="queued-delivery",
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES", None)
+        else:
+            os.environ["OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES"] = previous
+    output = json.loads(result.text)
+    assert output["facts"]["arrived_waiting_for_team"] is True, output["facts"]
+    cleared = [c for c in calls if c.startswith("patch:") and '"waiting_for_team": false' in c]
+    assert not cleared, (output["outcome"], calls)
 
 
 @test("local_support_controller", "diagnostic proof is PII-free and dry runs never authorize a claim")
@@ -3282,3 +3449,60 @@ async def t_routing_evidence(_ctx: TestContext) -> None:
         assert not isinstance(value, dict), evidence
         if isinstance(value, str):
             assert "@" not in value, evidence
+
+
+@test("vault_git", "a vault that is only committed still dies with its volume")
+async def t_vault_push(_ctx: TestContext) -> None:
+    """The autocommit loop protects the vault from a bad edit, not from losing
+    the disk. Measured on the eSound agent: 128 MB of vault, committed every 25
+    seconds since June, with no remote and no volume snapshot."""
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from src.memory.vault.gitrepo import VaultGit, _redact_url, resolve_git_bin
+
+    # A token in a URL must never reach a log line, whichever way it arrives.
+    assert _redact_url("https://user:tok@git.example/x.git") == (
+        "https://***@git.example/x.git")
+    assert _redact_url("fatal: https://u:p@h/r.git not found") == (
+        "fatal: https://***@h/r.git not found")
+    assert _redact_url("") == ""
+    # What must disappear is the secret, not the "@": the host has to survive
+    # or the log line stops saying which remote failed.
+    redacted = _redact_url("error https://alice:s3cr3t@git.example/d")
+    assert "s3cr3t" not in redacted and "alice" not in redacted, redacted
+    assert "git.example" in redacted, redacted
+
+    if not resolve_git_bin():
+        return  # no git here; the layer degrades to a no-op by design
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        vault, bare = root / "vault", root / "remote.git"
+        vault.mkdir()
+        (vault / "note.md").write_text("# una nota\n")
+        subprocess.run(["git", "init", "--bare", str(bare)],
+                       capture_output=True, check=True)
+
+        git = VaultGit(vault)
+        assert git.ensure_repo()
+        pushed = git.push(str(bare))
+        assert pushed.get("ok"), pushed
+
+        # The remote really has the history. Read the branch we pushed, not
+        # the bare repo's HEAD: a fresh bare repo points at `master` while the
+        # vault is on `main`, so following HEAD reports an empty repository
+        # for a push that in fact landed.
+        branch = pushed["branch"]
+        log = subprocess.run(
+            ["git", "--git-dir", str(bare), "log", "--oneline", branch],
+            capture_output=True, text=True,
+        )
+        assert log.stdout.strip(), (branch, log.stderr)
+
+        # An unreachable remote is reported, never raised: a backup that cannot
+        # reach its destination must not disturb the agent that is running.
+        failed = git.push(str(root / "nowhere.git"))
+        assert failed.get("ok") is False, failed
+        assert "error" in failed, failed
