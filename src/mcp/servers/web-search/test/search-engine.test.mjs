@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { SearchEngine } from '../dist/search-engine.js';
+import { resolveChromiumExecutable, SearchEngine } from '../dist/search-engine.js';
 
 const hit = {
   title: 'Relevant result',
@@ -34,4 +34,29 @@ test('later empty or failed engines cannot erase earlier search results', async 
     if (previousQuality === undefined) delete process.env.ENABLE_RELEVANCE_CHECKING;
     else process.env.ENABLE_RELEVANCE_CHECKING = previousQuality;
   }
+});
+
+test('Chromium resolution prefers operator config and falls back to system Chrome', () => {
+  const present = new Set([
+    '/opt/openagent/chrome',
+    '/usr/bin/google-chrome',
+  ]);
+  const exists = (candidate) => present.has(candidate);
+
+  assert.equal(
+    resolveChromiumExecutable(
+      { OPENAGENT_CHROME_BINARY: '/opt/openagent/chrome' },
+      'linux',
+      exists,
+    ),
+    '/opt/openagent/chrome',
+  );
+  assert.equal(
+    resolveChromiumExecutable({}, 'linux', exists),
+    '/usr/bin/google-chrome',
+  );
+  assert.equal(
+    resolveChromiumExecutable({}, 'linux', () => false),
+    undefined,
+  );
 });
