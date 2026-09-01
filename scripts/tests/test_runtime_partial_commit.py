@@ -271,8 +271,17 @@ async def t_recover_missing_journal_history(ctx: TestContext) -> None:
             "content": "recent answer",
             "messages": [
                 {
+                    "role": "system",
+                    "content": "framework prompt " * 4000,
+                },
+                {
                     "role": "user",
                     "content": "first lost request",
+                    "from_history": True,
+                },
+                {
+                    "role": "assistant",
+                    "content": "copied historical answer",
                     "from_history": True,
                 },
                 {"role": "user", "content": "recent question"},
@@ -322,6 +331,17 @@ async def t_recover_missing_journal_history(ctx: TestContext) -> None:
             message.get("content") != "continue now"
             for message in recovery["messages"]
         )
+        surviving_after = next(
+            run for run in runs if run.get("run_id") == "recent-run"
+        )
+        assert [
+            (message.get("role"), message.get("content"))
+            for message in surviving_after["messages"]
+        ] == [
+            ("user", "recent question"),
+            ("assistant", "recent answer"),
+        ]
+        assert recovery["metadata"]["replayed_messages_removed"] == 3
         assert await db.recover_session_from_journal(
             session_id, current_text="continue now",
         ) == 0
@@ -337,6 +357,11 @@ async def t_recover_missing_journal_history(ctx: TestContext) -> None:
         assert ("user", "first lost request") in projected_pairs
         assert ("assistant", "second lost answer") in projected_pairs
         assert ("user", "recent question") in projected_pairs
+        assert all(role != "compaction" for role, _text in projected_pairs)
+        assert all(
+            text != "copied historical answer"
+            for _role, text in projected_pairs
+        )
         await db.close()
     finally:
         try:

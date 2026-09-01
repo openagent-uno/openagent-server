@@ -6783,7 +6783,50 @@ class MemoryDB:
                 },
                 "created_at": max(1, selected[0]["ts_ms"] // 1000),
             }
-            encoded = json.dumps([recovery_run, *runs], ensure_ascii=False)
+
+            # Old runtime envelopes can carry the complete framework prompt
+            # and copied history inside every run's ``messages`` array.  They
+            # are scaffolding for the call that already happened, not turns in
+            # the conversation.  Keeping them after journal recovery both
+            # duplicates the facts we just restored and can replay a 50k+
+            # system prompt as if it were user history on the next turn (the
+            # production Mixout failure that prompted this recovery path).
+            #
+            # Strip only data that is provably replayed scaffolding: system
+            # messages are injected fresh by the runtime, while
+            # ``from_history`` explicitly marks a copied message.  Direct
+            # user/assistant messages and tool evidence remain byte-for-byte
+            # intact.  The rewrite shares the same CAS transaction as the
+            # recovery run, so a concurrent writer can never be overwritten.
+            cleaned_runs: list[dict[str, Any]] = []
+            replayed_messages_removed = 0
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                raw_messages = run.get("messages")
+                if not isinstance(raw_messages, list):
+                    cleaned_runs.append(run)
+                    continue
+                direct_messages: list[Any] = []
+                for message in raw_messages:
+                    if isinstance(message, dict) and (
+                        str(message.get("role") or "").lower() == "system"
+                        or message.get("from_history") is True
+                    ):
+                        replayed_messages_removed += 1
+                        continue
+                    direct_messages.append(message)
+                cleaned_runs.append(
+                    {**run, "messages": direct_messages}
+                    if len(direct_messages) != len(raw_messages)
+                    else run
+                )
+            recovery_run["metadata"]["replayed_messages_removed"] = (
+                replayed_messages_removed
+            )
+            encoded = json.dumps(
+                [recovery_run, *cleaned_runs], ensure_ascii=False,
+            )
             await conn.execute("BEGIN IMMEDIATE")
             updated = await conn.execute(
                 "UPDATE sessions SET runs = ?, updated_at = ? "
