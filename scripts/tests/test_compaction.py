@@ -166,6 +166,72 @@ class _BlockingModel(_FakeModel):
             raise
 
 
+@test("compaction", "start-of-turn repairs stale history before measuring it")
+async def t_start_of_turn_recovers_before_compaction(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    class _RecoveringDB:
+        db_path = str(ctx.test_dir / "missing-recovery.db")
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.journal_calls: list[tuple[str, str | None]] = []
+
+        async def recover_stale_session_runs(self, session_id: str) -> int:
+            self.calls.append(session_id)
+            return 1
+
+        async def recover_session_from_journal(
+            self, session_id: str, *, current_text: str | None = None,
+        ) -> int:
+            self.journal_calls.append((session_id, current_text))
+            return 2
+
+    model = _FakeModel()
+    db = _RecoveringDB()
+    agent = _FakeAgent(db.db_path, model)
+    agent._db = db
+
+    registered = await compaction.run_start_of_turn(
+        "sid", model, agent, None, current_message="continue",
+    )
+    assert registered is True
+    assert db.calls == ["sid"]
+    assert db.journal_calls == [("sid", "continue")]
+    compaction.mark_turn_done("sid")
+
+
+@test("compaction", "an overlapping live turn is never mistaken for stale")
+async def t_start_of_turn_does_not_recover_live_overlap(ctx: TestContext) -> None:
+    from src.core import compaction
+
+    class _RecoveringDB:
+        db_path = str(ctx.test_dir / "missing-overlap.db")
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def recover_stale_session_runs(self, _session_id: str) -> int:
+            self.calls += 1
+            return 1
+
+    model = _FakeModel()
+    db = _RecoveringDB()
+    agent = _FakeAgent(db.db_path, model)
+    agent._db = db
+    compaction.mark_turn_active("overlap")
+    try:
+        registered = await compaction.run_start_of_turn(
+            "overlap", model, agent, None,
+        )
+        assert registered is True
+        assert db.calls == 0
+    finally:
+        # Balance the manually-seeded first turn and run_start_of_turn's second.
+        compaction.mark_turn_done("overlap")
+        compaction.mark_turn_done("overlap")
+
+
 # ── 1. should_compact threshold behaviour ──────────────────────────────
 
 
@@ -246,6 +312,7 @@ async def t_compact_rewrites_runs(ctx: TestContext) -> None:
 
     recap = new_runs[0]
     assert recap.get("metadata", {}).get("compaction") is True, recap
+    assert recap.get("status") == "COMPLETED", recap
     assert "Compacted recap" in (recap.get("content") or ""), recap
 
     # The last two runs must be the originals, byte-identical.
@@ -263,6 +330,88 @@ async def t_compact_rewrites_runs(ctx: TestContext) -> None:
     assert summary_sid.startswith("compaction:"), call
     assert summary_sid not in {"default", "sid"}, call
     assert model.forgotten_sessions == [summary_sid], model.forgotten_sessions
+
+
+@test("compaction", "summary transcript excludes system and copied history")
+async def t_extracts_only_current_turn(_ctx: TestContext) -> None:
+    from src.core.compaction import _extract_run_text
+
+    system_prompt = "FRAMEWORK INSTRUCTIONS " * 200
+    text = _extract_run_text({
+        "input": {"input_content": "Keep the blue launch date."},
+        "content": "Decision saved.",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "Old copied question", "from_history": True},
+            {"role": "assistant", "content": "Old copied answer", "from_history": True},
+            {"role": "user", "content": "Keep the blue launch date."},
+            {"role": "assistant", "content": "Decision saved."},
+        ],
+    })
+
+    assert "FRAMEWORK INSTRUCTIONS" not in text, text[:500]
+    assert "Old copied question" not in text, text
+    assert "Old copied answer" not in text, text
+    assert text.count("Keep the blue launch date.") == 1, text
+    assert text.count("Decision saved.") == 1, text
+
+
+@test("compaction", "compaction refreshes the normalized client transcript")
+async def t_compaction_projects_operational_history(ctx: TestContext) -> None:
+    from src.core.compaction import compact
+    from src.memory.db import MemoryDB
+
+    db_path = str(ctx.test_dir / "compact-project-v2.db")
+    db = MemoryDB(db_path)
+    await db.connect()
+    now = int(time.time())
+    runs = [
+        {
+            "run_id": f"r-{i}",
+            "status": "COMPLETED",
+            "content": f"answer-{i}",
+            "messages": [
+                {"role": "user", "content": f"question-{i}"},
+                {"role": "assistant", "content": f"answer-{i}"},
+            ],
+            "created_at": now + i,
+        }
+        for i in range(5)
+    ]
+    conn = await db._ensure_connected()
+    await conn.execute(
+        "INSERT INTO sessions "
+        "(session_id, session_type, agent_id, user_id, metadata, runs, created_at, updated_at) "
+        "VALUES ('sid', 'agent', 'a', 'owner', '{}', ?, ?, ?)",
+        (json.dumps(runs), now, now),
+    )
+    await db._project_operational_session("sid")
+    await conn.commit()
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+    model = _FakeModel(summary="Recap of questions zero through two.")
+    agent = _FakeAgent(db_path, model)
+    agent._db = db
+    result = await compact("sid", model, agent)
+    assert result is not None
+
+    rows = await (
+        await conn.execute(
+            "SELECT role, text FROM session_messages "
+            "WHERE session_id='sid' ORDER BY sequence",
+        )
+    ).fetchall()
+    projected = [(row[0], row[1]) for row in rows]
+    # The operational repository stores the recap's synthetic user/assistant
+    # pair; the history API later renders its metadata as one compaction card.
+    assert projected[1] == (
+        "assistant", "Recap of questions zero through two.",
+    ), projected
+    assert not any("question-0" in (text or "") for _, text in projected), projected
+    assert ("user", "question-3") in projected
+    assert ("assistant", "answer-4") in projected
+    await db.close()
 
 
 @test("compaction", "compact is a no-op when history is within keep window")
@@ -503,6 +652,37 @@ async def t_compact_status_error(ctx: TestContext) -> None:
     assert phases == ["running", "error"], phases
     # Nothing folded — the row is byte-identical.
     assert len(_read_runs(db_path, "sid")) == 5
+
+
+@test("compaction", "a failed DB rewrite cannot report compaction done")
+async def t_compact_save_failure_is_error(ctx: TestContext) -> None:
+    from src.core import compaction
+    from src.channels.base import parse_compaction_status
+
+    os.environ.pop("OPENAGENT_COMPACTION_ENABLED", None)
+    os.environ["OPENAGENT_COMPACTION_KEEP_RUNS"] = "2"
+    db_path = str(ctx.test_dir / "compact-save-failed.db")
+    runs = [{"run_id": f"r-{i}", "content": f"turn {i}"} for i in range(5)]
+    _make_session_row(db_path, "sid", runs)
+    model = _FakeModel(summary="A valid summary that cannot be committed.")
+    agent = _FakeAgent(db_path, model)
+    phases: list[str] = []
+
+    async def on_status(raw: str) -> None:
+        parsed = parse_compaction_status(raw)
+        if parsed is not None:
+            phases.append(parsed["phase"])
+
+    original_save = compaction._save_runs
+    compaction._save_runs = lambda *_args, **_kwargs: False
+    try:
+        result = await compaction.compact("sid", model, agent, on_status=on_status)
+    finally:
+        compaction._save_runs = original_save
+
+    assert result is None
+    assert phases == ["running", "error"], phases
+    assert _read_runs(db_path, "sid") == runs
 
 
 @test("compaction", "parse_compaction_status normalises phase + stats")

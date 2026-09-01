@@ -427,37 +427,68 @@ def _estimate_text_tokens(text: str, model_id: str | None) -> int:
 
 
 def _extract_run_text(run: dict[str, Any]) -> str:
-    """Flatten one stored RunOutput dict into plain text for measurement.
+    """Flatten one stored run into the *conversation* the recap should see.
 
-    Pulls ``content`` (assistant reply) and every ``messages[*].content``
-    string. Tool calls / metrics / IDs are ignored — the measurement is
-    about how much the next ``add_history_to_context=True`` call will
-    serialise back into a prompt. Robust to legacy shapes (string vs
-    dict content, missing keys) since older sessions may predate the
-    current schema.
+    Stored run messages can contain the complete framework/system prompt and
+    copied history. Feeding those back to the summariser drowned the actual
+    turn in tens of thousands of repeated instruction bytes; ``run.content``
+    then duplicated the final assistant message a second time. Keep only this
+    run's user/assistant exchange plus bounded tool evidence, with a fallback
+    to ``input`` / ``content`` for interrupted legacy runs.
     """
+
+    def _text(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if not isinstance(value, list):
+            return ""
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "\n".join(parts).strip()
+
     chunks: list[str] = []
-    content = run.get("content")
-    if isinstance(content, str) and content:
-        chunks.append(content)
-    elif isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and isinstance(part.get("text"), str):
-                chunks.append(part["text"])
-            elif isinstance(part, str):
-                chunks.append(part)
+    user_texts: set[str] = set()
+    assistant_texts: set[str] = set()
     for msg in run.get("messages") or []:
         if not isinstance(msg, dict):
             continue
-        mc = msg.get("content")
-        if isinstance(mc, str) and mc:
-            chunks.append(mc)
-        elif isinstance(mc, list):
-            for part in mc:
-                if isinstance(part, dict) and isinstance(part.get("text"), str):
-                    chunks.append(part["text"])
-                elif isinstance(part, str):
-                    chunks.append(part)
+        role = str(msg.get("role") or "").lower()
+        if role == "system" or msg.get("from_history") is True:
+            continue
+        text = _text(msg.get("content"))
+        if not text:
+            continue
+        if role == "user":
+            user_texts.add(text)
+            chunks.append(f"User: {text}")
+        elif role == "assistant":
+            assistant_texts.add(text)
+            chunks.append(f"Assistant: {text}")
+        elif role == "tool":
+            # Tool output can contain the decision-driving fact, but an entire
+            # fetched page/log belongs in the source tool, not every future
+            # compaction prompt.
+            tool_name = str(msg.get("tool_name") or "tool")
+            cap = 4000
+            suffix = "\n[tool output truncated]" if len(text) > cap else ""
+            chunks.append(f"Tool ({tool_name}): {text[:cap]}{suffix}")
+
+    input_data = run.get("input")
+    input_text = _text(input_data.get("input_content")) if isinstance(input_data, dict) else ""
+    if input_text and input_text not in user_texts:
+        chunks.insert(0, f"User: {input_text}")
+
+    content_text = _text(run.get("content"))
+    # In tool-loop runs ``run.content`` is often the concatenation of every
+    # assistant delta already present as separate messages, so exact-string
+    # dedup is insufficient. Messages are the higher-fidelity source; content
+    # is only the interrupted/legacy fallback when no assistant message exists.
+    if content_text and not assistant_texts:
+        chunks.append(f"Assistant: {content_text}")
     return "\n".join(chunks)
 
 
@@ -728,7 +759,7 @@ def _load_runs(db_path: str, session_id: str) -> list[dict[str, Any]]:
         conn.close()
 
 
-def _save_runs(db_path: str, session_id: str, runs: list[dict[str, Any]]) -> None:
+def _save_runs(db_path: str, session_id: str, runs: list[dict[str, Any]]) -> bool:
     """Persist *runs* back to ``sessions.runs`` for *session_id*.
 
     Touches the row's ``updated_at`` so the session-list UI orders the
@@ -748,7 +779,7 @@ def _save_runs(db_path: str, session_id: str, runs: list[dict[str, Any]]) -> Non
     except sqlite3.Error as exc:
         elog("compaction.save_open_failed", level="warning",
              session_id=session_id, error=str(exc))
-        return
+        return False
     try:
         try:
             cursor = conn.execute(
@@ -756,16 +787,18 @@ def _save_runs(db_path: str, session_id: str, runs: list[dict[str, Any]]) -> Non
                 (session_id,),
             )
             if cursor.fetchone() is None:
-                return
+                return False
             conn.execute(
                 "UPDATE sessions SET runs = ?, updated_at = ? "
                 "WHERE session_id = ?",
                 (json.dumps(runs), int(time.time()), session_id),
             )
             conn.commit()
+            return True
         except sqlite3.Error as exc:
             elog("compaction.save_failed", level="warning",
                  session_id=session_id, error=str(exc))
+            return False
     finally:
         conn.close()
 
@@ -1626,6 +1659,7 @@ async def compact(
         "session_id": session_id,
         "content": summary,
         "content_type": "str",
+        "status": "COMPLETED",
         "messages": [
             {"role": "user", "content": "[Previous conversation was compacted into this summary. Continue helping the user as if you had read the full conversation — all key context, decisions, and pending tasks are captured below.]"},
             {"role": "assistant", "content": summary},
@@ -1651,7 +1685,38 @@ async def compact(
     # sets OPENAGENT_COMPACTION_HISTORY_TOOL_RESULT_CHARS.
     kept, results_elided, chars_elided = _trim_kept_tool_results(kept)
     new_runs = [recap_run, *kept]
-    _save_runs(db_path, session_id, new_runs)
+    if not _save_runs(db_path, session_id, new_runs):
+        elog(
+            "runtime.compaction.skipped",
+            level="warning",
+            session_id=session_id,
+            reason="save_failed",
+            runs=len(runs),
+        )
+        await _emit_compaction_status(
+            on_status, session_id, {"phase": "error"},
+        )
+        return None
+
+    # Raw sqlite compaction updates the legacy source row from its own
+    # connection. Refresh the normalized operational transcript before the
+    # live "done" frame is emitted; otherwise the model continues on the recap
+    # while a reopened client keeps rendering the pre-compaction transcript.
+    db = getattr(agent, "_db", None)
+    project = getattr(db, "_project_operational_session", None)
+    if callable(project):
+        try:
+            await project(session_id)
+            db_conn = getattr(db, "_conn", None)
+            if db_conn is not None:
+                await db_conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            elog(
+                "runtime.compaction.projection_deferred",
+                level="warning",
+                session_id=session_id,
+                error=str(exc) or type(exc).__name__,
+            )
 
     if results_elided:
         elog(
@@ -1978,6 +2043,7 @@ async def emit_wait_notice(
 
 async def run_start_of_turn(
     session_id: str, model: Any, agent: Any, on_status: Any | None,
+    *, current_message: str | None = None,
 ) -> bool:
     """Start-of-turn compaction step for the turn loop (``run`` + ``run_stream``).
 
@@ -2023,6 +2089,33 @@ async def run_start_of_turn(
         if waited:
             await emit_wait_notice(on_status, session_id, "running")
         async with lock:
+            # A previous process/turn may have persisted its input + streamed
+            # partial while leaving the run status RUNNING and messages empty.
+            # This is the first boundary at which that prior run is guaranteed
+            # not to be live; repair it before compaction measures history and
+            # before the provider reads history for this new turn.
+            if _ACTIVE_TURNS.get(session_id, 0) == 0:
+                db = getattr(agent, "_db", None)
+                recover = getattr(db, "recover_stale_session_runs", None)
+                if callable(recover):
+                    recovered = await recover(session_id)
+                    if recovered:
+                        elog(
+                            "runtime.session.stale_runs_recovered",
+                            session_id=session_id,
+                            count=recovered,
+                        )
+                recover_journal = getattr(db, "recover_session_from_journal", None)
+                if callable(recover_journal):
+                    recovered_events = await recover_journal(
+                        session_id, current_text=current_message,
+                    )
+                    if recovered_events:
+                        elog(
+                            "runtime.session.journal_context_recovered",
+                            session_id=session_id,
+                            events=recovered_events,
+                        )
             mark_turn_active(session_id)
             registered = True
             if not preempted and should_compact(session_id, model, agent=agent):

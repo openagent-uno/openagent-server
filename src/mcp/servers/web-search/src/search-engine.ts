@@ -97,6 +97,16 @@ export class SearchEngine {
             await this.handleBrowserError(error, approach.name);
           }
         }
+
+        // A later fallback returning zero results must not erase a successful
+        // earlier engine. This happened in production when Bing found useful
+        // hits, Brave could not launch, and DuckDuckGo returned its challenge
+        // page: the loop fell through to "None" even though `bestResults`
+        // still held the Bing response.
+        if (bestResults.length > 0) {
+          console.log(`[SearchEngine] Using best available results from ${bestEngine} (quality: ${bestQuality.toFixed(2)})`);
+          return { results: bestResults, engine: bestEngine };
+        }
         
         console.log(`[SearchEngine] All approaches failed, returning empty results`);
         return { results: [], engine: 'None' };
@@ -125,8 +135,11 @@ export class SearchEngine {
       let browser;
       try {
         // Create a dedicated browser instance for Brave search only
-        const { firefox } = await import('playwright');
-        browser = await firefox.launch({
+        // The package installs Chromium in postinstall. Launching Firefox here
+        // made Brave a guaranteed failure on every release/runtime host that
+        // correctly installed only the declared browser dependency.
+        const { chromium } = await import('playwright');
+        browser = await chromium.launch({
           headless: process.env.BROWSER_HEADLESS !== 'false',
           args: [
             '--no-sandbox',

@@ -1904,6 +1904,7 @@ class Agent:
                     from src.core import compaction
                     turn_registered = await compaction.run_start_of_turn(
                         session_id, active_model, self, _status,
+                        current_message=message,
                     )
 
                 messages: list[dict[str, Any]] = [{"role": "user", "content": current_input}]
@@ -2261,6 +2262,7 @@ class Agent:
                     from src.core import compaction
                     turn_registered = await compaction.run_start_of_turn(
                         session_id, active_model, self, _status,
+                        current_message=message,
                     )
 
                 messages: list[dict[str, Any]] = [{"role": "user", "content": current_input}]

@@ -2437,22 +2437,37 @@ class MemoryDB:
     async def set_operational_storage_phase(self, phase: str):
         """Explicitly promote or roll back normalized runtime reads.
 
-        Promotion performs full parity verification in the caller's
-        transaction.  The default boot path never invokes it automatically;
-        beta operators/tests must opt in after backfill is complete.
+        Promotion performs full parity verification in one dedicated,
+        writer-locked transaction. The default boot path never invokes it
+        automatically; beta operators/tests must opt in after backfill is
+        complete.
         """
 
-        conn = await self._ensure_connected()
         from src import __version__
         from src.memory.operational.phase import (
             transition_storage_phase_atomic_async,
         )
 
-        return await transition_storage_phase_atomic_async(
-            conn,
-            phase,
-            writer_version=__version__,
+        # Do not borrow the long-lived MemoryDB connection for a phase cutover.
+        # Runtime/startup readers can legitimately still own cursors on it; on
+        # Python 3.12 that made a later COMMIT fail with "SQL statements in
+        # progress" even though the phase operation itself was complete. A
+        # short-lived connection is also the clean cross-process transaction
+        # boundary promised by the phase CAS.
+        conn = await aiosqlite.connect(
+            self.db_path,
+            timeout=sqlite_busy_timeout_s(),
         )
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            await conn.execute("PRAGMA foreign_keys = ON")
+            return await transition_storage_phase_atomic_async(
+                conn,
+                phase,
+                writer_version=__version__,
+            )
+        finally:
+            await conn.close()
 
     async def _write_with_retry(self, do_write, *, attempts: int = 3):
         """Run an idempotent single-row write, retrying on "database is locked".
@@ -2569,6 +2584,68 @@ class MemoryDB:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    async def claim_due_task_run(
+        self,
+        *,
+        task_id: str,
+        expected_next_run: float,
+        fired_at: float,
+        next_run: float | None,
+        disable: bool,
+        run_id: str,
+        session_id: str | None,
+    ) -> bool:
+        """Atomically advance one due task and open its durable run row.
+
+        The schedule cursor and ``task_runs`` row are one unit of work. The
+        old scheduler committed ``last_run`` / ``next_run`` first and inserted
+        the run later from a detached coroutine. Under writer contention the
+        first commit could succeed while the second raised ``database is
+        locked``; the task then disappeared until its next cron occurrence
+        with no run to reap or retry.
+
+        A dedicated short-lived connection keeps this transaction isolated
+        from unrelated statements queued on ``MemoryDB._conn``. The exact
+        ``expected_next_run`` comparison is the cross-process claim guard.
+        """
+        conn = await aiosqlite.connect(
+            self.db_path,
+            timeout=sqlite_busy_timeout_s(),
+        )
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await conn.execute("BEGIN IMMEDIATE")
+            cursor = await conn.execute(
+                "UPDATE scheduled_tasks SET last_run = ?, next_run = ?, "
+                "enabled = ?, updated_at = ? "
+                "WHERE id = ? AND enabled = 1 AND next_run = ?",
+                (
+                    fired_at,
+                    next_run,
+                    0 if disable else 1,
+                    fired_at,
+                    task_id,
+                    expected_next_run,
+                ),
+            )
+            if cursor.rowcount != 1:
+                await conn.rollback()
+                return False
+            await conn.execute(
+                "INSERT INTO task_runs "
+                "(id, task_id, trigger, status, started_at, session_id) "
+                "VALUES (?, ?, 'schedule', 'running', ?, ?)",
+                (run_id, task_id, fired_at, session_id),
+            )
+            await conn.commit()
+            return True
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
 
     # ── Task Runs (scheduled-task execution history) ──
     #
@@ -6203,7 +6280,10 @@ class MemoryDB:
                     "WHERE session_id = ?), 0) + 1, ?, ?, ?) RETURNING seq",
                     (session_id, session_id, int(time.time() * 1000), event_type, payload),
                 )
-                row = await cursor.fetchone()
+                try:
+                    row = await cursor.fetchone()
+                finally:
+                    await cursor.close()
                 await conn.commit()
                 return int(row[0]) if row else 0
             except sqlite3.IntegrityError:
@@ -6289,6 +6369,449 @@ class MemoryDB:
         if not isinstance(runs, list):
             return []
         return list(reversed(runs[-limit:]))
+
+    @staticmethod
+    def _stale_run_text(value: Any) -> str:
+        """Extract textual runtime input/content without inventing media text."""
+        if isinstance(value, str):
+            return value.strip()
+        if not isinstance(value, list):
+            return ""
+        parts: list[str] = []
+        for part in value:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "\n".join(parts).strip()
+
+    async def recover_stale_session_runs(self, session_id: str) -> int:
+        """Finalize legacy ``RUNNING`` runs at a known-safe turn boundary.
+
+        A process crash (and older barge-in paths) can leave a run with its
+        user input and streamed partial content persisted, but no assembled
+        ``messages`` and status ``RUNNING``. History readers skip that shell,
+        so a follow-up such as "continue" reaches the model with neither the
+        request nor the partial answer. At startup every RUNNING row is stale;
+        at the start of a later turn the previous run in that session is stale
+        by construction. Those are the only call sites for this method.
+
+        The legacy row is updated with compare-and-swap on the exact runs JSON
+        so a concurrent writer can never be overwritten. The normalized v2
+        projection is refreshed afterwards for app/history parity.
+        """
+        if not session_id:
+            return 0
+        conn = await aiosqlite.connect(
+            self.db_path,
+            timeout=sqlite_busy_timeout_s(),
+        )
+        conn.row_factory = aiosqlite.Row
+        changed = 0
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            cursor = await conn.execute(
+                "SELECT runs FROM sessions WHERE session_id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            raw_runs = row["runs"] if row else None
+            if not raw_runs:
+                return 0
+            try:
+                runs = json.loads(raw_runs)
+                if isinstance(runs, str):
+                    runs = json.loads(runs)
+            except (TypeError, ValueError):
+                return 0
+            if not isinstance(runs, list):
+                return 0
+
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                status = str(run.get("status") or "").upper().rsplit(".", 1)[-1]
+                if status != "RUNNING":
+                    continue
+                messages = run.get("messages")
+                if isinstance(messages, list) and messages:
+                    run["status"] = "COMPLETED"
+                    changed += 1
+                    continue
+
+                input_data = run.get("input")
+                user_text = self._stale_run_text(
+                    input_data.get("input_content")
+                    if isinstance(input_data, dict) else None
+                )
+                content_text = self._stale_run_text(run.get("content"))
+                if user_text:
+                    recovered_messages: list[dict[str, Any]] = [
+                        {"role": "user", "content": user_text},
+                    ]
+                    run_id = str(run.get("run_id") or "")
+                    sentinels = {
+                        "Operation cancelled by user",
+                        f"Run {run_id} was cancelled" if run_id else "",
+                    }
+                    if content_text and content_text not in sentinels:
+                        recovered_messages.append(
+                            {"role": "assistant", "content": content_text},
+                        )
+                    run["messages"] = recovered_messages
+                    run["status"] = "COMPLETED"
+                else:
+                    # No conversational input exists to synthesize. Resolve
+                    # the zombie for UI/operational truth, but do not fabricate
+                    # a user turn merely from an assistant fragment.
+                    run["status"] = "ERROR"
+                changed += 1
+
+            if not changed:
+                return 0
+            encoded = json.dumps(runs, ensure_ascii=False)
+            await conn.execute("BEGIN IMMEDIATE")
+            updated = await conn.execute(
+                "UPDATE sessions SET runs = ?, updated_at = ? "
+                "WHERE session_id = ? AND runs = ?",
+                (encoded, int(time.time()), session_id, raw_runs),
+            )
+            if updated.rowcount != 1:
+                await conn.rollback()
+                return 0
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
+        # Projection is best-effort by design; the accepted legacy repair is
+        # already durable even if the additive v2 mirror must catch up later.
+        try:
+            await self._ensure_connected()
+            await self._project_operational_session(session_id)
+            assert self._conn is not None
+            await self._conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "stale session run projection deferred for %s: %s",
+                session_id,
+                exc,
+            )
+        return changed
+
+    async def recover_all_stale_session_runs(self) -> int:
+        """Recover prior-process RUNNING sessions at startup, idempotently."""
+        conn = await self._ensure_connected()
+        try:
+            cursor = await conn.execute(
+                "SELECT DISTINCT session_id FROM session_runs "
+                "WHERE status = 'running'",
+            )
+            session_ids = [str(row[0]) for row in await cursor.fetchall()]
+        except Exception:
+            # Operational storage is additive and may be absent on an old DB;
+            # targeted start-of-turn recovery remains the safe fallback.
+            return 0
+        recovered = 0
+        for stale_session_id in session_ids:
+            recovered += await self.recover_stale_session_runs(stale_session_id)
+        return recovered
+
+    async def recover_session_from_journal(
+        self,
+        session_id: str,
+        *,
+        current_text: str | None = None,
+        max_chars: int = 32_000,
+    ) -> int:
+        """Restore conversational facts that vanished from ``sessions.runs``.
+
+        ``session_events`` is an append-only witness written before/during a
+        turn. If a broken compaction recap is later skipped as RUNNING, or a
+        stale runtime object overwrites the recap, completed user/assistant
+        facts can remain in the journal while disappearing from model history.
+        At a safe start-of-turn boundary, prepend one synthetic COMPLETED run
+        containing the missing conversational events. Tool chatter is omitted;
+        newest events are retained under a strict character budget.
+
+        Recovery markers carry ``journal_through_seq`` so the operation is
+        idempotent. A valid compaction marker uses its matching journal event as
+        the baseline: facts already represented by that recap are never
+        expanded back into verbatim history.
+        """
+        if not session_id:
+            return 0
+        conn = await aiosqlite.connect(
+            self.db_path,
+            timeout=sqlite_busy_timeout_s(),
+        )
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            row = await (
+                await conn.execute(
+                    "SELECT runs FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+            ).fetchone()
+            raw_runs = row["runs"] if row else None
+            if not raw_runs:
+                return 0
+            try:
+                runs = json.loads(raw_runs)
+                if isinstance(runs, str):
+                    runs = json.loads(runs)
+            except (TypeError, ValueError):
+                return 0
+            if not isinstance(runs, list):
+                return 0
+
+            event_rows = await (
+                await conn.execute(
+                    "SELECT seq, ts_ms, type, data FROM ("
+                    "SELECT seq, ts_ms, type, data FROM session_events "
+                    "WHERE session_id = ? ORDER BY seq DESC LIMIT 2000"
+                    ") ORDER BY seq ASC",
+                    (session_id,),
+                )
+            ).fetchall()
+            events: list[dict[str, Any]] = []
+            for event_row in event_rows:
+                try:
+                    data = json.loads(event_row["data"] or "{}")
+                except (TypeError, ValueError):
+                    data = {}
+                events.append({
+                    "seq": int(event_row["seq"]),
+                    "ts_ms": int(event_row["ts_ms"]),
+                    "type": str(event_row["type"]),
+                    "data": data if isinstance(data, dict) else {},
+                })
+            if not events:
+                return 0
+
+            baseline_seq = 0
+            compaction_run_ids: set[str] = set()
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                metadata = run.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                if metadata.get("continuity_recovery"):
+                    try:
+                        baseline_seq = max(
+                            baseline_seq, int(metadata.get("journal_through_seq") or 0),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if metadata.get("compaction") and run.get("run_id"):
+                    compaction_run_ids.add(str(run["run_id"]))
+            if compaction_run_ids:
+                matched_compaction = False
+                for event in events:
+                    if event["type"] != "compaction":
+                        continue
+                    data = event["data"]
+                    if (
+                        data.get("phase") == "done"
+                        and str(data.get("recap_run_id") or "") in compaction_run_ids
+                    ):
+                        baseline_seq = max(baseline_seq, event["seq"])
+                        matched_compaction = True
+
+                # The bounded event window intentionally retains the newest
+                # facts. A still-live recap can be older than that window in a
+                # very long session, so locate its audit marker separately
+                # instead of expanding already-compacted history again.
+                if not matched_compaction:
+                    compaction_rows = await (
+                        await conn.execute(
+                            "SELECT seq, data FROM session_events "
+                            "WHERE session_id = ? AND type = 'compaction' "
+                            "ORDER BY seq DESC LIMIT 2000",
+                            (session_id,),
+                        )
+                    ).fetchall()
+                    for compaction_row in compaction_rows:
+                        try:
+                            data = json.loads(compaction_row["data"] or "{}")
+                        except (TypeError, ValueError):
+                            continue
+                        if (
+                            isinstance(data, dict)
+                            and data.get("phase") == "done"
+                            and str(data.get("recap_run_id") or "")
+                            in compaction_run_ids
+                        ):
+                            baseline_seq = max(
+                                baseline_seq, int(compaction_row["seq"]),
+                            )
+                            break
+
+            # Honour the journal's reconstruction contract: an unknown,
+            # non-ignorable event after our baseline means we cannot claim the
+            # replay is complete.
+            accepted_types = sorted(
+                self.JOURNAL_KNOWN_TYPES | self.JOURNAL_IGNORABLE_TYPES,
+            )
+            placeholders = ", ".join("?" for _ in accepted_types)
+            unknown = await (
+                await conn.execute(
+                    "SELECT 1 FROM session_events WHERE session_id = ? "
+                    "AND seq > ? AND type NOT IN (" + placeholders + ") LIMIT 1",
+                    (session_id, baseline_seq, *accepted_types),
+                )
+            ).fetchone()
+            if unknown is not None:
+                return 0
+
+            represented_texts: set[str] = set()
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                has_user = False
+                has_assistant = False
+                for message in run.get("messages") or []:
+                    if not isinstance(message, dict):
+                        continue
+                    role = str(message.get("role") or "").lower()
+                    if role not in {"user", "assistant"}:
+                        continue
+                    if message.get("from_history") is True:
+                        continue
+                    text = self._stale_run_text(message.get("content"))
+                    if not text:
+                        continue
+                    represented_texts.add(text)
+                    has_user = has_user or role == "user"
+                    has_assistant = has_assistant or role == "assistant"
+                input_data = run.get("input")
+                if not has_user and isinstance(input_data, dict):
+                    text = self._stale_run_text(input_data.get("input_content"))
+                    if text:
+                        represented_texts.add(text)
+                if not has_assistant:
+                    text = self._stale_run_text(run.get("content"))
+                    if text:
+                        represented_texts.add(text)
+
+            current = (current_text or "").strip()
+            current_witness = current[:4000]
+            current_event_seq: int | None = None
+            if current_witness and events and events[-1]["type"] == "user/message":
+                latest_user_text = self._stale_run_text(
+                    events[-1]["data"].get("text"),
+                )
+                if latest_user_text and (
+                    latest_user_text == current_witness
+                    or current.endswith("\n" + latest_user_text)
+                    or (
+                        len(latest_user_text) == 4000
+                        and current.startswith(latest_user_text)
+                    )
+                ):
+                    current_event_seq = events[-1]["seq"]
+            missing: list[dict[str, Any]] = []
+            for event in events:
+                if event["seq"] <= baseline_seq:
+                    continue
+                event_type = event["type"]
+                if event_type not in {"user/message", "assistant/message"}:
+                    continue
+                text = self._stale_run_text(event["data"].get("text"))
+                if not text:
+                    continue
+                # The current user event is journalled before the model run and
+                # is expected not to exist in persisted history yet. Skip only
+                # the newest exact witness; a short current message such as
+                # "ok" must not suppress an older, longer fact containing it.
+                if event["seq"] == current_event_seq:
+                    continue
+                if text in represented_texts:
+                    continue
+                missing.append({**event, "text": text})
+
+            if not any(event["type"] == "user/message" for event in missing):
+                return 0
+
+            budget = max(1000, min(int(max_chars), 128_000))
+            selected_rev: list[dict[str, Any]] = []
+            used = 0
+            for event in reversed(missing):
+                size = len(event["text"])
+                if selected_rev and used + size > budget:
+                    break
+                selected_rev.append(event)
+                used += size
+            selected = list(reversed(selected_rev))
+            while selected and selected[0]["type"] != "user/message":
+                selected.pop(0)
+            if not selected or not any(
+                event["type"] == "user/message" for event in selected
+            ):
+                return 0
+
+            messages = [
+                {
+                    "role": "user" if event["type"] == "user/message" else "assistant",
+                    "content": event["text"],
+                }
+                for event in selected
+            ]
+            last_assistant = next(
+                (
+                    event["text"] for event in reversed(selected)
+                    if event["type"] == "assistant/message"
+                ),
+                None,
+            )
+            recovery_run = {
+                "run_id": f"journal-recovery-{uuid.uuid4()}",
+                "session_id": session_id,
+                "status": "COMPLETED",
+                "content": last_assistant,
+                "content_type": "str",
+                "messages": messages,
+                "metadata": {
+                    "continuity_recovery": True,
+                    "journal_from_seq": selected[0]["seq"],
+                    "journal_through_seq": selected[-1]["seq"],
+                    "events_recovered": len(selected),
+                },
+                "created_at": max(1, selected[0]["ts_ms"] // 1000),
+            }
+            encoded = json.dumps([recovery_run, *runs], ensure_ascii=False)
+            await conn.execute("BEGIN IMMEDIATE")
+            updated = await conn.execute(
+                "UPDATE sessions SET runs = ?, updated_at = ? "
+                "WHERE session_id = ? AND runs = ?",
+                (encoded, int(time.time()), session_id, raw_runs),
+            )
+            if updated.rowcount != 1:
+                await conn.rollback()
+                return 0
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
+
+        try:
+            await self._ensure_connected()
+            await self._project_operational_session(session_id)
+            assert self._conn is not None
+            await self._conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "journal continuity projection deferred for %s: %s",
+                session_id,
+                exc,
+            )
+        return len(messages)
 
     # ── Generic state flags ──
 

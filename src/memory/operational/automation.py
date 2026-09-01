@@ -126,13 +126,17 @@ async def _effective_owner(
 
 
 async def _allocate_revision(conn: Any, now_ms: int) -> int:
-    row = await (
-        await conn.execute(
-            "UPDATE operational_storage_state SET history_revision=history_revision+1, "
-            "updated_at_ms=? WHERE singleton_id=1 RETURNING history_revision",
-            (now_ms,),
-        )
-    ).fetchone()
+    cursor = await conn.execute(
+        "UPDATE operational_storage_state SET history_revision=history_revision+1, "
+        "updated_at_ms=? WHERE singleton_id=1 RETURNING history_revision",
+        (now_ms,),
+    )
+    try:
+        row = await cursor.fetchone()
+    finally:
+        await cursor.close()
+    if row is None:
+        raise RuntimeError("failed to allocate operational history revision")
     return int(row[0])
 
 

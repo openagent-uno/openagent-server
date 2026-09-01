@@ -139,11 +139,17 @@ def _fetch_legacy(conn: Any, session_id: str) -> dict[str, Any] | None:
 
 
 def _allocate_revision(conn: Any, now_ms: int) -> int:
-    row = conn.execute(
+    changed = conn.execute(
         "UPDATE operational_storage_state "
         "SET history_revision=history_revision+1, updated_at_ms=? "
-        "WHERE singleton_id=1 RETURNING history_revision",
+        "WHERE singleton_id=1",
         (now_ms,),
+    )
+    if int(changed.rowcount) != 1:
+        raise RuntimeError("failed to allocate operational history revision")
+    row = conn.execute(
+        "SELECT history_revision FROM operational_storage_state "
+        "WHERE singleton_id=1"
     ).fetchone()
     if row is None:
         raise RuntimeError("failed to allocate operational history revision")

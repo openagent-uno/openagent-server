@@ -1829,6 +1829,14 @@ class AgentServer:
         #      one. Cheap (one UPDATE on a small table) and idempotent.
         try:
             db = getattr(self.agent, "_db", None)
+            if db is not None:
+                if hasattr(db, "recover_all_stale_session_runs"):
+                    recovered_sessions = await db.recover_all_stale_session_runs()
+                    if recovered_sessions:
+                        elog(
+                            "session.stale_runs_recovered",
+                            count=recovered_sessions,
+                        )
             if db is not None and hasattr(db, "reap_orphan_workflow_runs"):
                 reaped = await db.reap_orphan_workflow_runs()
                 if reaped:

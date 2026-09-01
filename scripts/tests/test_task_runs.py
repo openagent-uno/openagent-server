@@ -260,6 +260,96 @@ async def t_cascade(ctx: TestContext) -> None:
             pass
 
 
+@test("task_runs", "due-task claim advances schedule and opens run atomically")
+async def t_atomic_due_claim(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-claim-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("Atomic", "* * * * *", "p")
+        due_at = time.time() - 5
+        await db.update_task(task_id, next_run=due_at)
+        run_id = str(uuid.uuid4())
+        fired_at = time.time()
+        next_run = fired_at + 60
+
+        claimed = await db.claim_due_task_run(
+            task_id=task_id,
+            expected_next_run=due_at,
+            fired_at=fired_at,
+            next_run=next_run,
+            disable=False,
+            run_id=run_id,
+            session_id=f"scheduler:{task_id}:{run_id}",
+        )
+        assert claimed is True
+        task = await db.get_task(task_id)
+        run = await db.get_task_run(run_id)
+        assert task["last_run"] == fired_at, task
+        assert task["next_run"] == next_run, task
+        assert run is not None and run["status"] == "running", run
+
+        # The exact due occurrence can be claimed only once.
+        assert await db.claim_due_task_run(
+            task_id=task_id,
+            expected_next_run=due_at,
+            fired_at=fired_at + 1,
+            next_run=next_run + 60,
+            disable=False,
+            run_id=str(uuid.uuid4()),
+            session_id=None,
+        ) is False
+        assert len(await db.list_task_runs(task_id)) == 1
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("task_runs", "failed run insert rolls the schedule claim back")
+async def t_atomic_due_claim_rollback(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-rollback-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("Rollback", "* * * * *", "p")
+        due_at = time.time() - 5
+        await db.update_task(task_id, next_run=due_at)
+        before = await db.get_task(task_id)
+        duplicate_run_id = await db.add_task_run(task_id=task_id)
+
+        raised = False
+        try:
+            await db.claim_due_task_run(
+                task_id=task_id,
+                expected_next_run=due_at,
+                fired_at=time.time(),
+                next_run=time.time() + 60,
+                disable=False,
+                run_id=duplicate_run_id,
+                session_id=None,
+            )
+        except Exception:
+            raised = True
+        assert raised, "the duplicate run id must reject the claim"
+        after = await db.get_task(task_id)
+        assert after["last_run"] == before["last_run"], after
+        assert after["next_run"] == before["next_run"], after
+        assert len(await db.list_task_runs(task_id)) == 1
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
 # ── Scheduler recording path ──────────────────────────────────────────
 
 
@@ -286,6 +376,53 @@ class _SpyAgent:
 
     async def release_session(self, session_id: str, *, model_override=None) -> None:
         self.release_calls.append(session_id)
+
+
+@test("task_runs", "scheduler records a due run before execution begins")
+async def t_scheduler_due_claim_precedes_execution(ctx: TestContext) -> None:
+    import asyncio
+    import os
+
+    from src.core.scheduler import Scheduler
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-due-{uuid.uuid4().hex[:8]}.db")
+    previous = os.environ.get("OPENAGENT_SCHEDULER_DURABLE_SESSIONS")
+    os.environ["OPENAGENT_SCHEDULER_DURABLE_SESSIONS"] = "0"
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        task_id = await db.add_task("Due", "* * * * *", "p")
+        await db.update_task(task_id, next_run=time.time() - 1)
+
+        class _ClaimAwareAgent(_SpyAgent):
+            async def run(self, **kwargs) -> str:
+                rows = await db.list_task_runs(task_id)
+                assert len(rows) == 1, rows
+                assert rows[0]["status"] == "running", rows[0]
+                return "claimed first"
+
+        scheduler = Scheduler(db=db, agent=_ClaimAwareAgent())  # type: ignore[arg-type]
+        await scheduler._check_and_run()
+        await asyncio.gather(*scheduler._workflow_tasks, return_exceptions=False)
+
+        runs = await db.list_task_runs(task_id)
+        assert len(runs) == 1, runs
+        assert runs[0]["status"] == "success", runs[0]
+        assert runs[0]["output"] == "claimed first", runs[0]
+        task = await db.get_task(task_id)
+        assert task["last_run"] is not None
+        assert task["next_run"] > time.time(), task
+        await db.close()
+    finally:
+        if previous is None:
+            os.environ.pop("OPENAGENT_SCHEDULER_DURABLE_SESSIONS", None)
+        else:
+            os.environ["OPENAGENT_SCHEDULER_DURABLE_SESSIONS"] = previous
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
 
 
 @test("task_runs", "run_task records a success run with the output preview")

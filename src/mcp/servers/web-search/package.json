@@ -9,6 +9,7 @@
   "scripts": {
     "start": "npm run build && node dist/index.js",
     "build": "tsc",
+    "test": "npm run build && node --test test/*.test.mjs",
     "clean": "rm -rf dist",
     "postinstall": "npx playwright install chromium"
   },

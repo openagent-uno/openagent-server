@@ -856,17 +856,21 @@ class Scheduler:
                 "OPENAGENT_LOCAL_SCHEDULED_TASK_TIMEOUT_SECONDS", "120",
             )))
         durable = _durable_child_sessions()
-        # Per-run id (durable) so each firing is its own navigable session;
-        # legacy mode reuses one per-task id wiped after every fire.
-        run_id: str = str(uuid.uuid4())
+        # A cron firing is claimed atomically before this coroutine is
+        # dispatched. Manual/event firings still mint + insert here. Hidden
+        # keys live only on the in-memory copy made by ``_check_and_run`` and
+        # preserve the public ``run_task(task, ...)`` extension signature.
+        preclaimed_run_id = task.get("_preclaimed_run_id")
+        preclaimed_session_id = task.get("_preclaimed_session_id")
+        run_id: str = str(preclaimed_run_id or uuid.uuid4())
         # The durable per-run id MUST equal what ``run_child_session`` mints for
         # the same origin_ref, so the ``task_runs.session_id`` link points at the
         # real child row — mint it the one way instead of re-formatting by hand.
         from src.core.child_session import mint_child_session_id
-        session_id = (
+        session_id = str(preclaimed_session_id or (
             mint_child_session_id("scheduler", {"task_id": task["id"], "run_id": run_id})
             if durable else f"scheduler:{task['id']}"
-        )
+        ))
         allowed_families: list[str] | None = execution_policy.get(
             "allowed_tool_families"
         )
@@ -926,8 +930,8 @@ class Scheduler:
         # logging must never stop the task from running, so the db touch
         # is guarded and skipped entirely when there's no db (e.g. a
         # Scheduler constructed with ``db=None`` in unit tests).
-        recorded = False
-        if self.db is not None:
+        recorded = bool(preclaimed_run_id)
+        if self.db is not None and not recorded:
             try:
                 await self.db.add_task_run(
                     task_id=task["id"], trigger=trigger, run_id=run_id,
@@ -1333,16 +1337,47 @@ class Scheduler:
             elog("task.run_finish_failed", level="warning",
                  name=task.get("name"), error=str(e))
 
+    async def _run_preclaimed_task(self, task: dict) -> None:
+        """Dispatch a cron run already inserted by ``claim_due_task_run``.
+
+        Most task hooks delegate to the real ``run_task``, which finalizes the
+        row itself. The auto-update hook intentionally replaces execution and
+        never enters ``run_task``; the terminal check below closes that row as
+        well, so an implementation hook cannot leave the atomic claim
+        permanently ``running``.
+        """
+        run_id = str(task["_preclaimed_run_id"])
+        try:
+            await self.run_task(task)
+        except asyncio.CancelledError:
+            await self._record_task_finish(
+                run_id, task, status="cancelled", error="Stopped by user",
+            )
+            raise
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            await self._record_task_finish(
+                run_id, task, status="failed", error=detail,
+            )
+            raise
+        row = await self.db.get_task_run(run_id) if self.db is not None else None
+        if row is not None and row.get("status") == "running":
+            await self._record_task_finish(
+                run_id,
+                task,
+                status="success",
+                output="Completed by scheduled-task execution hook",
+            )
+
     async def _check_and_run(self) -> None:
         """Check for due tasks and execute them.
 
         Each due item is dispatched as its own ``asyncio.Task`` via
         ``_spawn_workflow`` so different workflows actually run in
-        parallel. Bookkeeping (``last_run`` / ``next_run`` advances,
-        broadcasts) happens *before* dispatch — otherwise a long run
-        would still be in-flight when the next 30 s tick fires
-        ``get_due_tasks`` again, and the same row would be re-fired
-        repeatedly.
+        parallel. Bookkeeping and the initial ``task_runs`` row are committed
+        in one transaction *before* dispatch. A lock failure rolls both back,
+        leaving the occurrence due for the next tick; a crash after commit
+        leaves a durable ``running`` row for startup reaping/requeueing.
         """
         now = time.time()
         due_tasks = await self.db.get_due_tasks(now)
@@ -1350,26 +1385,57 @@ class Scheduler:
         for task in due_tasks:
             elog("scheduler.run_due", name=task["name"])
             try:
-                if is_one_shot_expression(task["cron_expression"]):
-                    await self.db.update_task(
-                        task["id"],
-                        last_run=now,
-                        next_run=None,
-                        enabled=0,
+                one_shot = is_one_shot_expression(task["cron_expression"])
+                next_run = None if one_shot else self._next_run(
+                    task["cron_expression"], now, self._task_tz(task),
+                )
+                run_id = str(uuid.uuid4())
+                durable = _durable_child_sessions()
+                if durable:
+                    from src.core.child_session import mint_child_session_id
+
+                    session_id = mint_child_session_id(
+                        "scheduler", {"task_id": task["id"], "run_id": run_id},
                     )
                 else:
-                    await self.db.update_task(
-                        task["id"],
-                        last_run=now,
-                        next_run=self._next_run(
-                            task["cron_expression"], now, self._task_tz(task),
-                        ),
+                    session_id = None
+                claimed = await self.db.claim_due_task_run(
+                    task_id=task["id"],
+                    expected_next_run=task["next_run"],
+                    fired_at=now,
+                    next_run=next_run,
+                    disable=one_shot,
+                    run_id=run_id,
+                    session_id=session_id,
+                )
+                if not claimed:
+                    elog(
+                        "scheduler.run_due_already_claimed",
+                        task=task["name"],
+                        task_id=task["id"],
                     )
+                    continue
                 self._broadcast("scheduled_task", "updated", task["id"])
             except ValueError as e:
                 elog("scheduler.next_run_update_failed", level="error",
                      task=task["name"], error=str(e))
-            self._spawn_workflow(self.run_task(task))
+                continue
+            except Exception as e:  # noqa: BLE001
+                # The atomic transaction rolled back, so the occurrence stays
+                # due and will be retried on the next scheduler tick.
+                elog(
+                    "scheduler.task_claim_failed",
+                    level="warning",
+                    task=task["name"],
+                    error=str(e) or type(e).__name__,
+                )
+                continue
+            claimed_task = {
+                **task,
+                "_preclaimed_run_id": run_id,
+                "_preclaimed_session_id": session_id,
+            }
+            self._spawn_workflow(self._run_preclaimed_task(claimed_task))
 
         # Per-block schedules. Each due row fires its own
         # trigger-schedule node as the entry point; a workflow with

@@ -8,7 +8,9 @@ re-marks the run COMPLETED so it stays in history. These tests pin that.
 """
 from __future__ import annotations
 
+import json
 import time
+import uuid
 
 from ._framework import TestContext, TestSkip, test
 
@@ -147,3 +149,268 @@ async def t_synth_partial_and_sentinels(_ctx: TestContext) -> None:
     # Sentinels (nothing was generated) → user only, no bogus assistant.
     assert [m.role for m in synth_interrupted_messages(shell("Run rid was cancelled"))] == ["user"]
     assert [m.role for m in synth_interrupted_messages(shell("Operation cancelled by user"))] == ["user"]
+
+
+@test("runtime_partial_commit", "stale RUNNING input and partial are recovered into history")
+async def t_recover_stale_running_dict(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"stale-session-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        now = int(time.time())
+        session_id = "stale-session"
+        run_id = "stale-run"
+        runs = [{
+            "run_id": run_id,
+            "session_id": session_id,
+            "agent_id": "a",
+            "user_id": "owner",
+            "status": "RUNNING",
+            "input": {"input_content": "investigate the database lock"},
+            "content": "I found the writer that held",
+            "messages": [],
+            "created_at": now,
+        }]
+        conn = await db._ensure_connected()
+        await conn.execute(
+            "INSERT INTO sessions "
+            "(session_id, session_type, agent_id, user_id, metadata, runs, created_at, updated_at) "
+            "VALUES (?, 'agent', 'a', 'owner', '{}', ?, ?, ?)",
+            (session_id, json.dumps(runs), now, now),
+        )
+        await conn.commit()
+
+        assert await db.recover_stale_session_runs(session_id) == 1
+        recovered = (await db.list_session_runs(session_id))[0]
+        assert recovered["status"] == "COMPLETED", recovered
+        assert [(m["role"], m["content"]) for m in recovered["messages"]] == [
+            ("user", "investigate the database lock"),
+            ("assistant", "I found the writer that held"),
+        ]
+        # Recovery is idempotent and the normalized transcript sees the same
+        # repaired conversation, not a permanently-streaming shell.
+        assert await db.recover_stale_session_runs(session_id) == 0
+        run_row = await (
+            await conn.execute(
+                "SELECT status FROM session_runs WHERE session_id=?",
+                (session_id,),
+            )
+        ).fetchone()
+        assert run_row is not None and run_row[0] == "success", run_row
+        messages = await (
+            await conn.execute(
+                "SELECT role, text FROM session_messages WHERE session_id=? ORDER BY sequence",
+                (session_id,),
+            )
+        ).fetchall()
+        assert [(m[0], m[1]) for m in messages] == [
+            ("user", "investigate the database lock"),
+            ("assistant", "I found the writer that held"),
+        ], messages
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("runtime_partial_commit", "startup recovery finds projected running sessions")
+async def t_recover_all_stale_running(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"stale-startup-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        now = int(time.time())
+        conn = await db._ensure_connected()
+        await conn.execute(
+            "INSERT INTO sessions "
+            "(session_id, session_type, agent_id, user_id, metadata, runs, created_at, updated_at) "
+            "VALUES ('startup-stale', 'agent', 'a', 'owner', '{}', ?, ?, ?)",
+            (json.dumps([{
+                "run_id": "startup-run",
+                "status": "RUNNING",
+                "input": {"input_content": "continue this task"},
+                "messages": [],
+                "created_at": now,
+            }]), now, now),
+        )
+        await db._project_operational_session("startup-stale")
+        await conn.commit()
+
+        assert await db.recover_all_stale_session_runs() == 1
+        recovered = (await db.list_session_runs("startup-stale"))[0]
+        assert recovered["status"] == "COMPLETED", recovered
+        assert recovered["messages"][0]["content"] == "continue this task"
+        assert await db.recover_all_stale_session_runs() == 0
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("runtime_partial_commit", "journal witness restores history lost after compaction")
+async def t_recover_missing_journal_history(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"journal-recovery-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        now = int(time.time())
+        session_id = "journal-lost"
+        surviving = [{
+            "run_id": "recent-run",
+            "status": "COMPLETED",
+            "content": "recent answer",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "first lost request",
+                    "from_history": True,
+                },
+                {"role": "user", "content": "recent question"},
+                {"role": "assistant", "content": "recent answer"},
+            ],
+            "created_at": now,
+        }]
+        conn = await db._ensure_connected()
+        await conn.execute(
+            "INSERT INTO sessions "
+            "(session_id, session_type, agent_id, user_id, metadata, runs, created_at, updated_at) "
+            "VALUES (?, 'agent', 'a', 'owner', '{}', ?, ?, ?)",
+            (session_id, json.dumps(surviving), now, now),
+        )
+        await conn.commit()
+        for event_type, text in [
+            ("user/message", "first lost request"),
+            ("assistant/message", "first lost answer"),
+            ("user/message", "only continue now after validation"),
+            ("assistant/message", "validation is still pending"),
+            ("user/message", "second lost decision"),
+            ("assistant/message", "second lost answer"),
+            ("user/message", "recent question"),
+            ("assistant/message", "recent answer"),
+            ("user/message", "continue now"),
+        ]:
+            await db.append_session_event(session_id, event_type, {"text": text})
+
+        recovered_count = await db.recover_session_from_journal(
+            session_id, current_text="[language hint]\ncontinue now",
+        )
+        assert recovered_count == 6, recovered_count
+        runs = await db.list_session_runs(session_id, limit=10)
+        recovery = next(
+            run for run in runs
+            if (run.get("metadata") or {}).get("continuity_recovery")
+        )
+        assert [m["content"] for m in recovery["messages"]] == [
+            "first lost request",
+            "first lost answer",
+            "only continue now after validation",
+            "validation is still pending",
+            "second lost decision",
+            "second lost answer",
+        ], recovery
+        assert all(
+            message.get("content") != "continue now"
+            for message in recovery["messages"]
+        )
+        assert await db.recover_session_from_journal(
+            session_id, current_text="continue now",
+        ) == 0
+
+        projected = await (
+            await conn.execute(
+                "SELECT role, text FROM session_messages "
+                "WHERE session_id=? ORDER BY sequence",
+                (session_id,),
+            )
+        ).fetchall()
+        projected_pairs = [(row[0], row[1]) for row in projected]
+        assert ("user", "first lost request") in projected_pairs
+        assert ("assistant", "second lost answer") in projected_pairs
+        assert ("user", "recent question") in projected_pairs
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@test("runtime_partial_commit", "journal recovery reads the newest bounded event window")
+async def t_recover_latest_journal_window(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"journal-window-{uuid.uuid4().hex[:8]}.db")
+    try:
+        db = MemoryDB(str(tmp_db))
+        await db.connect()
+        now = int(time.time())
+        session_id = "journal-window"
+        conn = await db._ensure_connected()
+        await conn.execute(
+            "INSERT INTO sessions "
+            "(session_id, session_type, agent_id, user_id, metadata, runs, created_at, updated_at) "
+            "VALUES (?, 'agent', 'a', 'owner', '{}', ?, ?, ?)",
+            (session_id, json.dumps([{
+                "run_id": "survivor",
+                "status": "COMPLETED",
+                "content": "surviving answer",
+                "messages": [
+                    {"role": "user", "content": "surviving request"},
+                    {"role": "assistant", "content": "surviving answer"},
+                ],
+                "created_at": now,
+            }]), now, now),
+        )
+        await conn.executemany(
+            "INSERT INTO session_events (session_id, seq, ts_ms, type, data) "
+            "VALUES (?, ?, ?, 'tool/status', '{\"text\":\"progress\"}')",
+            [(session_id, seq, now * 1000) for seq in range(1, 2006)],
+        )
+        await conn.executemany(
+            "INSERT INTO session_events (session_id, seq, ts_ms, type, data) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    session_id, 2006, now * 1000, "user/message",
+                    json.dumps({"text": "newest lost request"}),
+                ),
+                (
+                    session_id, 2007, now * 1000, "assistant/message",
+                    json.dumps({"text": "newest lost answer"}),
+                ),
+                (
+                    session_id, 2008, now * 1000, "user/message",
+                    json.dumps({"text": "continue"}),
+                ),
+            ],
+        )
+        await conn.commit()
+
+        assert await db.recover_session_from_journal(
+            session_id, current_text="continue",
+        ) == 2
+        runs = await db.list_session_runs(session_id, limit=10)
+        recovery = next(
+            run for run in runs
+            if (run.get("metadata") or {}).get("continuity_recovery")
+        )
+        assert [message["content"] for message in recovery["messages"]] == [
+            "newest lost request",
+            "newest lost answer",
+        ]
+        await db.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
