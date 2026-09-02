@@ -1054,10 +1054,21 @@ def _as_epoch(value: Any) -> float:
 # subprocess insieme.
 #
 # Portato da Hermes (``hermes_cli/kanban_db.py``, ``_maybe_checkpoint_wal``):
-# un ``wal_checkpoint(TRUNCATE)`` esplicito a intervallo grosso, best-effort.
-# Nessun lock: la finestra di corsa produce al massimo due checkpoint
+# un ``wal_checkpoint`` esplicito a intervallo grosso, best-effort.
+# Nessun lock nostro: la finestra di corsa produce al massimo due checkpoint
 # ravvicinati, che e' innocuo, e cosi' evitiamo di legare un asyncio.Lock a un
 # event loop al momento dell'import.
+#
+# Il modo e' PASSIVE, non TRUNCATE, e la differenza non e' cosmetica: TRUNCATE
+# prende il lock di SCRITTURA e poi ASPETTA che ogni lettore rilasci il WAL.
+# Con un lettore lungo sullo stesso file — il builder dell'indice semantico
+# scandisce tutta ``sessions`` a ogni ciclo — quell'attesa dura un minuto e
+# passa, e per tutto quel tempo OGNI scrittore del processo prende
+# SQLITE_BUSY. Il 2-set-2026 e' cosi' che l'INSERT in ``event_deliveries`` di
+# un webhook e' fallito: la richiesta di cancellazione account di un cliente
+# non e' mai diventata una riga, e nessuno se n'e' accorto. PASSIVE fa quanto
+# puo' senza mai aspettare nessuno; il WAL si accorcia comunque, solo non
+# sempre fino a zero.
 _WAL_CHECKPOINT_INTERVAL_SECONDS = 300.0
 _LAST_WAL_CHECKPOINT: dict[str, float] = {}
 
@@ -2376,7 +2387,7 @@ class MemoryDB:
             self._conn = None
 
     async def _maybe_checkpoint_wal(self) -> None:
-        """Esegue ``PRAGMA wal_checkpoint(TRUNCATE)`` a intervallo grosso.
+        """Esegue ``PRAGMA wal_checkpoint(PASSIVE)`` a intervallo grosso.
 
         Chiamato da ``_ensure_connected``, quindi attraversato da ogni
         operazione: il controllo temporale è volutamente la prima cosa, così
@@ -2395,7 +2406,7 @@ class MemoryDB:
         # confine dell'intervallo non fanno il checkpoint due volte.
         _LAST_WAL_CHECKPOINT[key] = now
         try:
-            await conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception:
             # WAL occupato o lockato: si riprova al prossimo intervallo.
             pass
