@@ -3239,28 +3239,56 @@ class MemoryDB:
         delivery from the moment it is born. An out-of-process insert leaves
         the lease NULL; ``claim_pending_event_deliveries`` stamps it when the
         Scheduler claims the row."""
-        conn = await self._ensure_connected()
         did = delivery_id or str(uuid.uuid4())
         now = time.time()
         claim_expires = (now + _lease_ttl_seconds()) if claimed else None
         wid = WORKER_ID if claimed else None
         wpid = WORKER_PID if claimed else None
-        await conn.execute(
-            "INSERT INTO event_deliveries "
-            "(id, event_id, source, external_id, status, payload_json, started_at, "
-            " claimed_at, claim_expires, worker_id, worker_pid) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                did, event_id, source, external_id, status,
-                json.dumps(payload or {}), now, (now if claimed else None),
-                claim_expires, wid, wpid,
-            ),
+
+        # A dedicated short-lived connection opened with ``BEGIN IMMEDIATE``,
+        # the same shape ``claim_scheduled_task`` already uses and for the same
+        # reason — but this row costs more when it is lost.
+        #
+        # On the shared ``MemoryDB._conn`` this INSERT waits behind whatever
+        # else is queued on it, and the write lock is taken by SQLite only when
+        # the statement runs. If another connection holds the write lock at
+        # that moment the upgrade fails with SQLITE_BUSY **immediately**: the
+        # busy handler is never called, so ``busy_timeout`` — three minutes of
+        # it — buys nothing. Measured on the Lyra agent: an HTTP 500 back to
+        # Replio for every inbound conversation while three task runs sat
+        # holding the database, and before Replio had a durable queue those
+        # events were simply gone.
+        #
+        # ``BEGIN IMMEDIATE`` asks for the write lock UP FRONT, which is the
+        # one case where the busy handler does run, so the insert waits its
+        # turn instead of being refused. Isolating it on its own connection
+        # also means a long statement elsewhere cannot make an inbound webhook
+        # queue behind it.
+        conn = await aiosqlite.connect(
+            self.db_path, timeout=sqlite_busy_timeout_s(),
         )
-        # Stamp last_triggered_at so the events list can show recency.
-        await conn.execute(
-            "UPDATE events SET last_triggered_at = ? WHERE id = ?", (now, event_id),
-        )
-        await conn.commit()
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await conn.execute("BEGIN IMMEDIATE")
+            await conn.execute(
+                "INSERT INTO event_deliveries "
+                "(id, event_id, source, external_id, status, payload_json, started_at, "
+                " claimed_at, claim_expires, worker_id, worker_pid) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    did, event_id, source, external_id, status,
+                    json.dumps(payload or {}), now, (now if claimed else None),
+                    claim_expires, wid, wpid,
+                ),
+            )
+            # Stamp last_triggered_at so the events list can show recency.
+            await conn.execute(
+                "UPDATE events SET last_triggered_at = ? WHERE id = ?", (now, event_id),
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
         return did
 
     async def update_event_delivery(self, delivery_id: str, **kwargs: Any) -> None:

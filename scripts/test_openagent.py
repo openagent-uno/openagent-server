@@ -551,6 +551,14 @@ _TEST_MODULES: tuple[str, ...] = (
     # Also pins the lock-surviving bounded-retry write (the finalizer that used
     # to lose the writer race and leave a row ``running`` forever).
     "test_event_delivery_lease",
+    # An inbound webhook must be recorded even while something else holds the
+    # database. The insert used to run on the long-lived MemoryDB connection,
+    # where SQLite refuses a read→write promotion with SQLITE_BUSY
+    # IMMEDIATELY — the busy handler never runs, so a three-minute
+    # busy_timeout bought nothing and every inbound came back HTTP 500. It now
+    # takes its own connection with BEGIN IMMEDIATE, the shape
+    # ``claim_scheduled_task`` already used, so it waits its turn.
+    "test_event_delivery_write_lock",
     # Per-event circuit breaker (gated OFF by default): N consecutive PERMANENT
     # failures trip it and park further deliveries ``blocked``; a success resets
     # it. The load-bearing property: a transient provider-429 / throttle /
