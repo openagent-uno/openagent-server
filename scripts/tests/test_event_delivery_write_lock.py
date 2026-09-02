@@ -160,3 +160,51 @@ async def t_supplied_delivery_id_is_kept(ctx: TestContext) -> None:
         assert rows[0]["id"] == mine
     finally:
         await db.close()
+
+
+@test("event_delivery_write_lock",
+      "a delivery is finalised even from a connection whose snapshot went stale")
+async def t_finaliser_survives_a_stale_snapshot(ctx: TestContext) -> None:
+    """The other half, found by fixing the first half.
+
+    With ingest repaired the Lyra agent recorded nine deliveries and finalised
+    none: every one sat at ``received``. ``update_event_delivery`` had a
+    bounded retry, but it retried the SAME promotion on the SAME connection —
+    and a stale snapshot cannot be promoted however many times you ask, so
+    three attempts in 350 ms failed three identical times.
+    """
+    path = ctx.db_path.with_name(f"evfin-{uuid.uuid4().hex[:8]}.db")
+    db = await _make_db(path)
+    try:
+        eid = await _an_event(db)
+        did = await db.add_event_delivery(event_id=eid, payload={})
+
+        shared = await db._ensure_connected()
+        await shared.execute("BEGIN")
+        await shared.execute("SELECT count(*) FROM event_deliveries")
+
+        other = await aiosqlite.connect(str(path))
+        try:
+            await other.execute("PRAGMA busy_timeout = 5000")
+            await other.execute(
+                "UPDATE events SET last_triggered_at = ? WHERE id = ?",
+                (time.time(), eid),
+            )
+            await other.commit()
+        finally:
+            await other.close()
+
+        try:
+            await db.update_event_delivery(did, status="success")
+        finally:
+            try:
+                await shared.execute("ROLLBACK")
+            except Exception:
+                pass
+
+        row = await db.get_event_delivery(did)
+        assert row["status"] == "success", (
+            f"the delivery was never finalised: {row['status']!r}"
+        )
+    finally:
+        await db.close()

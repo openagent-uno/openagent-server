@@ -3304,14 +3304,35 @@ class MemoryDB:
 
         # Lock-surviving: this is the finalizer that a rate-limit storm used to
         # lose to the runtime's big ``runs`` commit — leaving the row ``running``
-        # forever. A bounded retry lands the (idempotent, single-row) write once
-        # the writer frees up.
+        # forever.
+        #
+        # The bounded retry alone was not enough, and the reason is the same
+        # one that broke ``add_event_delivery``: on the shared connection a
+        # write is a promotion from whatever snapshot that connection is
+        # holding, and once that snapshot is stale SQLite refuses INSTANTLY —
+        # the busy handler never runs. Retrying the same promotion three times
+        # in 350 ms then fails three identical times. Measured on the Lyra
+        # agent after the ingest fix: nine deliveries recorded and none
+        # finalised, every one of them stuck at ``received``.
+        #
+        # A dedicated connection opened with ``BEGIN IMMEDIATE`` asks for the
+        # write lock up front, which is the case where the busy handler DOES
+        # run — so the retry ladder now sits on top of a write that actually
+        # waits its turn, instead of on top of one that cannot succeed.
         async def _do() -> None:
-            conn = await self._ensure_connected()
-            await conn.execute(
-                f"UPDATE event_deliveries SET {set_clause} WHERE id = ?", params,
+            conn = await aiosqlite.connect(
+                self.db_path, timeout=sqlite_busy_timeout_s(),
             )
-            await conn.commit()
+            try:
+                await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+                await conn.execute("PRAGMA foreign_keys = ON")
+                await conn.execute("BEGIN IMMEDIATE")
+                await conn.execute(
+                    f"UPDATE event_deliveries SET {set_clause} WHERE id = ?", params,
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
 
         await self._write_with_retry(_do)
 
