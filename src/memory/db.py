@@ -3380,9 +3380,38 @@ class MemoryDB:
         ``worker_id``, ``worker_pid``) so the Scheduler's dispatch runner
         heartbeats it while the turn runs and ``reap_expired_event_leases``
         recovers it if the turn freezes."""
-        conn = await self._ensure_connected()
         now = time.time()
         claim_expires = now + _lease_ttl_seconds()
+        # Its own connection, opened with BEGIN IMMEDIATE — the fourth place
+        # this shape was needed, after ``claim_scheduled_task``,
+        # ``add_event_delivery`` and ``update_event_delivery``.
+        #
+        # A claim is a SELECT followed by an UPDATE, which is exactly the read
+        # -then-promote pattern SQLite refuses INSTANTLY when the connection's
+        # snapshot is no longer current — no busy handler, no timeout. Measured
+        # on the Lyra agent with ingest and finalisation already repaired:
+        # ``scheduler.event_claim_failed`` 49 times in ten minutes, and every
+        # re-enqueued orphan sat unclaimed for ten minutes and more. The
+        # conversation had been captured and was never answered.
+        #
+        # Taking the write lock up front also makes the claim genuinely atomic:
+        # the SELECT and the UPDATE are now one transaction rather than two
+        # statements with a race between them.
+        conn = await aiosqlite.connect(
+            self.db_path, timeout=sqlite_busy_timeout_s(),
+        )
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await conn.execute("BEGIN IMMEDIATE")
+            return await self._claim_deliveries_in(conn, limit, now, claim_expires)
+        finally:
+            await conn.close()
+
+    async def _claim_deliveries_in(
+        self, conn, limit: int, now: float, claim_expires: float,
+    ) -> list[dict]:
         cursor = await conn.execute(
             # ``finished_at IS NULL`` is load-bearing, not tidiness. The claim
             # orders by ``started_at ASC`` and does NOT look at status, so a row

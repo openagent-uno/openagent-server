@@ -208,3 +208,55 @@ async def t_finaliser_survives_a_stale_snapshot(ctx: TestContext) -> None:
         )
     finally:
         await db.close()
+
+
+@test("event_delivery_write_lock",
+      "an unclaimed delivery is claimed even from a stale snapshot")
+async def t_claim_survives_a_stale_snapshot(ctx: TestContext) -> None:
+    """The last link, and the one that decides whether anybody answers.
+
+    A claim is a SELECT followed by an UPDATE — the read-then-promote shape
+    SQLite refuses instantly on a snapshot the database has moved past. With
+    ingest and finalisation already repaired, the Lyra agent logged
+    ``scheduler.event_claim_failed`` 49 times in ten minutes and every
+    re-enqueued orphan sat unclaimed: the conversation was captured and never
+    answered, which from the outside is indistinguishable from losing it.
+    """
+    path = ctx.db_path.with_name(f"evclaim-{uuid.uuid4().hex[:8]}.db")
+    db = await _make_db(path)
+    try:
+        eid = await _an_event(db)
+        # `claimed=False` is the out-of-process shape the drain must pick up —
+        # and the shape the orphan reaper restores a row to.
+        did = await db.add_event_delivery(event_id=eid, payload={}, claimed=False)
+
+        shared = await db._ensure_connected()
+        await shared.execute("BEGIN")
+        await shared.execute("SELECT count(*) FROM event_deliveries")
+
+        other = await aiosqlite.connect(str(path))
+        try:
+            await other.execute("PRAGMA busy_timeout = 5000")
+            await other.execute(
+                "UPDATE events SET last_triggered_at = ? WHERE id = ?",
+                (time.time(), eid),
+            )
+            await other.commit()
+        finally:
+            await other.close()
+
+        try:
+            claimed = await db.claim_pending_event_deliveries(limit=10)
+        finally:
+            try:
+                await shared.execute("ROLLBACK")
+            except Exception:
+                pass
+
+        assert [c["id"] for c in claimed] == [did], (
+            f"the delivery was not claimed: {claimed!r}"
+        )
+        row = await db.get_event_delivery(did)
+        assert row["claimed_at"] is not None, "the claim did not stick"
+    finally:
+        await db.close()
