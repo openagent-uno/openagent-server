@@ -35,7 +35,14 @@ class BudgetTracker:
                 session_id=session_id,
             )
         except Exception as e:
-            logger.warning("Failed to record usage: %s", e)
+            # Deliberately swallowed: accounting must never take down a run.
+            # But the row IS lost, and the token alerts read the resulting hole
+            # as calm — so say "lost" and name the model/session, otherwise the
+            # only evidence is a gap in a table nobody is watching in real time.
+            logger.warning(
+                "usage row LOST (accounting hole, run continues) model=%s session=%s: %s",
+                model, session_id, e,
+            )
 
     async def get_current_month_spend(self) -> float:
         return await self._db.get_monthly_usage()

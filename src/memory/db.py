@@ -4771,18 +4771,33 @@ class MemoryDB:
         cost: float,
         session_id: str | None = None,
     ) -> str:
-        conn = await self._ensure_connected()
+        """Wrapped in the same bounded lock-surviving retry as the delivery
+        writes, because losing this row is silent by construction.
+
+        ``BudgetTracker.record`` swallows whatever this raises — accounting must
+        never take down a run — so a write that lost the WAL writer race just
+        vanished, and the only trace was one ``Failed to record usage: database
+        is locked`` warning nobody counts. On 3-set-2026 that emptied
+        ``usage_log`` on esound and lyra for hours while deliveries kept
+        landing at 30/h: the token alerts read an accounting hole as calm.
+        The row is built ONCE outside the retry so a second attempt writes the
+        same row rather than a duplicate under a new id."""
         row_id = str(uuid.uuid4())
         now = time.time()
         from datetime import datetime, timezone
         ym = datetime.now(timezone.utc).strftime("%Y-%m")
-        await conn.execute(
-            "INSERT INTO usage_log (id, timestamp, model, input_tokens, output_tokens, cost, session_id, year_month) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (row_id, now, model, input_tokens, output_tokens, cost, session_id, ym),
-        )
-        await conn.commit()
-        return row_id
+
+        async def _do() -> str:
+            conn = await self._ensure_connected()
+            await conn.execute(
+                "INSERT INTO usage_log (id, timestamp, model, input_tokens, output_tokens, cost, session_id, year_month) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (row_id, now, model, input_tokens, output_tokens, cost, session_id, ym),
+            )
+            await conn.commit()
+            return row_id
+
+        return await self._write_with_retry(_do)
 
     async def get_monthly_usage(self, year_month: str | None = None) -> float:
         """Total cost for a given month (default: current month)."""
