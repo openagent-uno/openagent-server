@@ -264,7 +264,7 @@ async def t_claim_survives_a_stale_snapshot(ctx: TestContext) -> None:
 
 @test("event_delivery_write_lock",
       "a delivery write gives up in seconds rather than holding an HTTP request")
-async def t_delivery_write_is_bounded(ctx: TestContext) -> None:
+async def t_isolated_write_is_bounded(ctx: TestContext) -> None:
     """The cost of moving these writes onto their own connection.
 
     A sibling holding an uncommitted transaction on the SHARED connection now
@@ -344,7 +344,7 @@ async def t_lease_reaper_survives_a_stale_snapshot(ctx: TestContext) -> None:
         eid = await _an_event(db)
         did = await db.add_event_delivery(event_id=eid, payload={}, claimed=True)
         # Expire the lease: this is the row a reaper exists to recover.
-        async with db._delivery_write() as w:
+        async with db._isolated_write() as w:
             await w.execute(
                 "UPDATE event_deliveries SET claim_expires = ?, status='running' "
                 " WHERE id = ?",
@@ -378,5 +378,134 @@ async def t_lease_reaper_survives_a_stale_snapshot(ctx: TestContext) -> None:
         row = await db.get_event_delivery(did)
         assert row["status"] == "received", f"still {row['status']!r}"
         assert row["claimed_at"] is None, "the claim was not cleared"
+    finally:
+        await db.close()
+
+
+@test("event_delivery_write_lock",
+      "a usage row survives a stale snapshot, which its retry alone could not")
+async def t_usage_row_survives_a_stale_snapshot(ctx: TestContext) -> None:
+    """Accounting whose loss is silent by construction.
+
+    ``BudgetTracker.record`` swallows whatever this raises — accounting must
+    never take down a run — so a lost write left one warning nobody counts.
+    On 3-set-2026 that emptied ``usage_log`` on two agents for hours while
+    deliveries kept landing, and the token alerts read the hole as calm.
+
+    A bounded retry was added for it, and could not work: on the shared
+    connection the INSERT is a promotion from a snapshot the database has
+    moved past, refused instantly without the busy handler, so three attempts
+    are three identical refusals. The retry now sits on top of a write that
+    can succeed.
+    """
+    path = ctx.db_path.with_name(f"usage-{uuid.uuid4().hex[:8]}.db")
+    db = await _make_db(path)
+    try:
+        shared = await db._ensure_connected()
+        await shared.execute("BEGIN")
+        await shared.execute("SELECT count(*) FROM usage_log")
+
+        other = await aiosqlite.connect(str(path))
+        try:
+            await other.execute("PRAGMA busy_timeout = 5000")
+            await other.execute(
+                "INSERT INTO usage_log (id, timestamp, model, input_tokens, "
+                "output_tokens, cost, session_id, year_month) "
+                "VALUES ('seed', ?, 'm', 1, 1, 0.0, NULL, '2026-09')",
+                (time.time(),),
+            )
+            await other.commit()
+        finally:
+            await other.close()
+
+        try:
+            row_id = await db.record_usage("gpt-x", 100, 50, 0.01, session_id="s1")
+        finally:
+            try:
+                await shared.execute("ROLLBACK")
+            except Exception:
+                pass
+
+        assert row_id, "the usage row was not written"
+        cur = await shared.execute(
+            "SELECT input_tokens, output_tokens FROM usage_log WHERE id = ?", (row_id,)
+        )
+        got = await cur.fetchone()
+        assert got is not None, "the row vanished exactly as it did in production"
+        assert (got[0], got[1]) == (100, 50)
+    finally:
+        await db.close()
+
+
+@test("event_delivery_write_lock",
+      "a task run is finalised from a stale snapshot, not left running forever")
+async def t_task_run_finalises_under_contention(ctx: TestContext) -> None:
+    """Chosen from the logs, not from a hunch.
+
+    Across two agents over six hours: ``task.run_finish_failed`` with
+    ``database is locked``, 30 times on lyra and 22 on esound. A firing that
+    cannot be finalised stays ``running`` forever — which is precisely the
+    state that wedged the Lyra agent, because a run stuck ``running`` holds
+    the database and the reaper that should recover it fails on the same lock.
+
+    The cancellation invariant has to survive the move: a firing flagged
+    ``cancelling`` may only become ``cancelled``, so a natural finalize that
+    races a stop request is still suppressed.
+    """
+    path = ctx.db_path.with_name(f"taskrun-{uuid.uuid4().hex[:8]}.db")
+    db = await _make_db(path)
+    try:
+        tid = await db.add_task(
+            name="t", cron_expression="* * * * *", prompt="hi",
+        )
+        run_id = await db.add_task_run(task_id=tid)
+
+        shared = await db._ensure_connected()
+        await shared.execute("BEGIN")
+        await shared.execute("SELECT count(*) FROM task_runs")
+
+        other = await aiosqlite.connect(str(path))
+        try:
+            await other.execute("PRAGMA busy_timeout = 5000")
+            await other.execute(
+                "UPDATE task_runs SET trigger = trigger WHERE id = ?", (run_id,)
+            )
+            await other.commit()
+        finally:
+            await other.close()
+
+        try:
+            await db.update_task_run(run_id, status="success", finished_at=time.time())
+        finally:
+            try:
+                await shared.execute("ROLLBACK")
+            except Exception:
+                pass
+
+        row = await db.get_task_run(run_id)
+        assert row["status"] == "success", f"left {row['status']!r} — stuck forever"
+
+    finally:
+        await db.close()
+
+
+@test("event_delivery_write_lock",
+      "a stop request still wins over a natural finalize")
+async def t_cancelling_invariant_survives_the_move(ctx: TestContext) -> None:
+    path = ctx.db_path.with_name(f"taskcancel-{uuid.uuid4().hex[:8]}.db")
+    db = await _make_db(path)
+    try:
+        tid = await db.add_task(name="t", cron_expression="* * * * *", prompt="hi")
+        run_id = await db.add_task_run(task_id=tid)
+        await db.update_task_run(run_id, status="cancelling")
+
+        # A firing that finished naturally at the same moment must NOT clear
+        # the stop request.
+        await db.update_task_run(run_id, status="success")
+        assert (await db.get_task_run(run_id))["status"] == "cancelling"
+
+        # …and the cancel handler still lands.
+        await db.update_task_run(run_id, status="cancelled")
+        assert (await db.get_task_run(run_id))["status"] == "cancelled"
     finally:
         await db.close()

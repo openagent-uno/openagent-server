@@ -2504,8 +2504,15 @@ class MemoryDB:
             await conn.close()
 
     @asynccontextmanager
-    async def _delivery_write(self):
-        """A short-lived write connection for the DELIVERY path only.
+    async def _isolated_write(self):
+        """A short-lived write connection for the writes that must not be lost.
+
+        The rule, arrived at by measurement rather than taste: use this where
+        losing the write is SILENT or costs a customer's message. Today that
+        is the delivery ingest, its finalisation, its claim, the reapers that
+        recover it, and the usage row — whose loss is silent by construction,
+        because `BudgetTracker.record` swallows what this raises so accounting
+        can never take down a run.
 
         Deliberately not a general facility. Making it the default for every
         write was tried and reverted: a sibling holding an uncommitted
@@ -2770,16 +2777,15 @@ class MemoryDB:
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
-        conn = await self._ensure_connected()
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
-        where = "WHERE id = ?"
-        if "status" in updates and updates["status"] != "cancelled":
-            where += " AND status != 'cancelling'"
-        await conn.execute(
-            f"UPDATE task_runs SET {set_clause} {where}",
-            list(updates.values()) + [run_id],
-        )
-        await conn.commit()
+        async with self._isolated_write() as conn:
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            where = "WHERE id = ?"
+            if "status" in updates and updates["status"] != "cancelled":
+                where += " AND status != 'cancelling'"
+            await conn.execute(
+                f"UPDATE task_runs SET {set_clause} {where}",
+                list(updates.values()) + [run_id],
+            )
 
     async def get_task_run(self, run_id: str) -> dict | None:
         conn = await self._ensure_connected()
@@ -2933,16 +2939,15 @@ class MemoryDB:
     async def prune_task_runs(self, task_id: str, *, keep_last: int = 50) -> int:
         """Delete all but the most recent ``keep_last`` runs for a task.
         Returns the number of rows removed."""
-        conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "DELETE FROM task_runs WHERE id IN ("
-            "  SELECT id FROM task_runs WHERE task_id = ? "
-            "  ORDER BY started_at DESC LIMIT -1 OFFSET ?"
-            ")",
-            (task_id, int(keep_last)),
-        )
-        await conn.commit()
-        return cursor.rowcount or 0
+        async with self._isolated_write() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM task_runs WHERE id IN ("
+                "  SELECT id FROM task_runs WHERE task_id = ? "
+                "  ORDER BY started_at DESC LIMIT -1 OFFSET ?"
+                ")",
+                (task_id, int(keep_last)),
+            )
+            return cursor.rowcount or 0
 
     async def flag_task_runs_cancelling(self, task_id: str) -> list[str]:
         """Flag every currently-``running`` firing of a task as ``cancelling``
@@ -3606,7 +3611,7 @@ class MemoryDB:
         max_attempts = max(1, int(max_attempts))
 
         async def _do() -> tuple[int, int]:
-            async with self._delivery_write() as conn:
+            async with self._isolated_write() as conn:
                 # 1. Park expired-lease rows over the replay budget FIRST (so the
                 #    re-enqueue below can't bump them past the cap). Clear the lease.
                 parked_cur = await conn.execute(
@@ -3817,7 +3822,7 @@ class MemoryDB:
         Returns the number of rows acted on (re-enqueued + parked), preserving
         the ``int`` contract the ``AgentServer.start()`` caller logs on.
         """
-        async with self._delivery_write() as conn:
+        async with self._isolated_write() as conn:
             now = time.time()
 
             def _flag(name: str, default: bool) -> bool:
@@ -3959,7 +3964,7 @@ class MemoryDB:
         Returns the number of rows acted on (re-enqueued + parked); 0 when it
         finds nothing (and it logs only when it acts).
         """
-        async with self._delivery_write() as conn:
+        async with self._isolated_write() as conn:
             now = time.time()
 
             def _flag(name: str, default: bool) -> bool:
@@ -4420,12 +4425,11 @@ class MemoryDB:
         where = "WHERE id = ?"
         if "status" in updates and updates["status"] != "cancelled":
             where += " AND status != 'cancelling'"
-        conn = await self._ensure_connected()
-        await conn.execute(
-            f"UPDATE workflow_runs SET {set_clause} {where}",
-            list(updates.values()) + [run_id],
-        )
-        await conn.commit()
+        async with self._isolated_write() as conn:
+            await conn.execute(
+                f"UPDATE workflow_runs SET {set_clause} {where}",
+                list(updates.values()) + [run_id],
+            )
 
     async def get_workflow_run(self, run_id: str) -> dict | None:
         conn = await self._ensure_connected()
@@ -4527,16 +4531,15 @@ class MemoryDB:
     ) -> int:
         """Delete all runs older than the most recent ``keep_last`` for a
         given workflow. Returns the number of rows removed."""
-        conn = await self._ensure_connected()
-        cursor = await conn.execute(
-            "DELETE FROM workflow_runs WHERE id IN ("
-            "  SELECT id FROM workflow_runs WHERE workflow_id = ? "
-            "  ORDER BY started_at DESC LIMIT -1 OFFSET ?"
-            ")",
-            (workflow_id, int(keep_last)),
-        )
-        await conn.commit()
-        return cursor.rowcount or 0
+        async with self._isolated_write() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM workflow_runs WHERE id IN ("
+                "  SELECT id FROM workflow_runs WHERE workflow_id = ? "
+                "  ORDER BY started_at DESC LIMIT -1 OFFSET ?"
+                ")",
+                (workflow_id, int(keep_last)),
+            )
+            return cursor.rowcount or 0
 
     async def workflow_run_stats(
         self,
@@ -4842,13 +4845,21 @@ class MemoryDB:
         ym = datetime.now(timezone.utc).strftime("%Y-%m")
 
         async def _do() -> str:
-            conn = await self._ensure_connected()
-            await conn.execute(
-                "INSERT INTO usage_log (id, timestamp, model, input_tokens, output_tokens, cost, session_id, year_month) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (row_id, now, model, input_tokens, output_tokens, cost, session_id, ym),
-            )
-            await conn.commit()
+            # The retry alone could not save this row, and that is worth being
+            # precise about: on the shared connection the INSERT is a
+            # promotion from whatever snapshot that connection holds, and a
+            # snapshot the database has moved past is refused INSTANTLY —
+            # SQLite does not call the busy handler, so three attempts in
+            # 350 ms are three identical refusals. `update_event_delivery` had
+            # exactly this retry and lost every write for the same reason.
+            # The retry stays: on top of a `BEGIN IMMEDIATE` write it now sits
+            # on something that can actually succeed.
+            async with self._isolated_write() as conn:
+                await conn.execute(
+                    "INSERT INTO usage_log (id, timestamp, model, input_tokens, output_tokens, cost, session_id, year_month) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (row_id, now, model, input_tokens, output_tokens, cost, session_id, ym),
+                )
             return row_id
 
         return await self._write_with_retry(_do)
