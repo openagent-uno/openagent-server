@@ -1813,6 +1813,16 @@ class ModelDispatcher(BaseModel):
         for provider in self._team_providers.values():
             wire_model_runtime(provider, mcp_pool=pool)
 
+    @property
+    def fallback_config(self) -> Any:
+        """La catena EFFETTIVA, dopo l'innesto della corsia locale.
+
+        Serve a chi cabla l'Agent: passare la config grezza significa
+        consegnargli una catena senza la corsia, che e' il guasto del
+        3-set-2026 (35 run morti su un rate limit con un ripiego configurato
+        e mai innestato)."""
+        return self._fallback_config
+
     def set_fallback_config(self, fallback_config: Any) -> None:
         self._fallback_config = self._local_fallback.augment_fallback_config(
             fallback_config, providers_config=self._providers_config,

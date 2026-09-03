@@ -787,6 +787,10 @@ _TEST_MODULES: tuple[str, ...] = (
     #     args ("Extra data") via raw_decode, instead of forcing a retry.
     #     Pure-unit (string in, dict out), so it can run anywhere in the order.
     "test_function_args_decode",
+    # La corsia di fallback locale deve finire DAVVERO in on_rate_limit: con
+    # l'ordine di boot reale non ci finiva, e 35 run sono morti su un rate
+    # limit avendo un ripiego configurato e mai innestato. Pure-unit.
+    "test_local_fallback_wiring",
 )
 
 

@@ -1487,6 +1487,18 @@ def _build_agent(config: dict) -> Agent:
                 from src.models.providers.fallback import FallbackConfig
                 fallback_config = FallbackConfig()
 
+    # L'innesto della corsia va fatto QUI, non prima. `set_local_fallback_policy`
+    # sopra gira quando `_fallback_config` e' ancora None e la sua guardia salta
+    # l'innesto; la FallbackConfig() vuota appena creata esiste proprio perche'
+    # la corsia ci venga aggiunta, ma senza questa chiamata nessuno la aggiunge e
+    # all'Agent arriva una catena vuota. Il 3-set-2026 e' costato 35 run morti su
+    # "No available ChatGPT accounts" con haiku in configurazione e ZERO eventi
+    # `router.local_fallback*`: il ripiego c'era e non veniva mai consultato.
+    _set_fb = getattr(model, "set_fallback_config", None)
+    if callable(_set_fb) and fallback_config is not None:
+        _set_fb(fallback_config)
+        fallback_config = getattr(model, "fallback_config", None) or fallback_config
+
     # ── budgets: per-scope spend caps (off by default) ──
     # Hand the yaml ``budgets:`` list to the dispatcher's BudgetGuard, which
     # seeds the rules additively (only-if-absent, so an app edit is never
