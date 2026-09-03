@@ -232,3 +232,46 @@ async def t_scheduler_policy_scope(ctx: TestContext) -> None:
     finally:
         await db.close()
         path.unlink(missing_ok=True)
+
+
+@test("scheduled_task_execution_policy",
+      "un task schedulato ha un budget di tool call suo, non quello dell'evento")
+async def t_lean_task_tool_budget(_ctx: TestContext) -> None:
+    """Le due corsie condividono il profilo lean, non la forma del lavoro.
+
+    La distinzione era gia' stata fatta per ``max_tokens`` e lasciata a meta'
+    sul budget di tool call: dieci chiamate bastano a una risposta di supporto,
+    a un audit no. Il 3-set-2026 `quality-scorer` veniva troncato a ogni giro
+    (35 fallimenti su 50) ed `escalation-audit` non era MAI andato a buon fine,
+    entrambi con "tool-call budget exhausted".
+    """
+    import os as _os
+
+    from src.core.execution_profile import (
+        lean_local_event_scope,
+        lean_local_task_scope,
+    )
+    from src.models.native_provider import _max_tool_calls_per_run
+
+    for key in ("OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS",
+                "OPENAGENT_LEAN_TASK_MAX_TOOL_CALLS"):
+        _os.environ.pop(key, None)
+    try:
+        # evento: la corsia stretta resta stretta
+        with lean_local_event_scope(True), lean_local_task_scope(False):
+            assert _max_tool_calls_per_run() == 10
+
+        # task schedulato: stesso profilo lean, budget proprio
+        with lean_local_event_scope(True), lean_local_task_scope(True):
+            assert _max_tool_calls_per_run() == 40
+
+        # e resta regolabile dall'operatore, senza toccare l'altra corsia
+        _os.environ["OPENAGENT_LEAN_TASK_MAX_TOOL_CALLS"] = "25"
+        with lean_local_event_scope(True), lean_local_task_scope(True):
+            assert _max_tool_calls_per_run() == 25
+        with lean_local_event_scope(True), lean_local_task_scope(False):
+            assert _max_tool_calls_per_run() == 10
+    finally:
+        for key in ("OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS",
+                    "OPENAGENT_LEAN_TASK_MAX_TOOL_CALLS"):
+            _os.environ.pop(key, None)

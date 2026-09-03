@@ -102,15 +102,32 @@ def _max_tool_calls_per_run() -> Optional[int]:
     policy_limit = current_max_tool_calls()
     if policy_limit is not None:
         return policy_limit
-    from src.core.execution_profile import lean_local_event_active
+    from src.core.execution_profile import (
+        lean_local_event_active,
+        lean_local_task_active,
+    )
 
     if lean_local_event_active():
-        raw = os.environ.get("OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS", "10").strip()
+        # Le due corsie condividono il profilo lean ma non la forma del lavoro,
+        # e qui la distinzione mancava: era gia' stata fatta per max_tokens
+        # (4000 per un task contro 2500 per un evento) e lasciata a meta' sul
+        # budget di tool call, dove entrambe prendevano il 10 dell'evento.
+        # Dieci chiamate bastano a una risposta di supporto; a un audit no.
+        # Misurato il 3-set-2026: `quality-scorer` troncato a ogni singolo giro
+        # per giorni (fallito 35 volte su 50) ed `escalation-audit` mai andato
+        # a buon fine, entrambi con "tool-call budget exhausted" — e nessuno dei
+        # due era un problema di modello.
+        is_task = lean_local_task_active()
+        env_key, default = (
+            ("OPENAGENT_LEAN_TASK_MAX_TOOL_CALLS", 40) if is_task
+            else ("OPENAGENT_LEAN_EVENT_MAX_TOOL_CALLS", 10)
+        )
+        raw = os.environ.get(env_key, str(default)).strip()
         try:
             value = int(raw)
         except ValueError:
-            value = 10
-        return value if value > 0 else 10
+            value = default
+        return value if value > 0 else default
     raw = os.environ.get("OPENAGENT_MAX_TOOL_CALLS_PER_RUN", "").strip()
     if not raw:
         return _DEFAULT_MAX_TOOL_CALLS_PER_RUN
