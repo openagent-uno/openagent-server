@@ -260,3 +260,63 @@ async def t_claim_survives_a_stale_snapshot(ctx: TestContext) -> None:
         assert row["claimed_at"] is not None, "the claim did not stick"
     finally:
         await db.close()
+
+
+@test("event_delivery_write_lock",
+      "a delivery write gives up in seconds rather than holding an HTTP request")
+async def t_delivery_write_is_bounded(ctx: TestContext) -> None:
+    """The cost of moving these writes onto their own connection.
+
+    A sibling holding an uncommitted transaction on the SHARED connection now
+    BLOCKS them instead of being joined by them — and the global
+    ``busy_timeout`` on the agents is three minutes. On a write that sits on
+    an HTTP request that is not a fix, it is a different outage: Replio drops
+    a delivery it has waited ten seconds for, which showed up on the receiver
+    as ``ConnectionResetError`` while reading the body.
+
+    So the wait is bounded well under that. Several modules outside
+    ``memory/db.py`` take the shared connection, so this state is not rare and
+    not something this class can rule out.
+    """
+    import os as _os
+
+    path = ctx.db_path.with_name(f"evbound-{uuid.uuid4().hex[:8]}.db")
+    db = await _make_db(path)
+    _os.environ["OPENAGENT_SQLITE_BUSY_TIMEOUT_MS"] = "180000"   # come in produzione
+    _os.environ["OPENAGENT_DELIVERY_LOCK_WAIT_MS"] = "1000"
+    try:
+        eid = await _an_event(db)
+
+        blocker = await aiosqlite.connect(str(path))
+        await blocker.execute("BEGIN IMMEDIATE")
+        await blocker.execute(
+            "UPDATE events SET last_triggered_at = ? WHERE id = ?", (time.time(), eid)
+        )
+        try:
+            started = time.monotonic()
+            try:
+                await asyncio.wait_for(
+                    db.add_event_delivery(event_id=eid, payload={}), timeout=20
+                )
+            except asyncio.TimeoutError:
+                raise AssertionError(
+                    "the write is still waiting on the global three-minute timeout"
+                )
+            except Exception:
+                pass  # refused is fine; hanging is not
+            waited = time.monotonic() - started
+            assert waited < 5, f"waited {waited:.1f}s for a lock it should abandon"
+
+            # A claim in the same state must take nothing rather than hold the
+            # scheduler: the next tick is seconds away.
+            claimed = await asyncio.wait_for(
+                db.claim_pending_event_deliveries(limit=5), timeout=20
+            )
+            assert claimed == []
+        finally:
+            await blocker.rollback()
+            await blocker.close()
+    finally:
+        _os.environ.pop("OPENAGENT_DELIVERY_LOCK_WAIT_MS", None)
+        _os.environ.pop("OPENAGENT_SQLITE_BUSY_TIMEOUT_MS", None)
+        await db.close()

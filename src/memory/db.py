@@ -72,6 +72,28 @@ def sqlite_busy_timeout_ms() -> int:
     return value if value > 0 else _DEFAULT_SQLITE_BUSY_TIMEOUT_MS
 
 
+# How long a delivery write may wait for the write lock before giving up.
+#
+# NOT the global ``busy_timeout``, which is three minutes on the agents: these
+# three writes sit on an HTTP request or a scheduler tick, and waiting three
+# minutes there is worse than the failure it avoids. Replio drops a delivery
+# it has been waiting on for ten seconds — which showed up on the receiver as
+# ``ConnectionResetError`` while reading the body — so the ceiling has to be
+# under that.
+#
+# Why a wait is needed at all: these run on a connection of their own, and a
+# sibling holding an uncommitted transaction on the SHARED connection blocks
+# them. Several modules outside this file take that connection, so it is not
+# a rare state and it is not one this class can rule out.
+def delivery_lock_wait_ms() -> int:
+    raw = os.environ.get("OPENAGENT_DELIVERY_LOCK_WAIT_MS", "").strip()
+    try:
+        value = int(raw) if raw else 8000
+    except ValueError:
+        value = 8000
+    return max(250, min(value, 60_000))
+
+
 def sqlite_busy_timeout_s() -> float:
     """The same budget in seconds, for ``sqlite3.connect(timeout=...)`` — which
     covers the window BEFORE the first PRAGMA can run on a new connection."""
@@ -3265,10 +3287,10 @@ class MemoryDB:
         # also means a long statement elsewhere cannot make an inbound webhook
         # queue behind it.
         conn = await aiosqlite.connect(
-            self.db_path, timeout=sqlite_busy_timeout_s(),
+            self.db_path, timeout=delivery_lock_wait_ms() / 1000.0,
         )
         try:
-            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            await conn.execute(f"PRAGMA busy_timeout = {delivery_lock_wait_ms()}")
             await conn.execute("PRAGMA foreign_keys = ON")
             await conn.execute("BEGIN IMMEDIATE")
             await conn.execute(
@@ -3321,10 +3343,10 @@ class MemoryDB:
         # waits its turn, instead of on top of one that cannot succeed.
         async def _do() -> None:
             conn = await aiosqlite.connect(
-                self.db_path, timeout=sqlite_busy_timeout_s(),
+                self.db_path, timeout=delivery_lock_wait_ms() / 1000.0,
             )
             try:
-                await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+                await conn.execute(f"PRAGMA busy_timeout = {delivery_lock_wait_ms()}")
                 await conn.execute("PRAGMA foreign_keys = ON")
                 await conn.execute("BEGIN IMMEDIATE")
                 await conn.execute(
@@ -3398,14 +3420,24 @@ class MemoryDB:
         # the SELECT and the UPDATE are now one transaction rather than two
         # statements with a race between them.
         conn = await aiosqlite.connect(
-            self.db_path, timeout=sqlite_busy_timeout_s(),
+            self.db_path, timeout=delivery_lock_wait_ms() / 1000.0,
         )
         conn.row_factory = aiosqlite.Row
         try:
-            await conn.execute(f"PRAGMA busy_timeout = {sqlite_busy_timeout_ms()}")
+            await conn.execute(f"PRAGMA busy_timeout = {delivery_lock_wait_ms()}")
             await conn.execute("PRAGMA foreign_keys = ON")
             await conn.execute("BEGIN IMMEDIATE")
             return await self._claim_deliveries_in(conn, limit, now, claim_expires)
+        except sqlite3.OperationalError as e:
+            # The lock did not come free in time. This is a drain tick: taking
+            # nothing this time round and trying again in a few seconds is the
+            # correct outcome, and far better than holding the scheduler while
+            # somebody else's transaction finishes. Raising here would put a
+            # traceback in the log for a situation that resolves itself.
+            if "locked" not in str(e).lower():
+                raise
+            logger.info("event claim skipped: write lock busy")
+            return []
         finally:
             await conn.close()
 
