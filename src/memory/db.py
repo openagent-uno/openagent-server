@@ -11,6 +11,7 @@ import sqlite3
 import time
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiosqlite
@@ -2502,6 +2503,51 @@ class MemoryDB:
         finally:
             await conn.close()
 
+    @asynccontextmanager
+    async def _delivery_write(self):
+        """A short-lived write connection for the DELIVERY path only.
+
+        Deliberately not a general facility. Making it the default for every
+        write was tried and reverted: a sibling holding an uncommitted
+        transaction on the shared connection BLOCKS a dedicated one instead of
+        being joined by it, two long-standing tests encode that, and eight
+        modules outside this file take the shared connection by design. The
+        exchange is only worth making where losing a write loses a customer's
+        message — the delivery ingest, its finalisation, its claim, and the
+        reapers that recover it.
+
+        ``BEGIN IMMEDIATE`` asks for the write lock up front, which is the one
+        case where SQLite's busy handler actually runs. On the shared
+        connection a write is a PROMOTION from whatever snapshot that
+        connection holds, and a snapshot the database has moved past cannot be
+        promoted — refused instantly, no busy handler, no timeout, and
+        retrying cannot help because the snapshot stays stale.
+
+        The wait is short on purpose: see ``delivery_lock_wait_ms``.
+        """
+        conn = await aiosqlite.connect(
+            self.db_path, timeout=delivery_lock_wait_ms() / 1000.0,
+        )
+        conn.row_factory = aiosqlite.Row
+        try:
+            await conn.execute(f"PRAGMA busy_timeout = {delivery_lock_wait_ms()}")
+            await conn.execute("PRAGMA foreign_keys = ON")
+            await conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            await conn.commit()
+        except BaseException:
+            try:
+                await conn.rollback()
+            except Exception:  # noqa: BLE001 — already unwinding
+                pass
+            raise
+        finally:
+            await conn.close()
+
+    @staticmethod
+    def _is_lock_error(e: BaseException) -> bool:
+        return isinstance(e, sqlite3.OperationalError) and "locked" in str(e).lower()
+
     async def _write_with_retry(self, do_write, *, attempts: int = 3):
         """Run an idempotent single-row write, retrying on "database is locked".
 
@@ -3549,7 +3595,6 @@ class MemoryDB:
         kill-switch (off → no-op, returns 0), the redeploy-free escape hatch.
 
         Returns the number of rows acted on (re-enqueued + parked)."""
-        conn = await self._ensure_connected()
         now = time.time()
 
         if enabled is None:
@@ -3561,42 +3606,54 @@ class MemoryDB:
         max_attempts = max(1, int(max_attempts))
 
         async def _do() -> tuple[int, int]:
-            # 1. Park expired-lease rows over the replay budget FIRST (so the
-            #    re-enqueue below can't bump them past the cap). Clear the lease.
-            parked_cur = await conn.execute(
-                "UPDATE event_deliveries "
-                "SET status='failed', finished_at=?, "
-                "    claim_expires=NULL, worker_id=NULL, worker_pid=NULL, "
-                "    error=COALESCE(error,'') || "
-                "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
-                "          'lease-reap: retry budget exhausted (' || reenqueue_count || ' attempts)' "
-                "WHERE claim_expires IS NOT NULL AND claim_expires < ? "
-                "  AND reenqueue_count >= ? "
-                "  AND status IN ('received','running')",
-                (now, now, max_attempts),
-            )
-            parked = parked_cur.rowcount or 0
+            async with self._delivery_write() as conn:
+                # 1. Park expired-lease rows over the replay budget FIRST (so the
+                #    re-enqueue below can't bump them past the cap). Clear the lease.
+                parked_cur = await conn.execute(
+                    "UPDATE event_deliveries "
+                    "SET status='failed', finished_at=?, "
+                    "    claim_expires=NULL, worker_id=NULL, worker_pid=NULL, "
+                    "    error=COALESCE(error,'') || "
+                    "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+                    "          'lease-reap: retry budget exhausted (' || reenqueue_count || ' attempts)' "
+                    "WHERE claim_expires IS NOT NULL AND claim_expires < ? "
+                    "  AND reenqueue_count >= ? "
+                    "  AND status IN ('received','running')",
+                    (now, now, max_attempts),
+                )
+                parked = parked_cur.rowcount or 0
 
-            # 2. Re-enqueue every expired-lease orphan under the budget: reset to
-            #    ``received``, drop the claim + lease, clear finished_at, bump the
-            #    replay counter (distinct ``lease-reap`` marker).
-            requeue_cur = await conn.execute(
-                "UPDATE event_deliveries "
-                "SET status='received', claimed_at=NULL, finished_at=NULL, "
-                "    claim_expires=NULL, worker_id=NULL, worker_pid=NULL, "
-                "    reenqueue_count = reenqueue_count + 1, "
-                "    error='re-enqueued: lease-reap recovered orphan (attempt ' "
-                "          || (reenqueue_count + 1) || ')' "
-                "WHERE claim_expires IS NOT NULL AND claim_expires < ? "
-                "  AND reenqueue_count < ? "
-                "  AND status IN ('received','running')",
-                (now, max_attempts),
-            )
-            requeued = requeue_cur.rowcount or 0
-            await conn.commit()
-            return requeued, parked
+                # 2. Re-enqueue every expired-lease orphan under the budget: reset to
+                #    ``received``, drop the claim + lease, clear finished_at, bump the
+                #    replay counter (distinct ``lease-reap`` marker).
+                requeue_cur = await conn.execute(
+                    "UPDATE event_deliveries "
+                    "SET status='received', claimed_at=NULL, finished_at=NULL, "
+                    "    claim_expires=NULL, worker_id=NULL, worker_pid=NULL, "
+                    "    reenqueue_count = reenqueue_count + 1, "
+                    "    error='re-enqueued: lease-reap recovered orphan (attempt ' "
+                    "          || (reenqueue_count + 1) || ')' "
+                    "WHERE claim_expires IS NOT NULL AND claim_expires < ? "
+                    "  AND reenqueue_count < ? "
+                    "  AND status IN ('received','running')",
+                    (now, max_attempts),
+                )
+                requeued = requeue_cur.rowcount or 0
+                return requeued, parked
 
-        requeued, parked = await self._write_with_retry(_do)
+        try:
+            requeued, parked = await self._write_with_retry(_do)
+        except Exception as e:  # noqa: BLE001
+            # The write lock did not come free in time. This runs on a
+            # two-second loop, so the next attempt is seconds away and taking
+            # nothing this time round is the right outcome. Raising is what put
+            # `scheduler.lease_reap_loop_error` in the log 1144 times in an
+            # hour while recovering nothing extra — an error nobody could act
+            # on, drowning the ones they could.
+            if not self._is_lock_error(e):
+                raise
+            logger.info("lease reap skipped: write lock busy")
+            return 0
         if requeued or parked:
             from src.core.logging import elog
             elog(
@@ -3760,102 +3817,100 @@ class MemoryDB:
         Returns the number of rows acted on (re-enqueued + parked), preserving
         the ``int`` contract the ``AgentServer.start()`` caller logs on.
         """
-        conn = await self._ensure_connected()
-        now = time.time()
+        async with self._delivery_write() as conn:
+            now = time.time()
 
-        def _flag(name: str, default: bool) -> bool:
-            raw = os.environ.get(name)
-            if raw is None:
-                return default
-            return raw.strip().lower() not in ("0", "false", "no", "off", "")
+            def _flag(name: str, default: bool) -> bool:
+                raw = os.environ.get(name)
+                if raw is None:
+                    return default
+                return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
-        if enabled is None:
-            enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
-        if recover_failed is None:
-            recover_failed = _flag("OPENAGENT_EVENT_REENQUEUE_BACKFILL", True)
-        # Separato da BACKFILL apposta: sui tre agent in produzione BACKFILL e'
-        # a 0 (non si resuscita la storia vecchia), ma un turno morto adesso per
-        # mancanza di capacita' va ritentato lo stesso.
-        recover_transient = _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True)
-        if max_attempts is None:
-            try:
-                max_attempts = int(
-                    os.environ.get("OPENAGENT_EVENT_REENQUEUE_MAX_ATTEMPTS", "5")
+            if enabled is None:
+                enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
+            if recover_failed is None:
+                recover_failed = _flag("OPENAGENT_EVENT_REENQUEUE_BACKFILL", True)
+            # Separato da BACKFILL apposta: sui tre agent in produzione BACKFILL e'
+            # a 0 (non si resuscita la storia vecchia), ma un turno morto adesso per
+            # mancanza di capacita' va ritentato lo stesso.
+            recover_transient = _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True)
+            if max_attempts is None:
+                try:
+                    max_attempts = int(
+                        os.environ.get("OPENAGENT_EVENT_REENQUEUE_MAX_ATTEMPTS", "5")
+                    )
+                except (TypeError, ValueError):
+                    max_attempts = 5
+            max_attempts = max(1, int(max_attempts))
+
+            if not enabled:
+                # Kill-switch: the legacy at-most-once behaviour (mark orphans
+                # failed, never re-fire) — a redeploy-free escape hatch.
+                cursor = await conn.execute(
+                    "UPDATE event_deliveries "
+                    "SET status='failed', finished_at=?, "
+                    "    error=COALESCE(error,'') || "
+                    "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+                    "          ? "
+                    "WHERE status IN ('received','running') AND claimed_at IS NOT NULL",
+                    (now, self._REAP_ORPHAN_MARK),
                 )
-            except (TypeError, ValueError):
-                max_attempts = 5
-        max_attempts = max(1, int(max_attempts))
+                n = cursor.rowcount or 0
+                if n:
+                    from src.core.logging import elog
+                    elog("event.orphan_reaped", mode="legacy-failed", count=n)
+                return n
 
-        if not enabled:
-            # Kill-switch: the legacy at-most-once behaviour (mark orphans
-            # failed, never re-fire) — a redeploy-free escape hatch.
-            cursor = await conn.execute(
+            # 1. Park orphans that have exhausted the replay budget FIRST, so a row
+            #    at the cap is retired here and not re-enqueued below (order
+            #    matters: re-enqueue increments the counter). Only in-flight rows
+            #    are parked — a historical ``failed`` row at/over the cap is already
+            #    terminal and left alone.
+            parked_cur = await conn.execute(
                 "UPDATE event_deliveries "
                 "SET status='failed', finished_at=?, "
                 "    error=COALESCE(error,'') || "
                 "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
-                "          ? "
-                "WHERE status IN ('received','running') AND claimed_at IS NOT NULL",
-                (now, self._REAP_ORPHAN_MARK),
+                "          'reaped: retry budget exhausted (' || reenqueue_count || ' attempts)' "
+                "WHERE claimed_at IS NOT NULL AND reenqueue_count >= ? "
+                "  AND status IN ('received','running')",
+                (now, max_attempts),
             )
-            await conn.commit()
-            n = cursor.rowcount or 0
-            if n:
+            parked = parked_cur.rowcount or 0
+
+            # 2. Re-enqueue every recoverable orphan under the budget: reset to
+            #    ``received`` + drop the claim so the scheduler drain re-dispatches
+            #    it; clear ``finished_at``; bump the replay counter.
+            where = (
+                "claimed_at IS NOT NULL AND reenqueue_count < ? "
+                "AND (status IN ('received','running')"
+            )
+            params: list[Any] = [max_attempts]
+            if recover_failed:
+                where += " OR (status='failed' AND error LIKE ?)"
+                params.append(f"%{self._REAP_ORPHAN_MARK}%")
+            if recover_transient:
+                where += " OR (status='failed' AND error LIKE ?)"
+                params.append(f"%{self._RETRYABLE_TURN_MARK}%")
+            where += ")"
+            requeue_cur = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET status='received', claimed_at=NULL, finished_at=NULL, "
+                "    reenqueue_count = reenqueue_count + 1, "
+                "    error='re-enqueued: recovered orphan (attempt ' "
+                "          || (reenqueue_count + 1) || ')' "
+                "WHERE " + where,
+                params,
+            )
+            requeued = requeue_cur.rowcount or 0
+
+            if requeued or parked:
                 from src.core.logging import elog
-                elog("event.orphan_reaped", mode="legacy-failed", count=n)
-            return n
-
-        # 1. Park orphans that have exhausted the replay budget FIRST, so a row
-        #    at the cap is retired here and not re-enqueued below (order
-        #    matters: re-enqueue increments the counter). Only in-flight rows
-        #    are parked — a historical ``failed`` row at/over the cap is already
-        #    terminal and left alone.
-        parked_cur = await conn.execute(
-            "UPDATE event_deliveries "
-            "SET status='failed', finished_at=?, "
-            "    error=COALESCE(error,'') || "
-            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
-            "          'reaped: retry budget exhausted (' || reenqueue_count || ' attempts)' "
-            "WHERE claimed_at IS NOT NULL AND reenqueue_count >= ? "
-            "  AND status IN ('received','running')",
-            (now, max_attempts),
-        )
-        parked = parked_cur.rowcount or 0
-
-        # 2. Re-enqueue every recoverable orphan under the budget: reset to
-        #    ``received`` + drop the claim so the scheduler drain re-dispatches
-        #    it; clear ``finished_at``; bump the replay counter.
-        where = (
-            "claimed_at IS NOT NULL AND reenqueue_count < ? "
-            "AND (status IN ('received','running')"
-        )
-        params: list[Any] = [max_attempts]
-        if recover_failed:
-            where += " OR (status='failed' AND error LIKE ?)"
-            params.append(f"%{self._REAP_ORPHAN_MARK}%")
-        if recover_transient:
-            where += " OR (status='failed' AND error LIKE ?)"
-            params.append(f"%{self._RETRYABLE_TURN_MARK}%")
-        where += ")"
-        requeue_cur = await conn.execute(
-            "UPDATE event_deliveries "
-            "SET status='received', claimed_at=NULL, finished_at=NULL, "
-            "    reenqueue_count = reenqueue_count + 1, "
-            "    error='re-enqueued: recovered orphan (attempt ' "
-            "          || (reenqueue_count + 1) || ')' "
-            "WHERE " + where,
-            params,
-        )
-        requeued = requeue_cur.rowcount or 0
-
-        await conn.commit()
-        if requeued or parked:
-            from src.core.logging import elog
-            elog(
-                "event.orphan_reaped", mode="re-enqueue",
-                requeued=requeued, parked=parked, max_attempts=max_attempts,
-            )
-        return requeued + parked
+                elog(
+                    "event.orphan_reaped", mode="re-enqueue",
+                    requeued=requeued, parked=parked, max_attempts=max_attempts,
+                )
+            return requeued + parked
 
     async def reap_stale_event_deliveries(
         self,
@@ -3904,113 +3959,112 @@ class MemoryDB:
         Returns the number of rows acted on (re-enqueued + parked); 0 when it
         finds nothing (and it logs only when it acts).
         """
-        conn = await self._ensure_connected()
-        now = time.time()
+        async with self._delivery_write() as conn:
+            now = time.time()
 
-        def _flag(name: str, default: bool) -> bool:
-            raw = os.environ.get(name)
-            if raw is None:
-                return default
-            return raw.strip().lower() not in ("0", "false", "no", "off", "")
+            def _flag(name: str, default: bool) -> bool:
+                raw = os.environ.get(name)
+                if raw is None:
+                    return default
+                return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
-        if enabled is None:
-            enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
-        if not enabled:
-            # Kill-switch: unlike the startup reap this does NOT fall back to
-            # mark-failed. A periodic sweep on a live process has no proof a
-            # claimed row is orphaned (that's the whole point of the age gate),
-            # so with re-enqueue disabled the safe action is to do nothing and
-            # let the next restart's reap handle it.
-            return 0
+            if enabled is None:
+                enabled = _flag("OPENAGENT_EVENT_REENQUEUE_ENABLED", True)
+            if not enabled:
+                # Kill-switch: unlike the startup reap this does NOT fall back to
+                # mark-failed. A periodic sweep on a live process has no proof a
+                # claimed row is orphaned (that's the whole point of the age gate),
+                # so with re-enqueue disabled the safe action is to do nothing and
+                # let the next restart's reap handle it.
+                return 0
 
-        if max_attempts is None:
-            try:
-                max_attempts = int(
-                    os.environ.get("OPENAGENT_EVENT_REENQUEUE_MAX_ATTEMPTS", "5")
-                )
-            except (TypeError, ValueError):
-                max_attempts = 5
-        max_attempts = max(1, int(max_attempts))
+            if max_attempts is None:
+                try:
+                    max_attempts = int(
+                        os.environ.get("OPENAGENT_EVENT_REENQUEUE_MAX_ATTEMPTS", "5")
+                    )
+                except (TypeError, ValueError):
+                    max_attempts = 5
+            max_attempts = max(1, int(max_attempts))
 
-        # A row is "stale" only if it was claimed at/before this cutoff. Never
-        # negative — a caller passing 0 would sweep everything, so clamp at 0
-        # and let the caller own the safety of the threshold it chooses.
-        min_claim_age_seconds = max(0.0, float(min_claim_age_seconds))
-        cutoff = now - min_claim_age_seconds
+            # A row is "stale" only if it was claimed at/before this cutoff. Never
+            # negative — a caller passing 0 would sweep everything, so clamp at 0
+            # and let the caller own the safety of the threshold it chooses.
+            min_claim_age_seconds = max(0.0, float(min_claim_age_seconds))
+            cutoff = now - min_claim_age_seconds
 
-        # 1. Park stale in-flight rows over the replay budget FIRST (retire them
-        #    here so the re-enqueue below can't bump them past the cap). Only
-        #    stale, in-flight rows — a recently-claimed row at the cap is still
-        #    a live turn and must not be parked; a historical ``failed`` row is
-        #    already terminal and never matched.
-        parked_cur = await conn.execute(
-            "UPDATE event_deliveries "
-            "SET status='failed', finished_at=?, "
-            "    error=COALESCE(error,'') || "
-            "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
-            "          'stale-sweep: retry budget exhausted (' || reenqueue_count || ' attempts)' "
-            "WHERE claimed_at IS NOT NULL AND claimed_at <= ? "
-            "  AND reenqueue_count >= ? "
-            "  AND status IN ('received','running')",
-            (now, cutoff, max_attempts),
-        )
-        parked = parked_cur.rowcount or 0
+            # 1. Park stale in-flight rows over the replay budget FIRST (retire them
+            #    here so the re-enqueue below can't bump them past the cap). Only
+            #    stale, in-flight rows — a recently-claimed row at the cap is still
+            #    a live turn and must not be parked; a historical ``failed`` row is
+            #    already terminal and never matched.
+            parked_cur = await conn.execute(
+                "UPDATE event_deliveries "
+                "SET status='failed', finished_at=?, "
+                "    error=COALESCE(error,'') || "
+                "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
+                "          'stale-sweep: retry budget exhausted (' || reenqueue_count || ' attempts)' "
+                "WHERE claimed_at IS NOT NULL AND claimed_at <= ? "
+                "  AND reenqueue_count >= ? "
+                "  AND status IN ('received','running')",
+                (now, cutoff, max_attempts),
+            )
+            parked = parked_cur.rowcount or 0
 
-        # 2. Re-enqueue every stale in-flight orphan under the budget: same SET
-        #    clause as the startup reap (received, drop claim, clear finished_at,
-        #    bump counter) with a distinct ``stale-sweep`` error marker.
-        requeue_cur = await conn.execute(
-            "UPDATE event_deliveries "
-            "SET status='received', claimed_at=NULL, finished_at=NULL, "
-            "    reenqueue_count = reenqueue_count + 1, "
-            "    error='re-enqueued: stale-sweep recovered orphan (attempt ' "
-            "          || (reenqueue_count + 1) || ')' "
-            "WHERE claimed_at IS NOT NULL AND claimed_at <= ? "
-            "  AND reenqueue_count < ? "
-            "  AND status IN ('received','running')",
-            (cutoff, max_attempts),
-        )
-        requeued = requeue_cur.rowcount or 0
-
-        # 3. E le delivery morte per MANCANZA DI CAPACITA'. Sono terminali
-        #    (``failed``), quindi qui non c'e' nessun turno vivo da duplicare e
-        #    il cancello dell'eta' non serve a quello: serve a non rilanciarle
-        #    dentro lo stesso blackout che le ha uccise, cioe' a dare al pool il
-        #    tempo di tornare. Senza questo passaggio sarebbero ripescate solo
-        #    dal reap di avvio, cioe' al prossimo riavvio: ore, per il messaggio
-        #    di un cliente. Il marcatore lo mette il dispatcher SOLO quando la
-        #    morte e' transitoria (un guasto permanente non finisce mai qui) e il
-        #    tetto dei tentativi resta quello di sempre.
-        try:
-            retry_delay = max(0.0, float(
-                os.environ.get("OPENAGENT_EVENT_RETRY_DELAY_SECONDS", "300")))
-        except (TypeError, ValueError):
-            retry_delay = 300.0
-        retried = 0
-        if _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True):
-            retry_cur = await conn.execute(
+            # 2. Re-enqueue every stale in-flight orphan under the budget: same SET
+            #    clause as the startup reap (received, drop claim, clear finished_at,
+            #    bump counter) with a distinct ``stale-sweep`` error marker.
+            requeue_cur = await conn.execute(
                 "UPDATE event_deliveries "
                 "SET status='received', claimed_at=NULL, finished_at=NULL, "
                 "    reenqueue_count = reenqueue_count + 1, "
-                "    error='re-enqueued: no model capacity (attempt ' "
+                "    error='re-enqueued: stale-sweep recovered orphan (attempt ' "
                 "          || (reenqueue_count + 1) || ')' "
-                "WHERE status='failed' AND error LIKE ? "
+                "WHERE claimed_at IS NOT NULL AND claimed_at <= ? "
                 "  AND reenqueue_count < ? "
-                "  AND finished_at IS NOT NULL AND finished_at <= ?",
-                (f"%{self._RETRYABLE_TURN_MARK}%", max_attempts, now - retry_delay),
+                "  AND status IN ('received','running')",
+                (cutoff, max_attempts),
             )
-            retried = retry_cur.rowcount or 0
+            requeued = requeue_cur.rowcount or 0
 
-        await conn.commit()
-        if requeued or parked or retried:
-            from src.core.logging import elog
-            elog(
-                "event.orphan_reaped", mode="stale-sweep",
-                requeued=requeued, parked=parked, retried=retried,
-                max_attempts=max_attempts,
-                min_claim_age_seconds=min_claim_age_seconds,
-            )
-        return requeued + parked + retried
+            # 3. E le delivery morte per MANCANZA DI CAPACITA'. Sono terminali
+            #    (``failed``), quindi qui non c'e' nessun turno vivo da duplicare e
+            #    il cancello dell'eta' non serve a quello: serve a non rilanciarle
+            #    dentro lo stesso blackout che le ha uccise, cioe' a dare al pool il
+            #    tempo di tornare. Senza questo passaggio sarebbero ripescate solo
+            #    dal reap di avvio, cioe' al prossimo riavvio: ore, per il messaggio
+            #    di un cliente. Il marcatore lo mette il dispatcher SOLO quando la
+            #    morte e' transitoria (un guasto permanente non finisce mai qui) e il
+            #    tetto dei tentativi resta quello di sempre.
+            try:
+                retry_delay = max(0.0, float(
+                    os.environ.get("OPENAGENT_EVENT_RETRY_DELAY_SECONDS", "300")))
+            except (TypeError, ValueError):
+                retry_delay = 300.0
+            retried = 0
+            if _flag("OPENAGENT_EVENT_REENQUEUE_TRANSIENT", True):
+                retry_cur = await conn.execute(
+                    "UPDATE event_deliveries "
+                    "SET status='received', claimed_at=NULL, finished_at=NULL, "
+                    "    reenqueue_count = reenqueue_count + 1, "
+                    "    error='re-enqueued: no model capacity (attempt ' "
+                    "          || (reenqueue_count + 1) || ')' "
+                    "WHERE status='failed' AND error LIKE ? "
+                    "  AND reenqueue_count < ? "
+                    "  AND finished_at IS NOT NULL AND finished_at <= ?",
+                    (f"%{self._RETRYABLE_TURN_MARK}%", max_attempts, now - retry_delay),
+                )
+                retried = retry_cur.rowcount or 0
+
+            if requeued or parked or retried:
+                from src.core.logging import elog
+                elog(
+                    "event.orphan_reaped", mode="stale-sweep",
+                    requeued=requeued, parked=parked, retried=retried,
+                    max_attempts=max_attempts,
+                    min_claim_age_seconds=min_claim_age_seconds,
+                )
+            return requeued + parked + retried
 
     # ── Workflow Tasks ──
 

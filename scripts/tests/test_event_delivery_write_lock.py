@@ -320,3 +320,63 @@ async def t_delivery_write_is_bounded(ctx: TestContext) -> None:
         _os.environ.pop("OPENAGENT_DELIVERY_LOCK_WAIT_MS", None)
         _os.environ.pop("OPENAGENT_SQLITE_BUSY_TIMEOUT_MS", None)
         await db.close()
+
+
+@test("event_delivery_write_lock",
+      "the lease reaper recovers an orphan from a stale snapshot")
+async def t_lease_reaper_survives_a_stale_snapshot(ctx: TestContext) -> None:
+    """The recovery path, which is the last thing standing between a frozen
+    turn and a customer who is never answered.
+
+    `scheduler.lease_reap_loop_error` fired 1144 times in an hour on the Lyra
+    agent. The cause was invisible from `kubectl logs`, because the console
+    renderer drops the structured fields — the reason only appears in
+    `logs/events.jsonl`, where every one of them reads
+    ``"error": "database is locked"``. Same read-then-promote shape as the
+    other four sites, on the shared connection.
+
+    Bursty, and tied to load: a quiet window shows zero. So the proof is here,
+    not in a production measurement taken while nothing was happening.
+    """
+    path = ctx.db_path.with_name(f"evreap-{uuid.uuid4().hex[:8]}.db")
+    db = await _make_db(path)
+    try:
+        eid = await _an_event(db)
+        did = await db.add_event_delivery(event_id=eid, payload={}, claimed=True)
+        # Expire the lease: this is the row a reaper exists to recover.
+        async with db._delivery_write() as w:
+            await w.execute(
+                "UPDATE event_deliveries SET claim_expires = ?, status='running' "
+                " WHERE id = ?",
+                (time.time() - 3600, did),
+            )
+
+        shared = await db._ensure_connected()
+        await shared.execute("BEGIN")
+        await shared.execute("SELECT count(*) FROM event_deliveries")
+
+        other = await aiosqlite.connect(str(path))
+        try:
+            await other.execute("PRAGMA busy_timeout = 5000")
+            await other.execute(
+                "UPDATE events SET last_triggered_at = ? WHERE id = ?",
+                (time.time(), eid),
+            )
+            await other.commit()
+        finally:
+            await other.close()
+
+        try:
+            acted = await db.reap_expired_event_leases()
+        finally:
+            try:
+                await shared.execute("ROLLBACK")
+            except Exception:
+                pass
+
+        assert acted == 1, f"the orphan was not recovered (acted={acted})"
+        row = await db.get_event_delivery(did)
+        assert row["status"] == "received", f"still {row['status']!r}"
+        assert row["claimed_at"] is None, "the claim was not cleared"
+    finally:
+        await db.close()
