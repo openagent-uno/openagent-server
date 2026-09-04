@@ -41,6 +41,7 @@ try:
     from sqlalchemy.dialects import sqlite
     from sqlalchemy.engine import Engine, create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
+    from sqlalchemy.pool import NullPool
     from sqlalchemy.schema import ForeignKey, Index, UniqueConstraint
 except ImportError:
     raise ImportError("`sqlalchemy` not installed. Please install it using `pip install sqlalchemy`")
@@ -103,7 +104,17 @@ def _make_session_store_engine(url: str) -> "Engine":
         timeout = default_timeout
     if timeout <= 0:
         timeout = default_timeout
-    engine = create_engine(url, connect_args={"timeout": timeout})
+    # A runtime Agent/Team is cached per session/system shape. With SQLAlchemy's
+    # default QueuePool that means one persistent pool per cache entry, and a
+    # partially-consumed result can keep its DB-API connection (and WAL reader
+    # snapshot) alive after the turn is over. SQLite connections are local and
+    # cheap; never pool them across runtime calls. Closing a Session now closes
+    # the physical handle and releases every statement/read mark immediately.
+    engine = create_engine(
+        url,
+        connect_args={"timeout": timeout},
+        poolclass=NullPool,
+    )
 
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _rec):  # noqa: ANN001
@@ -305,6 +316,12 @@ class SqliteDb(BaseDb):
         Should be called during application shutdown to properly release
         all database connections.
         """
+        # ``scoped_session.close()`` alone returns its connection to the engine
+        # and leaves the registry entry reusable. ``remove`` closes the current
+        # Session *and* forgets it; with NullPool that physically closes SQLite
+        # and finalizes even a result cursor a cancelled runtime left unread.
+        if self.Session is not None:
+            self.Session.remove()
         if self.db_engine is not None:
             self.db_engine.dispose()
 
@@ -739,7 +756,7 @@ class SqliteDb(BaseDb):
             # Latest version for the given table
             stmt = stmt.where(table.c.table_name == table_name)
             stmt = stmt.order_by(table.c.version.desc()).limit(1)
-            result = sess.execute(stmt).fetchone()
+            result = sess.execute(stmt).first()
             if result is None:
                 return "2.0.0"
             version_dict = dict(result._mapping)
@@ -906,7 +923,7 @@ class SqliteDb(BaseDb):
                         )
                     )
 
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 if result is None:
                     return None
 
@@ -1122,7 +1139,7 @@ class SqliteDb(BaseDb):
                     )
                     stmt = stmt.returning(*table.columns)  # type: ignore
                     result = sess.execute(stmt)
-                    row = result.fetchone()
+                    row = result.first()
 
                     if row is not None:
                         _project_operational_session_in_transaction(
@@ -1168,7 +1185,7 @@ class SqliteDb(BaseDb):
                     )
                     stmt = stmt.returning(*table.columns)  # type: ignore
                     result = sess.execute(stmt)
-                    row = result.fetchone()
+                    row = result.first()
 
                     if row is not None:
                         _project_operational_session_in_transaction(
@@ -1213,7 +1230,7 @@ class SqliteDb(BaseDb):
                     )
                     stmt = stmt.returning(*table.columns)  # type: ignore
                     result = sess.execute(stmt)
-                    row = result.fetchone()
+                    row = result.first()
 
                     if row is not None:
                         _project_operational_session_in_transaction(
@@ -1595,7 +1612,7 @@ class SqliteDb(BaseDb):
                 stmt = select(table).where(table.c.memory_id == memory_id)
                 if user_id is not None:
                     stmt = stmt.where(table.c.user_id == user_id)
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 if result is None:
                     return None
 
@@ -1821,7 +1838,7 @@ class SqliteDb(BaseDb):
                 ).returning(table)
 
                 result = sess.execute(stmt)
-                row = result.fetchone()
+                row = result.first()
 
                 if row is None:
                     return None
@@ -2021,7 +2038,7 @@ class SqliteDb(BaseDb):
         """
         with self.Session() as sess:
             stmt = select(table).order_by(table.c.date.desc()).limit(1)
-            result = sess.execute(stmt).fetchone()
+            result = sess.execute(stmt).first()
 
             # 1. Return the date of the first day without a complete metrics record.
             if result is not None:
@@ -2196,7 +2213,7 @@ class SqliteDb(BaseDb):
         try:
             with self.Session() as sess, sess.begin():
                 stmt = select(table).where(table.c.id == id)
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 if result is None:
                     return None
 
@@ -2419,7 +2436,7 @@ class SqliteDb(BaseDb):
 
             with self.Session() as sess, sess.begin():
                 stmt = select(table).where(table.c.run_id == eval_run_id)
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 if result is None:
                     return None
 
@@ -2757,7 +2774,7 @@ class SqliteDb(BaseDb):
 
                 # Order by most recent and get first result
                 stmt = stmt.order_by(table.c.start_time.desc()).limit(1)
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
 
                 if result:
                     return Trace.from_dict(dict(result._mapping))
@@ -3060,7 +3077,7 @@ class SqliteDb(BaseDb):
 
             with self.Session() as sess:
                 stmt = table.select().where(table.c.span_id == span_id)
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 if result:
                     return Span.from_dict(dict(result._mapping))
                 return None
@@ -3188,7 +3205,7 @@ class SqliteDb(BaseDb):
 
             with self.Session() as sess, sess.begin():
                 stmt = select(table).where(table.c.id == id)
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 if result is None:
                     return None
 
@@ -3332,7 +3349,7 @@ class SqliteDb(BaseDb):
                 ).returning(table)
 
                 result = sess.execute(stmt)
-                row = result.fetchone()
+                row = result.first()
 
                 if row is None:
                     return None
@@ -3375,7 +3392,7 @@ class SqliteDb(BaseDb):
                 if component_type is not None:
                     stmt = stmt.where(table.c.component_type == component_type.value)
 
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 return dict(result._mapping) if result else None
 
         except Exception as e:
@@ -3413,7 +3430,7 @@ class SqliteDb(BaseDb):
                 raise ValueError("Components table not found")
 
             with self.Session() as sess, sess.begin():
-                existing = sess.execute(select(table).where(table.c.component_id == component_id)).fetchone()
+                existing = sess.execute(select(table).where(table.c.component_id == component_id)).first()
 
                 if existing is None:
                     # Create new component
@@ -3788,7 +3805,7 @@ class SqliteDb(BaseDb):
                         .limit(1)
                     )
 
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 return dict(result._mapping) if result else None
 
         except Exception as e:
@@ -3848,7 +3865,7 @@ class SqliteDb(BaseDb):
                         components_table.c.component_id == component_id,
                         components_table.c.deleted_at.is_(None),
                     )
-                ).fetchone()
+                ).first()
 
                 if component is None:
                     raise ValueError(f"Component {component_id} not found")
@@ -3905,7 +3922,7 @@ class SqliteDb(BaseDb):
                             configs_table.c.component_id == component_id,
                             configs_table.c.version == version,
                         )
-                    ).fetchone()
+                    ).first()
 
                     if existing is None:
                         raise ValueError(f"Config {component_id} v{version} not found")
@@ -4011,7 +4028,7 @@ class SqliteDb(BaseDb):
                         configs_table.c.component_id == component_id,
                         configs_table.c.version == version,
                     )
-                ).fetchone()
+                ).first()
 
                 if config_row is None:
                     return False
@@ -4019,7 +4036,7 @@ class SqliteDb(BaseDb):
                 # Check if it's current version
                 current = sess.execute(
                     select(components_table.c.current_version).where(components_table.c.component_id == component_id)
-                ).fetchone()
+                ).first()
 
                 if current and current.current_version == version:
                     raise ValueError(f"Cannot delete current config {component_id} v{version}")
@@ -4076,7 +4093,7 @@ class SqliteDb(BaseDb):
                         components_table.c.component_id == component_id,
                         components_table.c.deleted_at.is_(None),
                     )
-                ).fetchone()
+                ).first()
 
                 if exists is None:
                     return []
@@ -4139,7 +4156,7 @@ class SqliteDb(BaseDb):
                         components_table.c.component_id == component_id,
                         components_table.c.deleted_at.is_(None),
                     )
-                ).fetchone()
+                ).first()
 
                 if component_exists is None:
                     return False
@@ -4150,7 +4167,7 @@ class SqliteDb(BaseDb):
                         configs_table.c.component_id == component_id,
                         configs_table.c.version == version,
                     )
-                ).fetchone()
+                ).first()
 
                 if stage is None:
                     return False
@@ -4405,7 +4422,7 @@ class SqliteDb(BaseDb):
                 if entity_type is not None:
                     stmt = stmt.where(table.c.entity_type == entity_type)
 
-                result = sess.execute(stmt).fetchone()
+                result = sess.execute(stmt).first()
                 if result is None:
                     return None
 
@@ -4585,7 +4602,7 @@ class SqliteDb(BaseDb):
             if table is None:
                 return None
             with self.Session() as sess:
-                result = sess.execute(select(table).where(table.c.id == schedule_id)).fetchone()
+                result = sess.execute(select(table).where(table.c.id == schedule_id)).first()
                 return dict(result._mapping) if result else None
         except Exception as e:
             log_debug(f"Error getting schedule: {e}")
@@ -4597,7 +4614,7 @@ class SqliteDb(BaseDb):
             if table is None:
                 return None
             with self.Session() as sess:
-                result = sess.execute(select(table).where(table.c.name == name)).fetchone()
+                result = sess.execute(select(table).where(table.c.name == name)).first()
                 return dict(result._mapping) if result else None
         except Exception as e:
             log_debug(f"Error getting schedule by name: {e}")
@@ -4696,7 +4713,7 @@ class SqliteDb(BaseDb):
                     .order_by(table.c.next_run_at.asc())
                     .limit(1)
                 )
-                row = sess.execute(stmt).fetchone()
+                row = sess.execute(stmt).first()
                 if row is None:
                     return None
                 schedule = dict(row._mapping)
@@ -4766,7 +4783,7 @@ class SqliteDb(BaseDb):
             if table is None:
                 return None
             with self.Session() as sess:
-                result = sess.execute(select(table).where(table.c.id == run_id)).fetchone()
+                result = sess.execute(select(table).where(table.c.id == run_id)).first()
                 return dict(result._mapping) if result else None
         except Exception as e:
             log_debug(f"Error getting schedule run: {e}")
@@ -4828,7 +4845,7 @@ class SqliteDb(BaseDb):
             if table is None:
                 return None
             with self.Session() as sess:
-                result = sess.execute(select(table).where(table.c.id == approval_id)).fetchone()
+                result = sess.execute(select(table).where(table.c.id == approval_id)).first()
                 return dict(result._mapping) if result else None
         except Exception as e:
             log_debug(f"Error getting approval: {e}")

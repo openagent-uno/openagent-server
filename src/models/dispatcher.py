@@ -833,6 +833,10 @@ class TeamRouterProvider(BaseModel):
         """Clear all per-session caches so the next turn rebuilds from
         the current db / pool / providers_config.
         """
+        from src.models.runtime_db_lifecycle import close_runtime_databases
+
+        for runtime in self._session_runtime.values():
+            close_runtime_databases(runtime)
         self._session_runtime.clear()
         self._session_system_key.clear()
         self._session_media_key.clear()
@@ -964,6 +968,14 @@ class TeamRouterProvider(BaseModel):
             and self._session_media_key.get(session_id, frozenset()) == required_modalities
         ):
             return cached
+        if cached is not None:
+            # A prompt/media-shape change replaces the runtime in-place. Close
+            # its SqliteDb before overwriting the cache slot; relying on GC is
+            # what left old SQLAlchemy pools holding WAL reader snapshots.
+            from src.models.runtime_db_lifecycle import close_runtime_databases
+
+            close_runtime_databases(cached)
+            self._session_runtime.pop(session_id, None)
 
         catalog = self._enabled_llm_models(required_modalities)
         entry_runtime = self._entry_runtime_id or (catalog[0].runtime_id if catalog else None)
@@ -1154,7 +1166,11 @@ class TeamRouterProvider(BaseModel):
         try:
             from src.memory.store.sqlite import SqliteDb
 
-            SqliteDb(db_file=db_path).delete_session(session_id=session_id)
+            runtime_db = SqliteDb(db_file=db_path)
+            try:
+                runtime_db.delete_session(session_id=session_id)
+            finally:
+                runtime_db.close()
         except Exception as e:  # noqa: BLE001
             logger.debug("TeamRouterProvider.forget_session %s: %s", session_id, e)
 
@@ -1165,7 +1181,10 @@ class TeamRouterProvider(BaseModel):
         """
         if not session_id:
             return
-        self._session_runtime.pop(session_id, None)
+        from src.models.runtime_db_lifecycle import close_runtime_databases
+
+        runtime = self._session_runtime.pop(session_id, None)
+        close_runtime_databases(runtime)
         self._session_system_key.pop(session_id, None)
         self._session_media_key.pop(session_id, None)
         self._session_runtime_entry.pop(session_id, None)
@@ -1839,6 +1858,9 @@ class ModelDispatcher(BaseModel):
             )
         for provider in self._team_providers.values():
             provider._local_fallback = self._local_fallback
+            invalidate = getattr(provider, "_invalidate_session_cache", None)
+            if callable(invalidate):
+                invalidate()
         self._team_providers.clear()
 
     def set_session_handle(self, session_id: str, handle: str | None) -> None:

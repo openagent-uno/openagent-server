@@ -61,6 +61,8 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_session_patch_owner",
     "test_tool_search_repeat_miss",
     "test_sqlite_busy_timeout",
+    "test_runtime_db_lifecycle",
+    "test_wal_monitor",
     "test_mcp_db_path",
     "test_session_journal",
     "test_operational_storage",

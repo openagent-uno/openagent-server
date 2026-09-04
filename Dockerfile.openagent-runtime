@@ -10,3 +10,4 @@ COPY --chmod=0755 dist/openagent /opt/openagent/bin/openagent
 # PyInstaller launcher instead of the SQLite-owning child process group.
 COPY deploy/supervisord.conf /etc/supervisord.conf
 COPY src/core/session_retention.py /opt/openagent/session_retention.py
+COPY src/core/wal_monitor.py /opt/openagent/wal_monitor.py

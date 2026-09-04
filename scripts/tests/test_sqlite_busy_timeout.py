@@ -14,6 +14,7 @@ runtime store no longer being the odd one out.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import sqlite3
 import uuid
 
@@ -115,6 +116,9 @@ async def t_session_store_default_on(ctx: TestContext) -> None:
         tmp = ctx.db_path.with_name(f"store-{uuid.uuid4().hex[:8]}.db")
         engine = _make_session_store_engine(f"sqlite:///{tmp}")
         try:
+            from sqlalchemy.pool import NullPool
+
+            assert isinstance(engine.pool, NullPool), type(engine.pool).__name__
             raw = engine.raw_connection()
             try:
                 cur = raw.cursor()
@@ -137,6 +141,54 @@ async def t_session_store_default_on(ctx: TestContext) -> None:
     # engine used to lose races it should have won.
     assert busy == sqlite_busy_timeout_ms(), busy
     assert journal == "wal", journal
+
+
+@test("sqlite_busy_timeout", "single-row runtime reads finalize their WAL cursor")
+async def t_runtime_store_single_row_read_releases_reader(ctx: TestContext) -> None:
+    """Regression for the low-volume pin that survived after the boot fix.
+
+    SQLAlchemy's ``fetchone`` leaves the result cursor open after returning a
+    row; ``first`` closes it. Keep the Session and Result objects alive across
+    a sibling write to prove the read mark itself has already been released.
+    """
+    from sqlalchemy import text
+    from src.memory.store.sqlite import SqliteDb
+
+    tmp = ctx.db_path.with_name(f"wal-reader-{uuid.uuid4().hex[:8]}.db")
+    seed = sqlite3.connect(tmp)
+    seed.execute("PRAGMA journal_mode=WAL")
+    seed.execute("CREATE TABLE rows_for_reader (value INTEGER)")
+    seed.executemany(
+        "INSERT INTO rows_for_reader(value) VALUES (?)",
+        ((value,) for value in range(256)),
+    )
+    seed.commit()
+    seed.close()
+
+    store = SqliteDb(db_file=str(tmp))
+    session = store.Session()
+    result = session.execute(text("SELECT value FROM rows_for_reader ORDER BY value"))
+    assert result.first()[0] == 0
+
+    writer = sqlite3.connect(tmp)
+    try:
+        writer.execute("INSERT INTO rows_for_reader(value) VALUES (999)")
+        writer.commit()
+        checkpoint = writer.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        assert checkpoint[2] == checkpoint[1], checkpoint
+
+        source = Path(__file__).resolve().parents[2] / "src/memory/store/sqlite/sqlite.py"
+        assert ".fetchone()" not in source.read_text(), (
+            "runtime single-row reads must use first() so CursorResult closes"
+        )
+    finally:
+        writer.close()
+        store.close()
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                tmp.with_name(tmp.name + suffix).unlink()
+            except OSError:
+                pass
 
 
 @test("sqlite_busy_timeout", "an operator can still switch the store hook off")

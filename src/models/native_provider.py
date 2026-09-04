@@ -324,9 +324,12 @@ def _agno_event_types() -> dict[str, tuple]:
 
 
 def _evict_oldest(cache: OrderedDict[str, Any], max_size: int) -> None:
-    """Pop the oldest entries from ``cache`` so it doesn't exceed ``max_size``."""
+    """Dispose and pop old runtimes so eviction also releases SQLite readers."""
+    from src.models.runtime_db_lifecycle import close_runtime_databases
+
     while len(cache) > max_size:
-        cache.popitem(last=False)
+        _key, runtime = cache.popitem(last=False)
+        close_runtime_databases(runtime)
 
 
 def _system_cache_key(system: str | None) -> str:
@@ -892,8 +895,7 @@ class NativeProvider(BaseModel):
         self._db_path = new_path
         self._ensured_db_path = None
         # Force agent rebuild so the new SqliteDb path takes effect.
-        self._agno_agents.clear()
-        self._agno_teams.clear()
+        self._clear_runtime_caches()
 
     def set_mcp_toolkits(self, toolkits: list[Any]) -> None:
         """Receive the pool's pre-connected ``MCPTools`` instances.
@@ -907,13 +909,24 @@ class NativeProvider(BaseModel):
         self._mcp_toolkits = list(toolkits)
         self._compatible_cache = None
         # Force agent/team rebuild so the new tool list is picked up.
-        self._agno_agents.clear()
-        self._agno_teams.clear()
+        self._clear_runtime_caches()
 
     def set_fallback_config(self, fallback_config: Any) -> None:
         if fallback_config is self._fallback_config:
             return
         self._fallback_config = fallback_config
+        self._clear_runtime_caches()
+
+    def _clear_runtime_caches(self) -> None:
+        """Dispose runtime session stores before dropping cache references."""
+        from src.models.runtime_db_lifecycle import close_runtime_databases
+
+        seen: set[int] = set()
+        for runtime in [*self._agno_agents.values(), *self._agno_teams.values()]:
+            if id(runtime) in seen:
+                continue
+            seen.add(id(runtime))
+            close_runtime_databases(runtime)
         self._agno_agents.clear()
         self._agno_teams.clear()
 
@@ -958,10 +971,10 @@ class NativeProvider(BaseModel):
             except Exception as e:  # noqa: BLE001
                 logger.debug("runtime forget_session: SqliteDb init failed: %s", e)
                 return False
-            delete_fn = getattr(db, "delete_session", None)
-            if not callable(delete_fn):
-                return False
             try:
+                delete_fn = getattr(db, "delete_session", None)
+                if not callable(delete_fn):
+                    return False
                 result = delete_fn(session_id=session_id)
                 # Defensive — the runtime may switch to async one day.
                 if inspect.isawaitable(result):
@@ -972,6 +985,8 @@ class NativeProvider(BaseModel):
                     "runtime delete_session failed for %s: %s", session_id, e,
                 )
                 return False
+            finally:
+                db.close()
 
         deleted_via_api = await _asyncio.to_thread(_delete_via_api)
         if not deleted_via_api:
@@ -1681,13 +1696,14 @@ class NativeProvider(BaseModel):
         # these itself — so the fallback costs nothing on the happy path.
         leader_tools: list[Any] = list(compatible_toolkits)
 
+        team_db = SqliteDb(db_file=str(db_path))
         try:
             team = Team(
                 members=members,
                 mode=TeamMode.route,
                 model=self._build_runtime_model(),
                 fallback_config=self._fallback_config,
-                db=SqliteDb(db_file=str(db_path)),
+                db=team_db,
                 tools=leader_tools,
                 system_message=sys_key,
                 # Surface each member's tool list in the leader's context so
@@ -1705,6 +1721,7 @@ class NativeProvider(BaseModel):
                 markdown=False,
             )
         except Exception as exc:
+            team_db.close()
             # If Team construction fails for any reason (signature drift
             # between runtime versions, model incompatibility, …), log and
             # fall back rather than breaking the main generate path.
