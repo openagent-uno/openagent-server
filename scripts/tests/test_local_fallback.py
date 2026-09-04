@@ -116,10 +116,26 @@ async def t_fallback_config(_ctx: TestContext) -> None:
         on_rate_limit=["deepseek:deepseek-v4-pro"],
         on_error=["deepseek:deepseek-v4-pro"],
     )
+
+    # La riga locale entra in catena solo se si COSTRUISCE. Prima questo test
+    # passava la stringa grezza, e cosi' faceva anche il codice: ma
+    # `FallbackConfig.resolve_models()` risolve con `get_model()`, che conosce
+    # solo i vendor nativi, e su "codex:"/"local:" SOLLEVA ValueError uccidendo
+    # il run invece di ripiegare (4-set-2026: tre task morti, registrati come
+    # `success` con il ValueError al posto del risultato). Qui si simula la
+    # riga gia' costruita, che e' cio' che il ramo NativeProvider produce.
+    class _Row:
+        def __init__(self, rid): self.id = rid
+        def __eq__(self, other): return str(getattr(other, "id", other)) == self.id
+
+    policy._runtime_fallback_models = lambda pc: [_Row(LOCAL_ID)]
+
     policy.augment_fallback_config(config)
     policy.augment_fallback_config(config)  # idempotent, no callback recursion
-    assert config.on_rate_limit == [LOCAL_ID, "deepseek:deepseek-v4-pro"]
-    assert config.on_error == ["deepseek:deepseek-v4-pro", LOCAL_ID]
+    assert [str(getattr(m, "id", m)) for m in config.on_rate_limit] == [
+        LOCAL_ID, "deepseek:deepseek-v4-pro"]
+    assert [str(getattr(m, "id", m)) for m in config.on_error] == [
+        "deepseek:deepseek-v4-pro", LOCAL_ID]
     config.callback(
         "claude-haiku-4-5", "qwen3-moe-local",
         ModelRateLimitError("quota exhausted"),

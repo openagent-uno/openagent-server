@@ -194,8 +194,15 @@ class LocalFallbackPolicy:
         operator providers with a base_url; fallback must use that same path or
         a valid ``windows-local`` row fails before inference starts.
         """
-        if not providers_config:
-            return list(self.local_models)
+        # MAI restituire le stringhe cosi' come sono. `FallbackConfig.resolve_models()`
+        # le risolve con `get_model()`, che conosce SOLO i vendor nativi
+        # (anthropic|openai|google|gemini|deepseek|groq): su "local:", "codex:" e
+        # "windows-local:" SOLLEVA `ValueError: Model provider 'codex' is not
+        # supported`, e il run muore invece di ripiegare. Il 4-set-2026 e' costato
+        # tre task uccisi (escalation-audit, alert-triage, morning-briefing) per
+        # giunta registrati come `success`, con il ValueError al posto del
+        # risultato. Si passa sempre dal ramo NativeProvider: una riga che non si
+        # costruisce viene SALTATA e loggata, non trasformata in una mina.
         built: list[Any] = []
         for runtime_id in self.local_models:
             try:

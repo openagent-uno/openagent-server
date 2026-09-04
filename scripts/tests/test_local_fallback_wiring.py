@@ -30,17 +30,29 @@ def _dispatcher():
 
 
 @test("local_fallback_wiring",
-      "la corsia locale finisce in on_rate_limit con l'ordine di boot reale")
+      "quando le pedane si costruiscono, finiscono davvero in on_rate_limit")
 async def t_lane_reaches_on_rate_limit(_ctx: TestContext) -> None:
+    """Il cablaggio, isolato dal fatto che le righe siano costruibili qui.
+
+    Costruire una riga vera vuole un `providers_config` con i base_url, che al
+    boot NON c'e' ancora (il dispatcher nasce con `providers_config=[]` e i
+    provider arrivano dal DB piu' tardi): e' il buco ancora aperto. Qui si
+    verifica il pezzo che era rotto e che ho corretto — che l'innesto AVVENGA
+    con l'ordine di boot reale — sostituendo la costruzione delle righe.
+    """
     from src.models.providers.fallback import FallbackConfig
 
     d = _dispatcher()
-    # ordine identico a server.py: prima la policy, poi la config vuota
     d.set_local_fallback_policy({"enabled": True, "models": LANE,
                                  "on_rate_limit": True, "on_error": True})
+
+    class _Row:  # sta per una riga NativeProvider gia' costruita
+        def __init__(self, rid): self.id = rid
+
+    d._local_fallback._runtime_fallback_models = lambda pc: [_Row(m) for m in LANE]
+
     cfg = FallbackConfig()
     d.set_fallback_config(cfg)
-
     got = getattr(d, "fallback_config", None)
     assert got is not None, "il dispatcher non espone la config innestata"
     refs = [str(getattr(m, "id", m)) for m in (got.on_rate_limit or [])]
@@ -62,3 +74,32 @@ async def t_no_lane_is_a_noop(_ctx: TestContext) -> None:
     d.set_fallback_config(cfg)
     got = getattr(d, "fallback_config", cfg)
     assert not (got.on_rate_limit or []), "nessuna corsia: nulla da innestare"
+
+
+@test("local_fallback_wiring",
+      "nessuna stringa non risolvibile finisce in catena")
+async def t_no_unresolvable_strings(_ctx: TestContext) -> None:
+    """Il ValueError che il 4-set-2026 ha ucciso tre task.
+
+    `FallbackConfig.resolve_models()` risolve con `get_model()`, che conosce
+    SOLO i vendor nativi. Una stringa "codex:"/"local:" in catena non degrada a
+    "niente fallback": SOLLEVA `ValueError: Model provider 'codex' is not
+    supported` e il run muore — per giunta registrato come `success`, con il
+    ValueError al posto del risultato. Una riga che non si costruisce va
+    SALTATA, non messa in catena.
+    """
+    d = _dispatcher()
+    d.set_local_fallback_policy({"enabled": True, "models": LANE,
+                                 "on_rate_limit": True, "on_error": True})
+    from src.models.providers.fallback import FallbackConfig
+    cfg = FallbackConfig()
+    d.set_fallback_config(cfg)
+    got = getattr(d, "fallback_config", None)
+    rows = list((got.on_rate_limit if got else []) or [])
+    stringhe = [r for r in rows if isinstance(r, str)]
+    assert not stringhe, (
+        f"in catena ci sono stringhe grezze {stringhe}: resolve_models() le "
+        "fara' esplodere invece di ripiegare"
+    )
+    # e la catena deve restare utilizzabile: o righe vere, o vuota
+    got.resolve_models()  # non deve sollevare
