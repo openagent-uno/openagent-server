@@ -1786,6 +1786,21 @@ class ModelDispatcher(BaseModel):
         """
         if providers_config is not None:
             self._providers_config = providers_config
+            # Ora che i provider sono noti, la corsia di ripiego si costruisce
+            # DAVVERO. Al boot `_build_agent` innesta la corsia quando questo
+            # dispatcher ha ancora `providers_config=[]`: senza base_url nessuna
+            # riga si costruisce, ogni pedana viene saltata e la catena resta
+            # VUOTA. Cosi' un rate limit uccide il run invece di scendere di
+            # pedana — misurato il 4-set-2026 su lyra ed esound, con otto
+            # `router.local_fallback_model_error` (una per pedana, haiku
+            # compreso) e zero ripieghi in un giorno intero di quota ChatGPT
+            # esaurita. L'ultimo ripiego riuscito risaliva al 28-ago.
+            # Qui i provider ci sono: si ri-innesta, ed e' idempotente
+            # (`_prioritize_unique` deduplica per id).
+            if self._fallback_config is not None:
+                self._fallback_config = self._local_fallback.augment_fallback_config(
+                    self._fallback_config, providers_config=self._providers_config,
+                )
         # Keep the guard's providers view current so the C2 $0-priced-scope
         # warning tracks a hot-reloaded catalog.
         if self._budget_guard is not None:
@@ -1794,6 +1809,9 @@ class ModelDispatcher(BaseModel):
             fn = getattr(provider, "rebuild_routing", None)
             if callable(fn):
                 fn(providers_config=self._providers_config)
+            # La catena appena ricostruita deve arrivare anche ai membri del
+            # Team: e' il loro Agent che la consulta su un ModelRateLimitError.
+            wire_model_runtime(provider, fallback_config=self._fallback_config)
         elog("router.rebuilt")
 
     # ── runtime wiring ───────────────────────────────────────────────

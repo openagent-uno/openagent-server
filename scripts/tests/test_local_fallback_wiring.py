@@ -103,3 +103,52 @@ async def t_no_unresolvable_strings(_ctx: TestContext) -> None:
     )
     # e la catena deve restare utilizzabile: o righe vere, o vuota
     got.resolve_models()  # non deve sollevare
+
+
+@test("local_fallback_wiring",
+      "quando i provider arrivano, la corsia si costruisce e la catena si popola")
+async def t_lane_built_when_providers_arrive(_ctx: TestContext) -> None:
+    """Il guasto vero: al boot la catena resta VUOTA e nessuno ripiega.
+
+    `_build_agent` innesta la corsia quando il dispatcher ha ancora
+    `providers_config=[]`: senza base_url nessuna riga si costruisce, ogni
+    pedana viene saltata e `on_rate_limit` resta vuota — quindi un
+    ModelRateLimitError uccide il run invece di scendere su Claude. Misurato il
+    4-set-2026 su lyra ed esound: otto `router.local_fallback_model_error` (una
+    per pedana, haiku compreso) e zero ripieghi in un giorno di quota ChatGPT
+    esaurita; l'ultimo ripiego riuscito risaliva al 28-ago.
+
+    I provider arrivano dopo, dal DB, via `rebuild_routing` — al boot e a ogni
+    hot-reload. E' li' che la corsia va ri-innestata.
+    """
+    from src.models.providers.fallback import FallbackConfig
+
+    PROVIDERS = [
+        {"name": "local", "framework": "api-based", "enabled": 1,
+         "base_url": "http://esound-claude-proxy.default.svc.cluster.local:8787/v1",
+         "api_key": "x"},
+        {"name": "codex", "framework": "api-based", "enabled": 1,
+         "base_url": "http://codex-sub-proxy.default.svc.cluster.local:8788/v1",
+         "api_key": "x"},
+    ]
+    LANE2 = ["codex:gpt-5.6-luna", "local:claude-haiku-4-5"]
+
+    d = _dispatcher()
+    d.set_local_fallback_policy({"enabled": True, "models": LANE2,
+                                 "on_rate_limit": True, "on_error": True})
+    d.set_fallback_config(FallbackConfig())
+
+    vuota = [str(getattr(m, "id", m)) for m in (d.fallback_config.on_rate_limit or [])]
+    assert vuota == [], f"senza provider la catena non puo' costruirsi: {vuota}"
+
+    d.rebuild_routing(PROVIDERS)   # come al boot, dopo l'idratazione dal DB
+
+    ids = [str(getattr(m, "id", m)) for m in (d.fallback_config.on_rate_limit or [])]
+    assert ids, "la catena e' ANCORA vuota: nessun ripiego, il run muore sul rate limit"
+    assert any("haiku" in i for i in ids), f"Claude non e' in catena: {ids}"
+    assert not any(isinstance(m, str) for m in d.fallback_config.on_rate_limit), \
+        "sono finite stringhe grezze in catena"
+
+    d.rebuild_routing(PROVIDERS)   # idempotente: un hot-reload non duplica
+    ids2 = [str(getattr(m, "id", m)) for m in d.fallback_config.on_rate_limit]
+    assert len(ids2) == len(ids), f"duplicati dopo il secondo giro: {ids2}"
