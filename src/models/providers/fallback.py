@@ -63,7 +63,25 @@ class FallbackConfig:
             if raw_list:
                 resolved: list = []
                 for fm in raw_list:
-                    resolved_model = get_model(fm)
+                    # Una voce irrisolvibile si SALTA, non uccide l'agent.
+                    # Era l'intento dichiarato ("a bad config degrades to 'no
+                    # fallback' rather than crashing the agent") ma non era
+                    # implementato per il caso che conta: `get_model()` torna
+                    # None quando il modello non c'e', ma SOLLEVA ValueError su
+                    # un provider che non e' un vendor nativo — e "codex:",
+                    # "local:", "windows-local:" sono provider operatore con
+                    # base_url nel DB, non vendor. Il 4-set-2026 sono morti
+                    # cosi' sei run (alert-triage, morning-briefing-delegated),
+                    # per giunta registrati come `success` con il ValueError al
+                    # posto del risultato.
+                    try:
+                        resolved_model = get_model(fm)
+                    except Exception as exc:  # noqa: BLE001
+                        log_warning(
+                            "fallback: voce non risolvibile, la salto: "
+                            f"{fm!r} ({type(exc).__name__}: {exc})"
+                        )
+                        continue
                     if resolved_model is not None:
                         resolved_model = deepcopy(resolved_model)
                         resolved_model.model_type = ModelType.MODEL

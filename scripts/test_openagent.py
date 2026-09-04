@@ -793,6 +793,8 @@ _TEST_MODULES: tuple[str, ...] = (
     # l'ordine di boot reale non ci finiva, e 35 run sono morti su un rate
     # limit avendo un ripiego configurato e mai innestato. Pure-unit.
     "test_local_fallback_wiring",
+    # Una voce di fallback irrisolvibile si salta, non uccide l'agent.
+    "test_fallback_resolve_skips",
 )
 
 
