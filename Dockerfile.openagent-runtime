@@ -1,3 +1,6 @@
 FROM hub.spicysparks.com/spicysparks/openagent:v29
-COPY dist/openagent /opt/openagent/bin/openagent
-RUN chmod 0755 /opt/openagent/bin/openagent
+# --chmod al posto di un RUN chmod: quel RUN creava un SECONDO layer che
+# duplicava il binario (289MB), raddoppiando spazio e tempo di build per
+# cambiare un bit di permessi. Il 3-set-2026, con il disco della macchina al
+# 99%, e' proprio quello step a morire con "DeadlineExceeded".
+COPY --chmod=0755 dist/openagent /opt/openagent/bin/openagent
