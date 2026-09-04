@@ -143,3 +143,10 @@ async def t_retention_supervisord_wired(ctx: TestContext) -> None:
     # Sanity: this is the real machine config (mirrors the image baseline),
     # not a stub — the agent program must still be present.
     assert "[program:openagent]" in text, "config is not the machine supervisord.conf"
+    openagent_block = text.split("[program:openagent]", 1)[1].split("[program:", 1)[0]
+    assert "stopasgroup=true" in openagent_block, "openagent stop can orphan its frozen child"
+    assert "killasgroup=true" in openagent_block, "openagent kill can orphan its frozen child"
+
+    runtime = (REPO_ROOT / "Dockerfile.openagent-runtime").read_text()
+    assert "COPY deploy/supervisord.conf /etc/supervisord.conf" in runtime
+    assert "COPY src/core/session_retention.py /opt/openagent/session_retention.py" in runtime

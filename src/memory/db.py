@@ -1102,6 +1102,12 @@ class MemoryDB:
     def __init__(self, db_path: str = "openagent.db"):
         self.db_path = db_path
         self._conn: aiosqlite.Connection | None = None
+        # Populated only by the most recent startup orphan reap and consumed
+        # by ``requeue_interrupted_task_runs``.  Keeping this boundary in
+        # memory is deliberate: historical rows also carry the same durable
+        # ``reaped: orphan`` marker, but they must never be replayed again on a
+        # later boot.
+        self._last_reaped_task_run_ids: list[str] = []
         # Per-process claim owner (see module-level ``WORKER_ID``). Exposed on
         # the instance so the dispatch runner can heartbeat "still mine".
         self.worker_id = WORKER_ID
@@ -2843,16 +2849,19 @@ class MemoryDB:
         ``AgentServer.start()``. Returns the number of rows reaped."""
         conn = await self._ensure_connected()
         now = time.time()
+        # Reset first so a failed/empty later reap can never reuse the ids from
+        # an earlier call in this process.
+        self._last_reaped_task_run_ids = []
         cursor = await conn.execute(
             "UPDATE task_runs "
             "SET status='failed', finished_at=?, "
             "    error=COALESCE(error, '') || "
             "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
             "          'reaped: orphan from prior process' "
-            "WHERE status='running'",
+            "WHERE status='running' RETURNING id",
             (now,),
         )
-        reaped = cursor.rowcount or 0
+        reaped_rows = await cursor.fetchall()
         # A firing flagged 'cancelling' that the prior process never finalized
         # (crash between the MCP flag and the scheduler's drain) is also an
         # orphan — finalize it as 'cancelled' (the requested outcome), kept
@@ -2863,11 +2872,13 @@ class MemoryDB:
             "    error=COALESCE(error, '') || "
             "          CASE WHEN error IS NULL OR error='' THEN '' ELSE ' | ' END || "
             "          'reaped: stop left pending by prior process' "
-            "WHERE status='cancelling'",
+            "WHERE status='cancelling' RETURNING id",
             (now,),
         )
+        cancelled_rows = await cancel_cursor.fetchall()
         await conn.commit()
-        return reaped + (cancel_cursor.rowcount or 0)
+        self._last_reaped_task_run_ids = [str(row[0]) for row in reaped_rows]
+        return len(reaped_rows) + len(cancelled_rows)
 
     async def requeue_interrupted_task_runs(self) -> list[str]:
         """Re-enqueue the tasks whose firing a process restart killed.
@@ -2897,15 +2908,29 @@ class MemoryDB:
         Call AFTER ``reap_orphan_task_runs``, which is what stamps the marker
         this reads. Returns the task ids re-enqueued.
         """
+        # Only rows settled by the immediately preceding reap belong to this
+        # boot.  Querying by the durable error marker alone replays every old
+        # interrupted run forever: after one deployment restart eSound
+        # launched fifteen unrelated historical tasks at once, pinned a WAL
+        # read mark, and grew the WAL for fourteen hours.  The in-memory ids
+        # disappear with the process, which is exactly the lifecycle boundary
+        # this recovery action needs.
+        run_ids = list(self._last_reaped_task_run_ids)
+        if not run_ids:
+            return []
+
         conn = await self._ensure_connected()
         marker = "reaped: orphan from prior process"
+        placeholders = ",".join("?" for _ in run_ids)
         cursor = await conn.execute(
             "SELECT r.id, r.task_id FROM task_runs AS r "
             "JOIN scheduled_tasks AS t ON t.id = r.task_id "
-            "WHERE r.status = 'failed' AND r.error LIKE ? AND t.enabled = 1",
-            (f"%{marker}%",),
+            f"WHERE r.id IN ({placeholders}) AND r.status = 'failed' "
+            "AND r.error LIKE ? AND t.enabled = 1",
+            (*run_ids, f"%{marker}%"),
         )
         candidates = [(row[0], row[1]) for row in await cursor.fetchall()]
+        self._last_reaped_task_run_ids = []
 
         requeued: list[str] = []
         for run_id, task_id in candidates:

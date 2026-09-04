@@ -156,6 +156,40 @@ async def t_requeue_stops_after_second_kill(ctx: TestContext) -> None:
             pass
 
 
+@test("task_runs", "historical reaped runs are not replayed on a later boot")
+async def t_requeue_ignores_historical_reaps(ctx: TestContext) -> None:
+    """The durable error marker is history, not a standing queue entry.
+
+    A fresh process that reaps no current run must not rediscover and replay a
+    run another process already settled.  This is the production shape that
+    turned every eSound/Lyra restart into a scheduled-task stampede.
+    """
+    from src.memory.db import MemoryDB
+
+    tmp_db = ctx.db_path.with_name(f"taskruns-history-{uuid.uuid4().hex[:8]}.db")
+    try:
+        first_process = MemoryDB(str(tmp_db))
+        await first_process.connect()
+        task_id = await first_process.add_task("T", "0 9 * * 1", "p")
+        await first_process.add_task_run(task_id=task_id)
+        assert await first_process.reap_orphan_task_runs() == 1
+        assert await first_process.requeue_interrupted_task_runs() == [task_id]
+        await first_process.claim_pending_task_requests(limit=10)
+        await first_process.close()
+
+        later_process = MemoryDB(str(tmp_db))
+        await later_process.connect()
+        assert await later_process.reap_orphan_task_runs() == 0
+        assert await later_process.requeue_interrupted_task_runs() == []
+        assert await later_process.claim_pending_task_requests(limit=10) == []
+        await later_process.close()
+    finally:
+        try:
+            tmp_db.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @test("task_runs", "a disabled task is not resurrected by the requeue")
 async def t_requeue_skips_disabled(ctx: TestContext) -> None:
     from src.memory.db import MemoryDB
