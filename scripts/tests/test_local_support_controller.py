@@ -1612,6 +1612,68 @@ async def t_partial_bug_tracks_then_enriches(_ctx: TestContext) -> None:
     assert "release date" in reply, output["reply"]
 
 
+@test(
+    "local_support_controller",
+    "a truncated YouTube playlist asks for the source link, not generic metadata",
+)
+async def t_youtube_playlist_limit_requests_reproducer(_ctx: TestContext) -> None:
+    """Regression for the public Lyra Reddit report with 1902 songs.
+
+    The old route filed this as a generic library failure and asked for app
+    version/device/OS. The operator had to replace that answer manually and
+    ask for the playlist URL, which is the fixture needed to reproduce a
+    provider continuation failure.
+    """
+    from src.core import local_support_controller as controller
+
+    message = (
+        "Hi, this app seemed like a pretty good alternative to YT Music, but "
+        "when I'm trying to add a playlist of 1902 songs to my liked songs, "
+        "it only likes the first 100 of them and if there are more songs "
+        "loaded on the mobile app, it just deloads them (the pc app doesn't "
+        "even load more than 100 songs). Actually doing basically anything "
+        "with the playlist seems to just unload all songs except for the "
+        "first 100, so I can't even put my full liked songs playlist on shuffle."
+    )
+    doubles = _Doubles(create_id="86-youtube-playlist-100")
+    output = await _drive(
+        doubles,
+        message,
+        thread_id="t-reddit-youtube-playlist-100",
+        payload_extra={
+            "product": "lyra",
+            "channel_kind": "reddit",
+            "subject": (
+                "Imported playlists from YT Music only allow me to like the "
+                "first 100 songs"
+            ),
+        },
+    )
+
+    assert output["outcome"] == "bug_created", output
+    assert output["facts"]["missing_evidence"] == ["source playlist link"], output
+    assert output["facts"]["provider_playlist_fixture_required"] is True, output
+    created = doubles.args_for("clickup_create_task")[0]
+    assert created["name"] == (
+        "Fix truncated import in provider playlist import"
+    ), created
+    reply = output["reply"].lower()
+    assert "original playlist link" in reply, output["reply"]
+    assert "app version" not in reply, output["reply"]
+    assert "device and os" not in reply, output["reply"]
+
+    with_link = message + (
+        " https://music.youtube.com/playlist?list=PLGC6pj6nUOcewgLSCorrnGT3jgb5mQ9yv"
+    )
+    assert controller._provider_playlist_link_missing(message) is True
+    assert controller._provider_playlist_link_missing(with_link) is False
+    title, _list_id, tag = controller._bug_symptom_route(
+        with_link, controller._TENANTS["lyra"],
+    )
+    assert title == "Fix truncated import in provider playlist import", title
+    assert tag == "lyra/client-core", tag
+
+
 @test("local_support_controller", "an unverifiable Replio link never becomes a tracked claim")
 async def t_bug_link_verification_failure(_ctx: TestContext) -> None:
     doubles = _Doubles(create_id="86-new-esound", link_ok=False)

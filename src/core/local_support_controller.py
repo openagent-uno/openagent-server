@@ -1086,6 +1086,13 @@ def _intent(text: str, channel: str = "") -> str:
         "redemande de payer", "pay again", "paying again",
     )):
         return "premium"
+    # A provider playlist that stops at an explicit item boundary is a fault,
+    # even when the customer never uses the words "bug", "error" or "not
+    # working". Keep this after the higher-risk legal/account/money routes,
+    # but before the generic bug vocabulary. The real 1902-track Reddit report
+    # said "only the first 100" and otherwise fell through to clarification.
+    if _provider_playlist_truncated(low):
+        return "bug"
     if _any_term(low, (
         # English
         "crash*", "freez*", "hang*", "endless", "infinite load*", "buffering",
@@ -2417,6 +2424,44 @@ def _bug_evidence_missing(text: str) -> list[str]:
     return missing
 
 
+_PROVIDER_PLAYLIST = re.compile(
+    r"(?:youtube(?:\s+music)?|yt\s+music|spotify|deezer).{0,80}playlist|"
+    r"playlist.{0,80}(?:youtube(?:\s+music)?|yt\s+music|spotify|deezer)|"
+    r"(?:import(?:ed|ing)?|shared?).{0,40}playlist",
+    re.IGNORECASE | re.DOTALL,
+)
+_URL = re.compile(r"https?://\S+", re.IGNORECASE)
+_PROVIDER_PLAYLIST_TRUNCATION = re.compile(
+    r"(?:only|just)\s+(?:the\s+)?first\s+\d+|"
+    r"first\s+\d+\s+(?:songs?|tracks?)|"
+    r"(?:more|past|beyond)\s+\d+|"
+    r"\d+\s+(?:songs?|tracks?).{0,80}(?:only|first)\s+\d+",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _provider_playlist_truncated(text: str) -> bool:
+    body = str(text or "")
+    return bool(
+        _PROVIDER_PLAYLIST.search(body)
+        and _PROVIDER_PLAYLIST_TRUNCATION.search(body)
+    )
+
+
+def _provider_playlist_link_missing(text: str) -> bool:
+    """Whether a provider-backed playlist report lacks its reproducer URL.
+
+    For an import/pagination fault, a generic app version or device model does
+    not identify the provider response that failed.  The source playlist URL
+    does: it preserves the provider, playlist id, size and continuation shape.
+    A real Reddit report described the 100/1902 boundary and both affected
+    clients in detail, yet the support reply asked for generic metadata and
+    missed the one fixture engineering needed.
+    """
+    body = str(text or "")
+    return bool(_PROVIDER_PLAYLIST.search(body)) and not bool(_URL.search(body))
+
+
 _CLOSED_STATUSES = frozenset({
     "closed", "complete", "completed", "done", "resolved", "released",
     "chiuso", "completato", "risolto", "rilasciato", "pending release",
@@ -2479,6 +2524,15 @@ _BUG_SURFACES: tuple[tuple[str, str, str, str], ...] = (
     (r"\bsync\b|\bserver\b|\bapi\b|timeout|\b5\d\d\b", "the backend sync", "backend", "esound/backend-core"),
     (r"search|ricerca|buscar", "search", "client", "esound/client-core"),
     (r"download|offline|scarica", "downloads", "client", "esound/client-core"),
+    # Provider playlist pagination/import belongs to shared Client Core. Keep
+    # it ahead of the generic library row so the task names the operation that
+    # actually failed instead of becoming "failure in the library".
+    (
+        r"(?:youtube(?:\s+music)?|yt\s+music|spotify|deezer).{0,80}playlist|"
+        r"playlist.{0,80}(?:youtube(?:\s+music)?|yt\s+music|spotify|deezer)|"
+        r"(?:import(?:ed|ing)?|shared?).{0,40}playlist",
+        "provider playlist import", "client", "esound/client-core",
+    ),
     # An incidental playlist mention must not steal a playback failure. A live
     # PC report said songs outside a playlist were unable to play and rapidly
     # skipped; the generic playlist row filed it under library ownership.
@@ -2527,8 +2581,13 @@ def _bug_symptom_route(
     title, a component, or a root cause be invented.
     """
     low = text.lower()
-    symptom = next(
-        (label for pattern, label in _BUG_SYMPTOMS if re.search(pattern, low)), "",
+    provider_playlist_truncation = _provider_playlist_truncated(low)
+    symptom = (
+        "truncated import"
+        if provider_playlist_truncation
+        else next(
+            (label for pattern, label in _BUG_SYMPTOMS if re.search(pattern, low)), "",
+        )
     )
     surface = next(
         (
@@ -2963,6 +3022,15 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
     missing = _bug_evidence_missing(
         state.thread_customer_text or state.customer_message
     )
+    if _provider_playlist_link_missing(
+        state.thread_customer_text or state.customer_message
+    ):
+        # The report already identifies the operation and the observed
+        # boundary. Ask first for the provider fixture that makes the bug
+        # reproducible; generic client metadata can be collected later only
+        # if the same playlist does not reproduce on the current build.
+        missing = ["source playlist link"]
+        state.facts["provider_playlist_fixture_required"] = True
     # The web form and the store reviews already attach the client version and
     # the device/OS. When the ONLY thing left is the exact sequence, holding
     # the report back means the queue never hears about a defect the form
@@ -3186,6 +3254,14 @@ def _missing_bug_evidence_suffix(state: SupportState, italian: bool) -> str:
     missing = [str(item) for item in (state.facts.get("missing_evidence") or []) if item]
     if not missing:
         return ""
+    if missing == ["source playlist link"]:
+        return (
+            " Inviami il link originale della playlist, così possiamo "
+            "riprodurre il problema con la stessa lista."
+            if italian else
+            " Please send the original playlist link so we can reproduce the "
+            "problem with the same list."
+        )
     joined = ", ".join(missing)
     return (
         f" Per completare il task, inviami anche: {joined}."
