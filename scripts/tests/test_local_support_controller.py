@@ -1890,6 +1890,85 @@ async def t_language_all_scripts(_ctx: TestContext) -> None:
     assert _language_hint("I paid for premium but still see ads") == "en"
 
 
+@test("local_support_controller", "September real messages retain Indonesian and Dutch")
+async def t_september_language_regressions(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import _language_hint
+    assert _language_hint("Terlalu lama loading dan beberapa tampilan hilang") == "id"
+    assert _language_hint("Hoe kan ik mijn premium abonnement opzeggen?") == "nl"
+
+
+@test("local_support_controller", "offline policy cannot be freely rewritten as a Premium upsell")
+async def t_offline_policy_is_constrained(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+
+    class Model:
+        async def generate(self, **kwargs):
+            packet = json.loads(kwargs["messages"][0]["content"])
+            assert "text" in packet, "offline policy went through free composition"
+            assert "does not enable" in packet["text"]
+            return SimpleNamespace(content=json.dumps({"reply":
+                "Premium no permite descargar el catálogo. Para escuchar sin conexión, importa tus propios archivos de audio desde tu dispositivo."}))
+
+    for product in ("esound", "lyra"):
+        state = lsc.SupportState(thread_id="fixture", customer_message="Quiero descargar canción para escucharlos sin conexión", tenant=lsc._TENANTS[product])
+        state.outcome, state.decision = "offline_explained", "self_help"
+        state.facts["language"] = "en"
+        reply = await lsc._compose_local(SimpleNamespace(model=Model()), {}, state, "fixture")
+        assert state.tenant.display in reply
+        assert "does not enable" in reply
+        assert state.facts["reply_source"] == "deterministic:product_policy"
+        state.facts["language"] = "es"
+        reply = await lsc._compose_local(SimpleNamespace(model=Model()), {}, state, "fixture-es")
+        assert "no permite" in reply, reply
+        assert state.facts["reply_source"] == "model:translate_product_policy"
+
+
+@test("local_support_controller", "unknown-language fallback still attempts to mirror the customer")
+async def t_unknown_language_fallback_translates(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    class Model:
+        async def generate(self, **kwargs):
+            packet = json.loads(kwargs["messages"][0]["content"])
+            assert packet["customer_message"] == "Muzika neveikia"
+            return SimpleNamespace(content=json.dumps({"reply": "Ką darote programėlėje ir kas nutinka?"}))
+    state = lsc.SupportState(thread_id="fixture", customer_message="Muzika neveikia")
+    state.facts["language"] = "und"
+    state.outcome, state.decision = "general_needs_detail", "ask_information"
+    reply = await lsc._fallback_in_language(SimpleNamespace(model=Model()), {}, state, "fixture", "guard")
+    assert reply.startswith("Ką"), reply
+
+
+@test("local_support_controller", "a greeting does not trigger a diagnostic questionnaire")
+async def t_greeting_is_not_a_bug(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    state = lsc.SupportState(thread_id="fixture", customer_message="Hola")
+    state.outcome = "general_needs_detail"
+    reply = lsc._fallback_reply(state)
+    assert "How can we help" in reply
+    assert "device" not in reply
+    state.customer_message = "Hola, nothing plays"
+    assert "How can we help" not in lsc._fallback_reply(state)
+
+
+@test("local_support_controller", "a language label cannot excuse English prose")
+async def t_language_label_is_not_evidence(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    calls = []
+    class Model:
+        async def generate(self, **kwargs):
+            packet = json.loads(kwargs["messages"][0]["content"])
+            calls.append(packet)
+            if "text" in packet:
+                return SimpleNamespace(content=json.dumps({"reply": "Beschrijf wat er gebeurt in de app."}))
+            return SimpleNamespace(content=json.dumps({"language": "nl", "reply": "Please tell us what happens when you open the app and what you were trying to do."}))
+    state = lsc.SupportState(thread_id="fixture", customer_message="Mijn app werkt niet")
+    state.facts["language"] = "nl"
+    state.outcome, state.decision = "bug_missing_evidence", "ask_information"
+    await lsc._compose_local(SimpleNamespace(model=Model()), {}, state, "fixture")
+    assert len(calls) == 2, calls
+    assert "text" in calls[1]
+
+
 @test("local_support_controller", "form values are read, labels are not evidence")
 async def t_form_fields_are_values(_ctx: TestContext) -> None:
     from src.core.local_support_controller import _bug_evidence_missing, _form_fields
