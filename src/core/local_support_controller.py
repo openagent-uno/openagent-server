@@ -23,7 +23,7 @@ from typing import Any, Iterable
 
 from src.core import reply_guard, support_attachments, support_context, support_semantics, support_turn, tool_trace
 from src.core.support_billing import billing_payload, explicit_premium
-from src.core.support_email import receipt_request
+from src.core.support_email import receipt_request, without_support_echo
 from src.core.dry_run import is_dry_run
 from src.core.execution_profile import (
     stateless_completion_scope,
@@ -1392,12 +1392,21 @@ async def _read_reported_turn(
         state.facts["turn_reader"] = "invalid_evidence"
         state.intent = "request_review"
         return
+    if assessment.kind in {"resolved_confirmation", "acknowledgement"} and (
+        support_turn.read_reported_turn(assessment.packet(), state.customer_message) is None
+    ):
+        # An old "it worked" cannot close a newly reported problem.
+        state.facts["turn_reader"] = "invalid_latest_evidence"
+        state.intent = "request_review"
+        return
     state.reported_turn = assessment
     state.facts["turn_reader"] = "grounded"
     # Other means no operational override, NOT that the thread is resolved.
     route = {"signup": "account_signup", "password_recovery": "password_recovery",
              "referral_status": "referral_status", "status_check": "status_check",
-             "catalog_offline": "offline", "library_loss": "bug", "bug": "bug"}.get(assessment.kind)
+             "catalog_offline": "offline", "library_loss": "bug", "bug": "bug",
+             "resolved_confirmation": "resolved_confirmation",
+             "acknowledgement": "acknowledgement"}.get(assessment.kind)
     if route:
         state.intent = route
         state.facts["intent_source"] = "conversation_reader"
@@ -1954,10 +1963,10 @@ def _customer_text(thread: Any, message: str, limit: int = 20000) -> str:
             for key in ("body_text", "text", "body", "content"):
                 value = item.get(key)
                 if isinstance(value, str) and value.strip():
-                    parts.append(receipt_request(value.strip())[0])
+                    parts.append(without_support_echo(receipt_request(value.strip())[0], _support_replies(thread, limit=1000)))
                     break
     if message and message.strip() and (not parts or parts[-1] != message.strip()):
-        parts.append(receipt_request(message.strip())[0])
+        parts.append(without_support_echo(receipt_request(message.strip())[0], _support_replies(thread, limit=1000)))
     return "\n".join(parts)[-limit:]
 
 
@@ -6271,6 +6280,14 @@ async def run(
                     state.facts["language"] = _COUNTRY_LANGUAGE[country]
                     state.facts["language_source"] = "store_country"
             break
+    if state.channel == "email_imap":
+        authored = without_support_echo(message, _support_replies(thread, limit=1000))
+        if authored != message:
+            message = authored
+            state.customer_message = authored
+            state.facts["support_echo_removed"] = True
+            state.facts["language_signal"] = authored
+            state.facts["language"] = _language_hint(authored)
     state.corrections = await _load_corrections(pool, state)
     name = _customer_first_name(thread, payload)
     if name:

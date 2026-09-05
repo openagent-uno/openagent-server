@@ -12,6 +12,49 @@ from src.core import local_support_controller as controller
 from src.core.support_turn import delivery_state, missing_bug_fields, read_reported_turn
 
 
+@test("support_turn", "resolved latest message does not reopen an old bug questionnaire")
+async def t_resolved_followup(_ctx: TestContext) -> None:
+    text = "Ho installato l'ultima versione, ora la musica è partita regolarmente."
+    class Model:
+        async def generate(self, **kw):
+            return SimpleNamespace(content=json.dumps({"kind": "resolved_confirmation", "evidence": text}))
+    state = controller.SupportState(thread_id="sim", customer_message=text, intent="bug",
+        thread_customer_text="La musica non parte.\n" + text)
+    await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "unit")
+    assert state.intent == "resolved_confirmation"
+    # A historical resolution cannot silence a new malfunction.
+    state.customer_message = "Adesso ho un altro problema: la libreria è vuota."
+    state.intent = "bug"
+    await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "unit")
+    assert state.intent == "request_review"
+    assert state.facts["turn_reader"] == "invalid_latest_evidence"
+
+
+@test("support_turn", "unmarked support quote cannot turn thanks into another bug report")
+async def t_unmarked_support_echo(_ctx: TestContext) -> None:
+    from src.core.support_email import without_support_echo
+    prior = "Folders hold playlists and albums, not individual songs. Put the songs into a playlist first, then move that playlist into the folder."
+    thanks = "So many thanks!\nI will follow your instructions later.\nCheers"
+    mail = thanks + "\n\n" + prior.replace(" ", " \n ")
+    assert without_support_echo(mail, [prior]) == thanks
+    assert without_support_echo(prior, [prior]) == ""
+    # Real bottom-posted and inline replies must not disappear.
+    bottom = mail + "\nI tried that, but the folder is still empty."
+    assert without_support_echo(bottom, [prior]) == bottom
+    inline = "You said: " + prior
+    assert without_support_echo(inline, [prior]) == inline
+    assert without_support_echo(mail, ["An unrelated previous support answer."]) == mail
+    history = {"messages": [{"direction": "outbound", "body_text": prior},
+                             {"direction": "inbound", "body_text": mail}]}
+    assert "Folders hold" not in controller._customer_text(history, mail)
+    class Model:
+        async def generate(self, **kw):
+            return SimpleNamespace(content=json.dumps({"kind": "acknowledgement", "evidence": thanks}))
+    state = controller.SupportState(thread_id="sim", customer_message=thanks, intent="bug")
+    await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "unit")
+    assert state.intent == "acknowledgement"
+
+
 @test("support_turn", "reported facts must quote customer text, not prior support claims")
 async def t_reported_quotes(_ctx: TestContext) -> None:
     source = "Toco no ícone e fecha antes de mostrar a tela. Uso a versão 1.4.11."

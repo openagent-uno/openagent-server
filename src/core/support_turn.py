@@ -14,18 +14,27 @@ from typing import Any
 
 KINDS = frozenset({
     "other", "signup", "password_recovery", "catalog_offline", "library_loss", "referral_status", "status_check", "bug",
+    "resolved_confirmation", "acknowledgement",
 })
 FIELDS = frozenset({"app_version", "device", "os", "platform", "steps", "observed", "expected"})
 
 READER_SYSTEM = """Read the customer's support conversation, not just topic words.
 Return JSON only:
-{"kind":"other|signup|password_recovery|catalog_offline|library_loss|referral_status|status_check|bug",
+{"kind":"other|signup|password_recovery|catalog_offline|library_loss|referral_status|status_check|bug|resolved_confirmation|acknowledgement",
  "evidence":"exact customer quote supporting the kind",
  "reported":{"app_version":"exact quote","device":"exact quote","os":"exact quote",
  "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote"}}
 Omit unknown fields; never infer a version, OS, account state or successful action.
 Quotes must occur literally in customer_text (not in prior_support). Keep them short.
 Read latest_message in context; an explicit change of topic wins over older history.
+resolved_confirmation means the latest message clearly says the reported problem
+now works, with no remaining problem or new question. 'I installed the update and
+now the music started normally' is confirmation, not a new playback malfunction.
+acknowledgement means only thanks, accepting instructions or waiting for our work;
+there is no question, new evidence or request. 'Thanks, I will try later' does NOT
+mean the problem is resolved. Never use either kind for a pending authorization,
+an answer to our diagnostic question, or a message reporting another problem.
+For these two kinds evidence MUST quote latest_message, never older history.
 signup means asking how to CREATE an account, not change credentials or recover one.
 password_recovery means asking how to reset a forgotten password or recover sign-in;
 it is self-service guidance, not a request to send support a new password.
