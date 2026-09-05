@@ -746,7 +746,8 @@ async def t_general_local_composer(_ctx: TestContext) -> None:
     # Asked for what is missing, and asked as a person: the old wording here
     # was the bare order "I need more detail about the behavior, device, and
     # app version."
-    assert "what you do in the app" in output["reply"].lower(), output
+    assert "?" in output["reply"], output
+    assert "app version" not in output["reply"].lower(), output
 
     known_result = await run(
         agent=SimpleNamespace(_mcp=pool, model=model),
@@ -764,8 +765,8 @@ async def t_general_local_composer(_ctx: TestContext) -> None:
     known_output = json.loads(known_result.text)
     known_reply = known_output["reply"].lower()
     assert known_output["outcome"] == "general_needs_detail", known_output
-    assert "already have" in known_reply, known_output
-    assert "what i am missing is the step" in known_reply, known_output
+    assert "already provided" in known_reply, known_output
+    assert "?" in known_reply and "app version" not in known_reply, known_output
 
     # The trailer rides on the FIRST message only. A customer who then writes
     # a bare follow-up - "have you fixed it?" - must still count as known, or
@@ -803,8 +804,8 @@ async def t_general_local_composer(_ctx: TestContext) -> None:
     followup_reply = json.loads(followup.text)["reply"].lower()
     # The "we already have it" branch, reached from the thread rather than
     # from this message: nothing is asked for a second time.
-    assert "ce li ho gi\u00e0" in followup_reply, followup_reply
-    assert "quello che mi manca \u00e8 il passaggio" in followup_reply, followup_reply
+    assert "già inviati" in followup_reply, followup_reply
+    assert "versione" not in followup_reply, followup_reply
 
 
 @test(
@@ -3610,7 +3611,10 @@ async def t_routing_evidence(_ctx: TestContext) -> None:
     from src.core import local_support_controller as lsc
 
     plain = lsc.SupportState(thread_id="t", customer_message="", channel="email")
-    assert lsc._routing_evidence(plain) == {"intent_source": "term"}
+    assert lsc._routing_evidence(plain) == {
+        "intent_source": "term", "delivery_state": "not_attempted",
+        "reply_source": "none", "turn_reader": "not_needed",
+    }
 
     routed = lsc.SupportState(thread_id="t", customer_message="", channel="email")
     routed.facts.update({

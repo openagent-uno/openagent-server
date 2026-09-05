@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from src.core import reply_guard, support_semantics, tool_trace
+from src.core import reply_guard, support_semantics, support_turn, tool_trace
 from src.core.dry_run import is_dry_run
 from src.core.execution_profile import (
     stateless_completion_scope,
@@ -206,6 +206,9 @@ class SupportState:
     # Everything this side already said on the thread, oldest first. Used to
     # refuse to send the same answer a second time in any language.
     prior_support_replies: list[str] = field(default_factory=list)
+    # A customer's report is not a verified product/account fact. Keep this
+    # separate from facts, which carries actual tool receipts to the composer.
+    reported_turn: support_turn.ReportedTurn | None = None
     # Everything the CUSTOMER has written on the thread, oldest first. The bug
     # evidence gates read this rather than the latest message alone: a report
     # becomes detailed over two or three messages, and judging only the last
@@ -1299,6 +1302,70 @@ async def _classify_with_model(
     return label if label in _MODEL_LABELS else "general"
 
 
+async def _read_reported_turn(
+    agent: Any, event: dict[str, Any], state: SupportState, session_id: str,
+) -> None:
+    """Read a complete request before a topic keyword can select a policy.
+
+    Only non-destructive support routes can be refined here. Money, deletion,
+    legal and explicit confirmations retain their independent authority gates.
+    """
+    if state.intent not in {"general", "offline", "bug", "feature_request", "account_change"}:
+        return
+    if os.environ.get("OPENAGENT_SUPPORT_TURN_READER", "1").lower() not in _TRUE:
+        return
+    model = getattr(agent, "model", None)
+    model_id = str(event.get("model") or "").strip()
+    if model_id and callable(getattr(model, "build_override_model", None)):
+        model = model.build_override_model(model_id)
+    if model is None or len(state.customer_message.strip()) < 8:
+        return
+    # Keep the latest message even on a long thread; _customer_text used to
+    # retain only the first 20k characters and discard the answer just given.
+    customer_text = (state.thread_customer_text or state.customer_message)[-16000:]
+    packet = {
+        "customer_text": customer_text,
+        "latest_message": state.customer_message[-4000:],
+        "prior_support": state.prior_support_replies[-3:],
+    }
+    token = set_tool_allowlist([])
+    try:
+        with strict_local_only_scope(True), stateless_completion_scope(True):
+            response = await _generate_support_model(
+                model, messages=[{"role": "user", "content": json.dumps(packet, ensure_ascii=False)}],
+                system=support_turn.READER_SYSTEM,
+                session_id=f"{session_id}:support-turn-reader",
+                timeout_env="OPENAGENT_SUPPORT_TURN_READER_TIMEOUT_SECONDS",
+            )
+        assessment = support_turn.read_reported_turn(
+            _extract_json(getattr(response, "content", "")), customer_text,
+        )
+    except Exception as exc:
+        state.facts["turn_reader"] = "unavailable"
+        elog("support_controller.turn_reader_failed", level="warning", error_type=type(exc).__name__)
+        return
+    finally:
+        reset_tool_allowlist(token)
+    if assessment is None:
+        state.facts["turn_reader"] = "invalid_evidence"
+        return
+    state.reported_turn = assessment
+    state.facts["turn_reader"] = "grounded"
+    # Other means no operational override, NOT that the thread is resolved.
+    route = {"signup": "account_signup", "password_recovery": "password_recovery",
+             "referral_status": "referral_status", "status_check": "status_check",
+             "library_loss": "bug", "bug": "bug"}.get(assessment.kind)
+    if route:
+        state.intent = route
+        state.facts["intent_source"] = "conversation_reader"
+    if assessment.kind == "library_loss":
+        state.instructions.append(
+            "The customer reports previously saved content disappearing. Do not answer "
+            "with catalog download availability, deny past downloads, or recommend "
+            "clearing data/reinstalling. Verify library/sync evidence first."
+        )
+
+
 def _attachment_text(result: Any) -> str:
     if isinstance(result, str):
         return result.strip()
@@ -1739,7 +1806,7 @@ def _customer_text(thread: Any, message: str, limit: int = 20000) -> str:
                     break
     if message and message.strip() and (not parts or parts[-1] != message.strip()):
         parts.append(message.strip())
-    return "\n".join(parts)[:limit]
+    return "\n".join(parts)[-limit:]
 
 
 def _support_replies(thread: Any, limit: int = 6) -> list[str]:
@@ -2829,10 +2896,17 @@ async def _already_reported(pool: Any, state: SupportState, task_id: str) -> boo
     return seen
 
 
+def _reported_bug_route(state: SupportState) -> tuple[str, str, str] | None:
+    if state.reported_turn and state.reported_turn.kind == "library_loss":
+        return ("Fix missing content in the library", _CLICKUP_LISTS["client"],
+                f"{state.tenant.component_prefix}/client-core")
+    return _bug_symptom_route(state.thread_customer_text or state.customer_message, state.tenant)
+
+
 def _new_bug_task_payload(state: SupportState) -> dict[str, Any] | None:
     """Build a canonical task only for deterministic, clearly routed symptoms."""
-    text = state.customer_message.strip()
-    route = _bug_symptom_route(text, state.tenant)
+    text = (state.thread_customer_text or state.customer_message).strip()
+    route = _reported_bug_route(state)
     if route is None:
         return None
     title, list_id, component_tag = route
@@ -3092,9 +3166,9 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
         return
     urgent = _is_urgent(state.customer_message)
     state.facts["urgent"] = urgent
-    missing = _bug_evidence_missing(
+    missing = support_turn.missing_bug_fields(_bug_evidence_missing(
         state.thread_customer_text or state.customer_message
-    )
+    ), state.reported_turn)
     if _provider_playlist_link_missing(
         state.thread_customer_text or state.customer_message
     ):
@@ -3127,9 +3201,13 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
             "reproduce the problem, and never say it is already fixed."
         )
         missing = []
-    route_from_report = _bug_symptom_route(state.customer_message, state.tenant)
+    route_from_report = _reported_bug_route(state)
     if missing:
         state.facts["missing_evidence"] = missing
+        state.instructions.append(
+            "Ask one focused question, only for the first missing evidence item. "
+            "Do not ask again for any quoted field in customer_reported."
+        )
     if missing and not urgent and route_from_report is None:
         state.decision = "ask_information"
         state.outcome = "bug_needs_evidence"
@@ -3163,7 +3241,8 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
     ):
         await _read_policy(pool, state, path)
 
-    query = _bug_query(state.customer_message)
+    report_text = state.thread_customer_text or state.customer_message
+    query = _bug_query(report_text)
     matches: list[dict[str, Any]] = []
     list_only = not _pick_tool(pool, "clickup", (
         "clickup_get_workspace_tasks", "get_workspace_tasks", "tasks_search",
@@ -3189,7 +3268,7 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
         parts = re.match(r"^(?:Fix|Investigate|Reproduce|Add)\s+(.*?)\s+in\s+(.*)$", title)
         candidate = _best_task_match(
             matches, parts.group(1) if parts else "",
-            parts.group(2) if parts else "", owning_list, state.customer_message,
+            parts.group(2) if parts else "", owning_list, report_text,
         )
         # An unfiltered list being nonempty does not mean this bug exists.
         # Only the same symptom AND surface enters the existing-task path.
@@ -3348,12 +3427,32 @@ def _missing_bug_evidence_suffix(state: SupportState, italian: bool) -> str:
             " Please send the original playlist link so we can reproduce the "
             "problem with the same list."
         )
-    joined = ", ".join(missing)
+    joined = _next_bug_question_field(state, italian)
     return (
         f" Per completare il task, inviami anche: {joined}."
         if italian else
         f" To complete the task, please also send: {joined}."
     )
+
+
+def _next_bug_question_field(state: SupportState, italian: bool) -> str:
+    missing = list(state.facts.get("missing_evidence") or [])
+    if not missing:
+        return ""
+    field = missing[0]
+    known = dict(state.facts.get("already_known_from_form") or {})
+    if state.reported_turn:
+        known.update(state.reported_turn.reported)
+    if field == "device and OS" and "device" in known:
+        field = "OS version"
+    labels = {
+        "app version": ("la versione dell’app", "the app version"),
+        "device and OS": ("il dispositivo e il sistema operativo", "the device and operating system"),
+        "OS version": ("la versione del sistema operativo", "the operating system version"),
+        "steps to reproduce and exact behavior": ("il passaggio che causa il problema e il risultato", "the step that triggers the problem and what happens"),
+        "source playlist link": ("il link originale della playlist", "the original playlist link"),
+    }
+    return labels.get(field, (field, field))[0 if italian else 1]
 
 
 def _fallback_reply(state: SupportState) -> str:
@@ -3524,6 +3623,47 @@ def _fallback_reply(state: SupportState) -> str:
             "La simulazione del rimborso dell’ultimo pagamento idoneo è riuscita; nessun movimento reale è stato eseguito."
             if italian else
             "The dry-run refund of the eligible latest payment succeeded; no real money movement occurred."
+        )
+    if state.outcome == "password_recovery_self_service":
+        return (
+            "Se accedi con email e password, usa il recupero password nella schermata "
+            "di accesso con l’email dell’account. Se usi Google, Apple o Facebook, "
+            "accedi con lo stesso servizio e account usati in precedenza. Non inviare la password al supporto."
+            if italian else
+            "If you sign in with email and password, use password recovery on the "
+            "sign-in screen with your account email. If you use Google, Apple or Facebook, "
+            "sign in with the same service and account you used before. Do not send your password to support."
+        )
+    if state.outcome == "account_signup_in_app":
+        return (
+            "Puoi creare l’account dalla schermata di registrazione nell’app. "
+            "Imposta la password soltanto lì: non inviarla al supporto."
+            if italian else
+            "You can create an account from the sign-up screen in the app. "
+            "Set your password only there; do not send it to support."
+        )
+    if state.outcome == "status_verification_human":
+        return (
+            "Non ho una verifica che il problema sia risolto nella versione "
+            "che stai usando. " + ("Ho passato la richiesta di aggiornamento a un collega."
+            if state.facts.get("human_handoff_confirmed") else "La verifica è ancora da completare.")
+            if italian else
+            "I do not have verification that the issue is fixed in the version "
+            "you are using. " + ("I have passed your status request to a colleague."
+            if state.facts.get("human_handoff_confirmed") else "That check is still needed.")
+        )
+    if state.outcome == "referral_verification_human":
+        handed = state.facts.get("human_handoff_confirmed")
+        return (
+            "La segnalazione riguarda un invito o premio che non compare. "
+            "Serve verificare la registrazione del codice e l’esito del premio. "
+            + ("Ho passato il caso a un collega per questa verifica." if handed else
+               "Non ho ancora una verifica dell’accredito.")
+            if italian else
+            "Your report concerns an invitation or reward that has not appeared. "
+            "The code registration and reward result need to be checked. "
+            + ("I have passed the case to a colleague for that check." if handed else
+               "I have not yet verified the reward.")
         )
     if state.outcome == "offline_explained":
         return (
@@ -3737,11 +3877,11 @@ def _fallback_reply(state: SupportState) -> str:
                 if italian else
                 "Thanks, those details are enough. To reproduce it I need a log or a short screen recording."
             )
-        missing = ", ".join(evidenze)
+        missing = _next_bug_question_field(state, italian)
         return (
-            f"Per verificare il problema, inviami: {missing}. Non aprirò un task finché non abbiamo evidenze sufficienti."
+            f"Per verificare il problema, inviami {missing}."
             if italian else
-            f"To investigate this accurately, please send: {missing}. I won’t claim or open a task until there is sufficient evidence."
+            f"To investigate this, please send {missing}."
         )
     if state.decision == "human":
         # Never the internal verdict. "This report requires specialist human
@@ -3781,24 +3921,14 @@ def _fallback_reply(state: SupportState) -> str:
     known = state.facts.get("already_known_from_form") or {}
     if known:
         return (
-            "Dispositivo, sistema operativo e versione dell’app ce li ho già, "
-            "grazie. Quello che mi manca è il passaggio: dimmi cosa fai "
-            "nell’app e cosa succede al posto di quello che ti aspetti, così "
-            "provo a riprodurlo."
+            "Grazie per i dettagli già inviati. Qual è il problema per cui vuoi aiuto?"
             if italian else
-            "I already have your device, OS and app version, thank you. What "
-            "I am missing is the step itself: tell me what you do in the app "
-            "and what happens instead of what you expect, and I will try to "
-            "reproduce it."
+            "Thanks for the details already provided. What issue would you like help with?"
         )
     return (
-        "Per capire cosa sta succedendo mi servirebbe qualche dettaglio in "
-        "più: cosa fai nell’app, cosa succede al posto di quello che ti "
-        "aspetti e, se ce l’hai sottomano, dispositivo e versione dell’app."
+        "Per quale problema o domanda sull’app vorresti aiuto?"
         if italian else
-        "To work out what is happening I need a little more: what you do in "
-        "the app, what happens instead of what you expect and, if you have "
-        "them to hand, your device and app version."
+        "What issue or question about the app would you like help with?"
     )
 
 
@@ -4348,7 +4478,7 @@ async def _compose_local(
         return await _fallback_in_language(
             agent, event, state, session_id, "deletion_policy",
         )
-    if state.outcome in {"ads_policy_explained", "offline_explained"}:
+    if state.outcome in {"ads_policy_explained", "offline_explained", "account_signup_in_app", "password_recovery_self_service", "referral_verification_human", "status_verification_human"}:
         # Product mechanics here are both factual and remotely configurable.
         # Measured in the operational dry-run: a composer given the verified
         # routes invented that a reward video grants "credits". Keep the
@@ -4398,6 +4528,7 @@ async def _compose_local(
         # back is what makes a reply read like someone read it.
         "customer_name": state.facts.get("customer_name") or "",
         "already_known": state.facts.get("already_known_from_form") or {},
+        "customer_reported": state.reported_turn.packet() if state.reported_turn else {},
         "decision": state.decision,
         "outcome": state.outcome,
         "verified_facts": state.facts,
@@ -4429,7 +4560,7 @@ async def _compose_local(
             "actually asked instead."
         )
     system = (
-        "You are the final eSound support reply composer. All routing and tools "
+        f"You are the final {state.tenant.display} support reply composer. All routing and tools "
         "were already handled by a deterministic controller. You have NO tools. "
         "WRITE LIKE A HELPFUL PERSON, not like a form. If customer_name is not "
         "empty, open by greeting them by that name; if it IS empty, never "
@@ -4451,7 +4582,10 @@ async def _compose_local(
         "in instructions exactly: they are the routed policy for this case. "
         "recent_exchange and thread_subject are context for reading a short "
         "message; they are NOT evidence and never license a new claim. "
-        "Use only verified_facts and successful_actions; never add a "
+        "customer_reported contains quoted customer statements, not verified "
+        "account state: acknowledge them as reports and never ask for those "
+        "same fields again. Use only verified_facts and successful_actions "
+        "for factual claims; never add a "
         "password request: passwords and authentication codes must never be "
         "collected in support chat, including a new password during signup. "
         "Never add a "
@@ -4521,6 +4655,32 @@ async def _compose_local(
         return await _fallback_in_language(
             agent, event, state, session_id, "guard",
         )
+    known = set(state.facts.get("already_known_from_form") or {})
+    if state.reported_turn:
+        known.update(state.reported_turn.reported)
+    repeated_fields = support_turn.requested_fields(reply) & known
+    if repeated_fields:
+        state.facts["question_repair"] = sorted(repeated_fields)
+        return await _fallback_in_language(
+            agent, event, state, session_id, "already_answered_fields",
+        )
+    if state.decision == "ask_information" and reply.count("?") > 1:
+        return await _fallback_in_language(
+            agent, event, state, session_id, "questionnaire",
+        )
+    route = _reported_bug_route(state) if state.intent == "bug" else None
+    if (state.reported_turn and state.reported_turn.kind == "library_loss") or (
+        route and "app startup" in route[0]
+    ):
+        if re.search(
+            r"\b(?:reinstall|uninstall|clear (?:the |your )?(?:data|storage)|"
+            r"nothing (?:is|will be) lost|won.t lose|no data (?:is|will be) lost|"
+            r"reinstall\w*|disinstall\w*|non perdi|n[aã]o perde)\b", reply, re.I,
+        ):
+            state.facts["recovery_advice_rejected"] = True
+            return await _fallback_in_language(
+                agent, event, state, session_id, "unverified_recovery",
+            )
     # The JSON label is a model claim too. A response labelled "nl" but
     # written in English must not pass merely because the label matches.
     actual_language = _language_hint(reply)
@@ -4716,8 +4876,17 @@ async def _record_action(
             "kind": kind, "success": False, "planned": True, "draft_rung": True,
         })
         return False
-    tool, result = await _call_first(pool, server, candidates, args)
+    try:
+        tool, result = await _call_first(pool, server, candidates, args)
+    except Exception as exc:
+        state.actions.append({"kind": kind, "success": False,
+                              "receipt": {"ok": False, "error_type": type(exc).__name__}})
+        return False
     success = _succeeded(result)
+    if kind == "customer_reply" and success:
+        objects = support_turn.receipt_objects(result)
+        success = any(x.get("sent") is True or x.get("simulated") or x.get("dryRun")
+                      for x in objects)
     state.actions.append({
         "kind": kind,
         "tool": tool,
@@ -4928,6 +5097,17 @@ async def _resolve_diagnostic_identity(
 
 
 async def _maybe_enable_bug_diagnostics(pool: Any, state: SupportState) -> None:
+    route = _reported_bug_route(state)
+    if route and "app startup" in route[0]:
+        state.facts["diagnostics_skipped"] = "native_startup_capture_required"
+        state.facts["required_capability"] = "native_startup_crash_read"
+        state.instructions.append(
+            "The app crashes before a usable screen. Do not ask for in-app "
+            "navigation, keeping the app open, reinstalling or clearing data. "
+            "A native startup crash report is needed; do not assert a root cause "
+            "or newer release without evidence."
+        )
+        return
     """Enable one receipt-backed capture for a hard-to-reproduce tracked bug.
 
     Diagnostics are never guessed and never enabled merely because a report is
@@ -5364,6 +5544,9 @@ def _routing_evidence(state: SupportState) -> dict[str, Any]:
     facts = state.facts
     evidence: dict[str, Any] = {
         "intent_source": str(facts.get("intent_source") or "term"),
+        "delivery_state": str(facts.get("delivery_state") or "not_attempted"),
+        "reply_source": str(facts.get("reply_source") or "none"),
+        "turn_reader": str(facts.get("turn_reader") or "not_needed"),
     }
     semantic = facts.get("intent_semantic")
     if isinstance(semantic, dict):
@@ -6004,6 +6187,7 @@ async def run(
                     # with an internal sentence. Read, explain, and stop at
                     # the mutation instead.
                     state.facts["money_execution_requires_human"] = True
+        await _read_reported_turn(agent, event, state, session_id)
         if state.facts.get("money_execution_requires_human"):
             # The label was inferred, not stated. The route may be served, but
             # nothing about their money may be asserted or spent on an
@@ -6189,6 +6373,37 @@ async def run(
                 )
             else:
                 await _delete_account(pool, state, sender_email)
+        elif state.intent == "status_check":
+            if state.linked_task_id:
+                _tool, task_read = await _call_first(
+                    pool, "clickup", ("clickup_get_task", "get_task"),
+                    {"task_id": state.linked_task_id}, required=False,
+                )
+                state.facts["status_task_read_succeeded"] = _succeeded(task_read)
+            state.decision = "human"
+            state.outcome = "status_verification_human"
+            state.human_reason = (
+                "Customer asks for status of the existing report. Verify task "
+                "and exact released artifact; do not restart troubleshooting "
+                "or treat a previous support promise as release proof."
+            )
+        elif state.intent == "password_recovery":
+            state.decision = "self_help"
+            state.outcome = "password_recovery_self_service"
+        elif state.intent == "account_signup":
+            state.decision = "self_help"
+            state.outcome = "account_signup_in_app"
+        elif state.intent == "referral_status":
+            # Premium status cannot prove an invitation was registered. A
+            # missing read capability is our work, not another UI questionnaire.
+            state.decision = "human"
+            state.outcome = "referral_verification_human"
+            state.facts["required_capability"] = "referral_status_read"
+            state.human_reason = (
+                "Verify referral code registration, invitation use, eligibility "
+                "and reward receipt. Account/Premium tools do not provide these "
+                "facts. Preserve the steps already in the thread."
+            )
         elif state.intent == "account_change":
             await _read_policy(
                 pool, state,
@@ -6847,6 +7062,19 @@ async def run(
         if retry_reply:
             await _apply_lifecycle(pool, state, retry_reply)
             reply = retry_reply
+    state.facts["delivery_state"] = support_turn.delivery_state(state.actions)
+    if state.facts["delivery_state"] in {"blocked", "held", "failed", "unknown"}:
+        # An uncertain transport result must never be retried blindly. Keep
+        # the case visible without saying the proposed reply reached anyone.
+        handed = await _record_action(
+            state, pool, "replio",
+            ("replio_threads_mark_for_human", "threads_mark_for_human"),
+            {"thread_id": state.thread_id,
+             "reason": "Support delivery not verified: " + state.facts["delivery_state"]
+                       + ". Review the held draft and receipts before resending."},
+            "delivery_handoff",
+        )
+        state.facts["delivery_handoff_confirmed"] = handed
     output = {
         "thread_id": state.thread_id,
         "outcome": state.outcome,
@@ -6856,6 +7084,7 @@ async def run(
         "actions": state.actions,
         "policy_paths": state.policy_paths,
         "facts": state.facts,
+        "customer_reported": state.reported_turn.packet() if state.reported_turn else {},
         "controller": "esound-local-v1",
         "local_only": True,
         "language": state.facts.get("language", "en"),
