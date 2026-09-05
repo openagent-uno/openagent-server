@@ -334,3 +334,16 @@ async def t_native_evidence_scope(_ctx: TestContext) -> None:
     assert await controller._read_support_evidence(pool,state,"release")
     assert state.decision != "resolved"
     assert "particular task's fix" in state.instructions[-1]
+
+@test("support_turn", "delivery diagnostics preserve only bounded operational labels")
+async def t_compact_delivery_receipt(_ctx: TestContext) -> None:
+    from src.core.support_delivery_receipts import summarize
+    actions=[{"kind":"customer_reply","success":False,"receipt":{"isError":True,"content":[{"type":"text","text":"HTTPException: 409: Thread changed; re-read thread_brief. private@example.test token=private-secret"}]}}]
+    result=summarize(actions)
+    assert result['state']=='failed' and result['http_status']==409
+    assert result['error_hints']==['newer_inbound']
+    assert 'private' not in json.dumps(result)
+    actions.append({'kind':'customer_reply','success':True,'receipt':{'sent':True,'body_text':'the customer says error, timeout and not found'}})
+    result=summarize(actions)
+    assert result['state']=='sent' and result['attempts']==2
+    assert 'error_hints' not in result and 'body_text' not in json.dumps(result)

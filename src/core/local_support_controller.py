@@ -7617,6 +7617,9 @@ async def run(
         else:
             state.facts["delivery_guard_no_progress"] = True
     state.facts["delivery_state"] = support_turn.delivery_state(state.actions)
+    from src.core import support_delivery_receipts
+    elog("support_controller.delivery_receipt", thread_id=state.thread_id,
+         **support_delivery_receipts.summarize(state.actions))
     if state.facts["delivery_state"] in {"blocked", "held", "failed", "unknown"}:
         # An uncertain transport result must never be retried blindly. Keep
         # the case visible without saying the proposed reply reached anyone.
