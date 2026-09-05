@@ -330,6 +330,34 @@ def _tool_functions(pool: Any, server: str) -> dict[str, Any]:
     }
 
 
+def _clickup_payload(value: Any) -> Any:
+    """Unwrap a single MCP JSON result without discarding an error envelope."""
+    for _ in range(6):
+        if isinstance(value, str):
+            value = _jsonable(value)
+            if isinstance(value, str):
+                return value
+            continue
+        if isinstance(value, dict):
+            if not _succeeded(value):
+                return value
+            structured = value.get("structuredContent") or value.get("structured_content")
+            if structured is not None:
+                value = structured
+                continue
+            content = value.get("content")
+            if isinstance(content, list) and len(content) == 1:
+                value = content
+                continue
+        if isinstance(value, list) and len(value) == 1:
+            item = value[0]
+            if isinstance(item, dict) and item.get("type") == "text":
+                value = item.get("text")
+                continue
+        return value
+    return value
+
+
 def _pick_tool(pool: Any, server: str, candidates: Iterable[str]) -> str | None:
     names = tuple(_tool_functions(pool, server))
     if not names:
@@ -397,7 +425,8 @@ async def _call_first(
             )
         return None, None
     actual_args = _adapt_args(pool, server, tool, args)
-    result = _jsonable(await _call_tool_impl(pool, server, tool, actual_args))
+    raw = await _call_tool_impl(pool, server, tool, actual_args)
+    result = _jsonable(_clickup_payload(raw) if server == "clickup" else raw)
     safe_args = {
         key: ("[redacted]" if "email" in key.lower() else value)
         for key, value in actual_args.items()
@@ -3136,7 +3165,13 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
 
     query = _bug_query(state.customer_message)
     matches: list[dict[str, Any]] = []
-    for list_id in _CLICKUP_LISTS.values():
+    list_only = not _pick_tool(pool, "clickup", (
+        "clickup_get_workspace_tasks", "get_workspace_tasks", "tasks_search",
+    ))
+    # The current server cannot filter by text. If the component is known,
+    # read its owning list rather than five unrelated complete lists.
+    list_ids = [route_from_report[1]] if list_only and route_from_report else _CLICKUP_LISTS.values()
+    for list_id in list_ids:
         try:
             candidates = await _search_bug_tasks(pool, list_id, query)
         except Exception as exc:
@@ -3149,6 +3184,16 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
             state.human_reason = "Cannot complete the bug-tracker read; preserve the report for manual triage."
             return
         matches.extend(candidates)
+    if list_only and route_from_report:
+        title, owning_list, _ = route_from_report
+        parts = re.match(r"^(?:Fix|Investigate|Reproduce|Add)\s+(.*?)\s+in\s+(.*)$", title)
+        candidate = _best_task_match(
+            matches, parts.group(1) if parts else "",
+            parts.group(2) if parts else "", owning_list, state.customer_message,
+        )
+        # An unfiltered list being nonempty does not mean this bug exists.
+        # Only the same symptom AND surface enters the existing-task path.
+        matches = [candidate] if candidate else []
     if not matches:
         # The code-derived feature index is the minimum repository grounding
         # for deterministic component routing. Unknown symptom shapes still

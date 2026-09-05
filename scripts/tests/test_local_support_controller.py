@@ -3739,3 +3739,46 @@ async def t_clickup_outage_handoff(_ctx: TestContext) -> None:
     assert state.decision == "human"
     assert "manual triage" in state.human_reason
     assert not any("Ask for diagnostics" in instruction for instruction in state.instructions)
+
+
+@test("local_support_controller", "ClickUp MCP envelopes retain tasks, pagination and errors")
+async def t_clickup_real_envelopes(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    body = {"tasks": [{"id": "one"}], "last_page": True}
+    wrapped = {"content": [{"type": "text", "text": json.dumps(body)}], "isError": False}
+    assert lsc._clickup_payload(wrapped) == body
+    failed = {**wrapped, "isError": True}
+    assert lsc._clickup_payload(failed) == failed
+    async def get_tasks(**kwargs):
+        return wrapped
+    pool = _Pool({"clickup": _Toolkit({"clickup_get_tasks": get_tasks})})
+    assert await lsc._search_bug_tasks(pool, "list", "crash") == [{"id": "one"}]
+    async def get_error(**kwargs):
+        return failed
+    pool = _Pool({"clickup": _Toolkit({"clickup_get_tasks": get_error})})
+    assert await lsc._search_bug_tasks(pool, "list", "crash") is None
+
+
+@test("local_support_controller", "unfiltered ClickUp lists do not suppress new grounded bugs")
+async def t_clickup_unfiltered_new_bug(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    doubles = _Doubles()
+    pool = doubles.pool()
+    toolkit = pool._toolkit_by_name["clickup"]
+    del toolkit.functions["clickup_get_workspace_tasks"]
+    reads = []
+    async def get_tasks(list_id, include_closed, page):
+        reads.append(list_id)
+        return {"content": [{"type": "text", "text": json.dumps({"tasks": [{"id": "unrelated", "name": "Fix folder sorting", "list": {"id": list_id}}], "last_page": True})}]}
+    toolkit.functions["clickup_get_tasks"] = SimpleNamespace(entrypoint=get_tasks, parameters={"properties": {"list_id": {}, "include_closed": {}, "page": {}}})
+    state = lsc.SupportState(thread_id="fixture", customer_message="The app crashes on startup on Samsung S21 Android 15 app 1.4.11", tenant=lsc._TENANTS["lyra"])
+    previous = os.environ.get(lsc._WRITES_ENV)
+    os.environ[lsc._WRITES_ENV] = "1"
+    try:
+        await lsc._route_bug(pool, state)
+    finally:
+        if previous is None: os.environ.pop(lsc._WRITES_ENV, None)
+        else: os.environ[lsc._WRITES_ENV] = previous
+    assert reads == [lsc._CLICKUP_LISTS["lyra"]], reads
+    assert state.outcome == "bug_created", (state.outcome, state.facts)
+    assert "clickup_create_task" in doubles.names
