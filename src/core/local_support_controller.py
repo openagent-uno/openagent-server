@@ -2779,7 +2779,7 @@ _BUG_SYMPTOMS: tuple[tuple[str, str], ...] = (
      r"n[ãa]o consigo|n[ãa]o me deixa|"
      r"je n'?arrive pas|impossible de|"
      r"kann nicht|lasst mich nicht", "blocked action"),
-    (r"stops? (?:playing|after)|stopped playing|si ferma|si interrompe|"
+    (r"stops? (?:playing|after)|stopped playing|si ferm\w*|si interromp\w*|"
      r"se detiene|para de (?:tocar|reproduzir)|s'arr[êe]te", "playback stopping"),
 )
 
@@ -2811,7 +2811,7 @@ _BUG_SURFACES: tuple[tuple[str, str, str, str], ...] = (
     # An incidental playlist mention must not steal a playback failure. A live
     # PC report said songs outside a playlist were unable to play and rapidly
     # skipped; the generic playlist row filed it under library ownership.
-    (r"unable to play|can'?t play|won'?t play|not playing|play(?:ing)? (?:a )?(?:song|track)|"
+    (r"unable to play|can'?t play|won'?t play|not playing|riproduzione|play(?:ing)? (?:a )?(?:song|track)|"
      r"skip(?:s|ping)? (?:songs?|tracks?)|riprodurre (?:un )?(?:brano|canzone)",
      "playback", "client", "esound/client-core"),
     (r"playlist|library|folder|libreria|cartell", "the library", "client", "esound/client-core"),
@@ -3010,7 +3010,7 @@ def _task_shares_subject(task: Any, message: str) -> int:
 
 def _best_task_match(
     matches: list[dict[str, Any]], symptom: str, noun: str, list_id: str,
-    message: str = "",
+    message: str = "", tenant: Tenant | None = None,
 ) -> dict[str, Any] | None:
     """The single best-scoring candidate, or nothing if none is convincing."""
     scored = [
@@ -3023,6 +3023,7 @@ def _best_task_match(
             task,
         )
         for index, task in enumerate(matches)
+        if tenant is None or not _task_is_other_product(task, tenant)
     ]
     # A symptom hit alone is not enough, nor is a component hit alone: both
     # halves had to match for us to route it, so both must match to dedup it.
@@ -3031,6 +3032,23 @@ def _best_task_match(
         return None
     viable.sort(key=lambda row: (-row[0], row[1]))
     return viable[0][2]
+
+
+def _task_is_other_product(task: dict[str, Any], tenant: Tenant) -> bool:
+    """A shared component/list is not proof that two products have one bug.
+
+    Use the task's declared scope, not comments (which may already contain a
+    mistakenly linked report). Explicit multi-product tasks remain eligible.
+    """
+    scope = " ".join(str(task.get(key) or "") for key in (
+        "product", "name", "title", "description", "text_content",
+    ))
+    tags = task.get("tags") or []
+    scope += " " + " ".join(
+        str(tag.get("name") or "") if isinstance(tag, dict) else str(tag)
+        for tag in tags
+    )
+    return _is_other_brand(scope, tenant=tenant)
 
 
 def _source_marker(state: SupportState) -> str:
@@ -3077,6 +3095,17 @@ def _reported_bug_route(state: SupportState) -> tuple[str, str, str] | None:
 
 def _bug_report_text(state: SupportState) -> str:
     text = state.thread_customer_text or state.customer_message
+    # A follow-up can introduce a different actionable defect after recovery.
+    # Keep device metadata from the thread, without routing the new report by
+    # the older (now resolved) symptom. Short contextual follow-ups still need
+    # the full history when they cannot name a defect on their own.
+    if _bug_symptom_route(state.customer_message, state.tenant):
+        text = state.customer_message
+        fields = _form_fields(state.thread_customer_text)
+        fields.update(state.facts.get("already_known_from_form") or {})
+        fields.update(_form_fields(state.customer_message))
+        if fields:
+            text += "\n" + "\n".join(f"{key}: {value}" for key, value in fields.items())
     if state.attachment_visible_text:
         text += "\nText read from attachment (verify before diagnosis):\n" + state.attachment_visible_text
     return text
@@ -3111,6 +3140,10 @@ def _new_bug_task_payload(state: SupportState) -> dict[str, Any] | None:
     )
     os_value = os_match.group(0) if os_match else "unknown"
     device = device_match.group(0).strip(" ,.;") if device_match else "unknown"
+    fields = _form_fields(text)
+    version = fields.get("app_version") or fields.get("native_version") or version
+    device = fields.get("device") or device
+    os_value = fields.get("os") or fields.get("platform") or os_value
     # Severity follows the symptom, not the template. Stamping "urgent" on
     # every task is the same as stamping none: the queue stops reading it.
     severity = _bug_severity(symptom, bool(state.facts.get("urgent")))
@@ -3441,13 +3474,13 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
             state.outcome = "clickup_unavailable"
             state.human_reason = "Cannot complete the bug-tracker read; preserve the report for manual triage."
             return
-        matches.extend(candidates)
+        matches.extend(task for task in candidates if not _task_is_other_product(task, state.tenant))
     if list_only and route_from_report:
         title, owning_list, _ = route_from_report
         parts = re.match(r"^(?:Fix|Investigate|Reproduce|Add)\s+(.*?)\s+in\s+(.*)$", title)
         candidate = _best_task_match(
             matches, parts.group(1) if parts else "",
-            parts.group(2) if parts else "", owning_list, report_text,
+            parts.group(2) if parts else "", owning_list, report_text, state.tenant,
         )
         # An unfiltered list being nonempty does not mean this bug exists.
         # Only the same symptom AND surface enters the existing-task path.
@@ -3499,7 +3532,7 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
         return
 
     # Judge the candidates against the route instead of trusting search order.
-    routed = _bug_symptom_route(state.customer_message, state.tenant)
+    routed = route_from_report
     routed_title, routed_list = (routed[0], routed[1]) if routed else ("", "")
     parts = re.match(
         r"^(?:Fix|Investigate|Reproduce|Add)\s+(.*?)\s+in\s+(.*)$", routed_title,
@@ -3509,7 +3542,8 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
         parts.group(1) if parts else "",
         parts.group(2) if parts else "",
         routed_list,
-        state.customer_message,
+        report_text,
+        state.tenant,
     )
     if task is None:
         state.facts["dedup_rejected_matches"] = len(matches)
@@ -3595,7 +3629,7 @@ def _diagnostic_reply_suffix(state: SupportState, italian: bool) -> str:
 
 def _missing_bug_evidence_suffix(state: SupportState, italian: bool) -> str:
     """Ask for metadata that can enrich an already tracked partial report."""
-    missing = [str(item) for item in (state.facts.get("missing_evidence") or []) if item]
+    missing = _unknown_bug_evidence(state)
     if not missing:
         return ""
     if missing == ["source playlist link"]:
@@ -3608,14 +3642,14 @@ def _missing_bug_evidence_suffix(state: SupportState, italian: bool) -> str:
         )
     joined = _next_bug_question_field(state, italian)
     return (
-        f" Per completare il task, inviami anche: {joined}."
+        f" Per approfondire, inviami anche {joined}."
         if italian else
-        f" To complete the task, please also send: {joined}."
+        f" To investigate further, please also send {joined}."
     )
 
 
 def _next_bug_question_field(state: SupportState, italian: bool) -> str:
-    missing = list(state.facts.get("missing_evidence") or [])
+    missing = _unknown_bug_evidence(state)
     if not missing:
         return ""
     field = missing[0]
@@ -3632,6 +3666,30 @@ def _next_bug_question_field(state: SupportState, italian: bool) -> str:
         "source playlist link": ("il link originale della playlist", "the original playlist link"),
     }
     return labels.get(field, (field, field))[0 if italian else 1]
+
+
+def _unknown_bug_evidence(state: SupportState) -> list[str]:
+    """Do not let an older evidence verdict re-request known metadata."""
+    missing = list(state.facts.get("missing_evidence") or [])
+    known = _form_fields(state.thread_customer_text)
+    known.update(state.facts.get("already_known_from_form") or {})
+    if state.reported_turn:
+        known.update(state.reported_turn.reported)
+    if known.get("app_version") or known.get("native_version"):
+        missing = [item for item in missing if item != "app version"]
+    if known.get("device") and (known.get("os") or known.get("platform")):
+        missing = [item for item in missing if item != "device and OS"]
+    return missing
+
+
+def _unverified_recovery_advice(reply: str) -> bool:
+    return bool(re.search(
+        r"\b(?:reinstall\w*|uninstall\w*|clear (?:the |your )?(?:data|storage)|"
+        r"nothing (?:is|was|will be) lost|(?:you )?(?:haven.t|have not) lost (?:anything|any data)|"
+        r"won.t lose|no data (?:is|was|will be) lost|"
+        r"disinstall\w*|non perdi|non (?:hai|avete) perso (?:nulla|niente)|"
+        r"n[aã]o perde|no has perdido nada)\b", reply, re.I,
+    ))
 
 
 def _fallback_reply(state: SupportState) -> str:
@@ -4002,9 +4060,9 @@ def _fallback_reply(state: SupportState) -> str:
                 )
             else:
                 base = (
-                    f"Ho aperto e collegato il task {task_id} con le tue evidenze. Non posso ancora indicare tempi di rilascio."
+                    "Ho registrato il problema con i dettagli che ci hai fornito. Non posso ancora indicare tempi di risoluzione."
                     if italian else
-                    f"I opened and linked task {task_id} with your evidence. I can’t give a release date yet."
+                    "I recorded the issue with the details you provided. I can’t give a resolution date yet."
                 )
             return (
                 base
@@ -4045,9 +4103,9 @@ def _fallback_reply(state: SupportState) -> str:
                 )
             else:
                 base = (
-                    f"Ho aggiunto le nuove evidenze al task esistente {task_id} e collegato questa segnalazione."
+                    "Ho aggiunto i dettagli della tua segnalazione al problema già tracciato."
                     if italian else
-                    f"I added the new evidence to existing task {task_id} and linked this report."
+                    "I added the details from your report to the issue already being tracked."
                 )
             return (
                 base
@@ -4061,7 +4119,7 @@ def _fallback_reply(state: SupportState) -> str:
         # `app_version=3.0.9` nel modulo si e' sentito chiedere la versione.
         # Se non manca nulla la richiesta non ha oggetto: si chiede il materiale
         # che serve DAVVERO per riprodurre, come fa il ramo `bug_no_grounded_match`.
-        evidenze = [e for e in (state.facts.get("missing_evidence") or []) if e]
+        evidenze = _unknown_bug_evidence(state)
         if not evidenze:
             return (
                 "Grazie, le informazioni ci sono. Per riprodurlo mi servono un log o una breve registrazione dello schermo."
@@ -4885,13 +4943,9 @@ async def _compose_local(
         )
     route = _reported_bug_route(state) if state.intent == "bug" else None
     if (state.reported_turn and state.reported_turn.kind == "library_loss") or (
-        route and "app startup" in route[0]
+        route and ("app startup" in route[0] or "missing content" in route[0])
     ):
-        if re.search(
-            r"\b(?:reinstall|uninstall|clear (?:the |your )?(?:data|storage)|"
-            r"nothing (?:is|will be) lost|won.t lose|no data (?:is|will be) lost|"
-            r"reinstall\w*|disinstall\w*|non perdi|n[aã]o perde)\b", reply, re.I,
-        ):
+        if _unverified_recovery_advice(reply):
             state.facts["recovery_advice_rejected"] = True
             return await _fallback_in_language(
                 agent, event, state, session_id, "unverified_recovery",

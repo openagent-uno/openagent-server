@@ -3896,3 +3896,59 @@ async def t_billing_enrichment_conflict(_ctx: TestContext) -> None:
             "billingbear_get_v1_customers_by_appUserId": customer})})
         got = await _billing_lookup(pool, "", "listener@example.com")
         assert _customer_lookup_state(got)[0] is (True if not full else None), got
+
+
+@test("local_support_controller", "playback follow-up keeps metadata without inheriting resolved library symptom")
+async def t_playback_followup_after_library_recovery(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    initial = "Gli album sono spariti dalla libreria.\napp_version: 1.4.11\ndevice: Redmi test\nos: Android 16\nplatform: android"
+    latest = "Un altro problema: dopo due o tre brani la riproduzione si fermasse e devo premere play manualmente."
+    state = lsc.SupportState(thread_id="fixture", customer_message=latest,
+        thread_customer_text=initial + "\nLa reinstallazione ha risolto.\n" + latest,
+        tenant=lsc._TENANTS["lyra"])
+    payload = lsc._new_bug_task_payload(state)
+    assert payload and payload["name"] == "Fix playback stopping in playback", payload
+    assert "Redmi test" in payload["description"] and "Android 16" in payload["description"]
+    assert "1.4.11" in payload["description"] and "spariti" not in payload["description"]
+    state.facts["missing_evidence"] = ["app version", "device and OS"]
+    assert lsc._missing_bug_evidence_suffix(state, True) == ""
+
+
+@test("local_support_controller", "same playback title cannot merge an explicitly different product")
+async def t_dedup_product_scope(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    wrong = {"id": "other", "name": "Fix playback stopping in playback",
+             "description": "Customer reports playback stopping on eSound.",
+             "comments": [{"text": "Lyra report was mistakenly linked"}]}
+    tenant = lsc._TENANTS["lyra"]
+    match = lambda items: lsc._best_task_match(items, "playback stopping", "playback", "core", "playback stops", tenant)
+    assert match([wrong]) is None
+    tagged = {"id": "tagged", "name": wrong["name"], "tags": [{"name": "esound"}]}
+    assert match([tagged]) is None
+    shared = {**wrong, "id": "shared", "description": "Verified in both eSound and Lyra."}
+    assert match([wrong, shared]) == shared
+    own = {**wrong, "id": "own", "description": "Lyra playback stops after two tracks."}
+    assert match([wrong, own]) == own
+
+
+@test("local_support_controller", "live bug receipts produce customer wording without internal ids")
+async def t_live_bug_reply_without_tracker_id(_ctx: TestContext) -> None:
+    from unittest.mock import patch
+    from src.core import local_support_controller as lsc
+    for language in ("it", "en"):
+        for outcome in ("bug_created", "bug_deduplicated"):
+            state = lsc.SupportState(thread_id="fixture", customer_message="Playback stops", outcome=outcome)
+            state.facts = {"language": language, "clickup_task": {"id": "private-tracker-id"},
+                           "diagnostic_capture": {"category": "playback"}}
+            with patch.object(lsc, "is_dry_run", return_value=False):
+                reply = lsc._fallback_reply(state)
+            assert "private-tracker-id" not in reply and "task" not in reply, reply
+            assert "diagnostic" in reply and ("30" in reply or "trentina" in reply), reply
+
+
+@test("local_support_controller", "library recovery cannot guarantee that nothing was lost")
+async def t_library_loss_guarantees(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import _unverified_recovery_advice
+    for text in ("Non hai perso nulla.", "Non avete perso niente.", "You haven't lost anything.", "Nothing was lost.", "No has perdido nada."):
+        assert _unverified_recovery_advice(text), text
+    assert not _unverified_recovery_advice("Non posso ancora confermare la causa. Controlliamo la libreria.")
