@@ -266,7 +266,9 @@ async def t_native_evidence_scope(_ctx: TestContext) -> None:
     state=controller.SupportState(thread_id="synthetic",customer_message="crashes at startup",tenant=controller._TENANTS["lyra"])
     assert not await controller._read_support_evidence(pool,state,"native_crash")
     assert not calls
-    state.facts["already_known_from_form"]={"package":"com.fixture","platform":"Android 15","native_version":"1.4.13 (71)"}
+    # The controller's compact known-fields packet deliberately omits package.
+    state.thread_customer_text = "The app crashes.\n---\npackage: com.fixture\nplatform: android"
+    state.facts["already_known_from_form"]={"platform":"Android 15","native_version":"1.4.13 (71)"}
     got=await controller._read_support_evidence(pool,state,"native_crash")
     assert got["individualCustomerMatch"] is False
     assert calls[-1]=={"packageName":"com.fixture","platform":"android","version":"1.4.13","build":"71","days":7}

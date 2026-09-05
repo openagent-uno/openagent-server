@@ -5409,7 +5409,8 @@ async def _read_referral_status(pool: Any, state: SupportState) -> dict[str, Any
 
 async def _read_support_evidence(pool: Any, state: SupportState, kind: str) -> dict[str, Any]:
     """Read app-scoped evidence; missing metadata never selects a default app."""
-    fields = state.facts.get("already_known_from_form") or _form_fields(state.thread_customer_text or state.customer_message)
+    fields = _form_fields(state.thread_customer_text or state.customer_message)
+    fields.update(state.facts.get("already_known_from_form") or {})
     package = str(fields.get("package") or "").strip()
     raw_platform = str(fields.get("platform") or fields.get("os") or "").strip().lower()
     platform = "android" if raw_platform.startswith("android") else "ios" if raw_platform.startswith(("ios", "ipados")) else ""
