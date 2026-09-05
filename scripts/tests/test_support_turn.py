@@ -55,6 +55,22 @@ async def t_unmarked_support_echo(_ctx: TestContext) -> None:
     assert state.intent == "acknowledgement"
 
 
+@test("support_turn", "lifecycle uses the guarded close and reasoned human queue APIs")
+async def t_lifecycle_reserved_fields(_ctx: TestContext) -> None:
+    doubles = _Doubles()
+    with patch.dict(os.environ, {"OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES": "1"}):
+        state = controller.SupportState(thread_id="sim", customer_message="It works now",
+            intent="resolved_confirmation", outcome="resolved_confirmation", decision="noop")
+        await controller._apply_lifecycle(doubles.pool(), state, "")
+        assert doubles.args_for("replio_threads_patch")[-1]["patch"] == {"status": "closed"}
+        state = controller.SupportState(thread_id="sim", customer_message="Still broken",
+            intent="bug", decision="human", human_reason="The prior advice failed and needs technical investigation")
+        assert await controller._queue_for_human(doubles.pool(), state)
+        assert doubles.args_for("replio_threads_mark_for_human")
+        assert all("waiting_for_team" not in call["patch"] for call in doubles.args_for("replio_threads_patch"))
+        assert all("needs-human" not in call.get("tags", []) for call in doubles.args_for("replio_threads_tags_add"))
+
+
 @test("support_turn", "reported facts must quote customer text, not prior support claims")
 async def t_reported_quotes(_ctx: TestContext) -> None:
     source = "Toco no ícone e fecha antes de mostrar a tela. Uso a versão 1.4.11."

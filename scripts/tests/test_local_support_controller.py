@@ -1232,7 +1232,7 @@ async def t_resolved_confirmation(_ctx: TestContext) -> None:
     assert "replio_threads_mark_for_human" not in doubles.names, doubles.names
     assert doubles.args_for("replio_threads_tags_add")[0]["tags"] == ["resolved"]
     assert doubles.args_for("replio_threads_patch")[0]["patch"] == {
-        "waiting_for_team": False, "status": "closed",
+        "status": "closed",
     }
     # "thanks, but it still fails" is not a resolution.
     from src.core.local_support_controller import _resolved_confirmation
@@ -1403,8 +1403,10 @@ def _assert_human_tags(doubles: _Doubles, *expected: str) -> None:
     filtered on it.
     """
     tags = set(doubles_tags(doubles))
-    missing = {*expected, "team-decision", "needs-human"} - tags
+    missing = {*expected, "team-decision"} - tags
     assert not missing, (missing, tags)
+    assert "needs-human" not in tags  # reserved, owned by the handoff endpoint
+    assert doubles.args_for("replio_threads_mark_for_human")
 
 
 @test("local_support_controller", "only eSound's own tenant reaches the deletion tool")
@@ -1558,7 +1560,7 @@ async def t_bug_create_and_link(_ctx: TestContext) -> None:
     assert {"task_create", "task_link", "task_link_verify"} <= kinds, output["actions"]
     # A tracked bug leaves the thread open for the fix, it does not close it.
     patches = [args["patch"] for args in doubles.args_for("replio_threads_patch")]
-    assert {"waiting_for_team": False, "status": "open"} in patches, patches
+    assert {"status": "open"} in patches, patches
     assert "86-new-esound" in output["reply"], output["reply"]
     assert "release" not in output["reply"].lower() or "can’t" in output["reply"], output["reply"]
 
@@ -2907,7 +2909,7 @@ async def t_terminal_outcomes_are_closed(_ctx: TestContext) -> None:
             )).text)
             assert output["outcome"] == outcome, (message, output["outcome"])
             patches = [a["patch"] for a in doubles.args_for("replio_threads_patch")]
-            assert {"waiting_for_team": False, "status": "closed"} in patches, (
+            assert {"status": "closed"} in patches, (
                 message, patches
             )
             assert "replio_threads_respond" not in doubles.names, message
@@ -3225,12 +3227,10 @@ async def t_handoff_precedes_reply(_ctx: TestContext) -> None:
         # thread has to be the one that queues it again.
         requeues = [
             index for index, name in enumerate(names)
-            if name == "replio_threads_patch"
+            if name == "replio_threads_mark_for_human"
         ]
         assert requeues and requeues[-1] > respond, names
-        assert doubles.args_for("replio_threads_patch")[-1]["patch"][
-            "waiting_for_team"
-        ] is True, doubles.args_for("replio_threads_patch")
+        assert doubles.args_for("replio_threads_mark_for_human")[-1]["reason"]
     finally:
         if previous is None:
             os.environ.pop(lsc._WRITES_ENV, None)

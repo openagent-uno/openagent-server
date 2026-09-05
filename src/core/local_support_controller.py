@@ -5940,7 +5940,8 @@ async def _queue_for_human(pool: Any, state: SupportState) -> bool:
             action.get("kind") == "human_handoff" and action.get("success")
             for action in state.actions
         )
-    tags = ["team-decision", "needs-human"]
+    # Replio's reasoned handoff owns needs-human and queue state atomically.
+    tags = ["team-decision"]
     if state.intent == "security_legal":
         tags.insert(0, "security")
     elif state.intent in {"account_delete", "account_change"}:
@@ -5956,17 +5957,6 @@ async def _queue_for_human(pool: Any, state: SupportState) -> bool:
         {"thread_id": state.thread_id, "reason": state.human_reason},
         "human_handoff",
     )
-    if handed:
-        # mark_for_human sets status=closed + waiting_for_team=false, so
-        # without this the case vanishes from the human queue entirely.
-        await _record_action(
-            state, pool, "replio", ("replio_threads_patch", "threads_patch"),
-            {"thread_id": state.thread_id,
-             "patch": {"status": "open", "waiting_for_team": True}},
-            "thread_patch",
-        )
-        # A patch can clear the tag array as a side effect, so re-apply.
-        await _record_tags(state, pool, tags)
     return bool(handed)
 
 
@@ -5979,7 +5969,7 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         if os.environ.get(
             "OPENAGENT_LEGAL_ESCALATE", "1",
         ).strip().lower() in _TRUE:
-            await _record_tags(state, pool, ["legal", "needs-human"])
+            await _record_tags(state, pool, ["legal"])
             handed = await _record_action(
                 state, pool, "replio",
                 ("replio_threads_mark_for_human", "threads_mark_for_human"),
@@ -5987,14 +5977,6 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
                  "reason": "legal/copyright/investment: owner answers directly"},
                 "human_handoff",
             )
-            if handed:
-                await _record_action(
-                    state, pool, "replio", ("replio_threads_patch", "threads_patch"),
-                    {"thread_id": state.thread_id,
-                     "patch": {"status": "open", "waiting_for_team": True}},
-                    "thread_patch",
-                )
-                await _record_tags(state, pool, ["legal", "needs-human"])
         return
     if state.outcome in _TERMINAL_NO_REPLY:
         # Every terminal verdict must be EXECUTED in the same turn. A decision
@@ -6005,7 +5987,7 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         await _record_action(
             state, pool, "replio", ("replio_threads_patch", "threads_patch"),
             {"thread_id": state.thread_id,
-             "patch": {"waiting_for_team": False, "status": "closed"}},
+             "patch": {"status": "closed"}},
             "thread_patch",
         )
         return
@@ -6037,10 +6019,9 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
             # the flag at send time - so the flag has to be put back
             # afterwards or the case silently leaves the human queue.
             await _record_action(
-                state, pool, "replio", ("replio_threads_patch", "threads_patch"),
-                {"thread_id": state.thread_id,
-                 "patch": {"status": "open", "waiting_for_team": True}},
-                "thread_patch",
+                state, pool, "replio", ("replio_threads_mark_for_human", "threads_mark_for_human"),
+                {"thread_id": state.thread_id, "reason": state.human_reason},
+                "human_handoff_restore",
             )
         return
 
@@ -6074,17 +6055,17 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
             await _record_action(
                 state, pool, "replio", ("replio_threads_patch", "threads_patch"),
                 {"thread_id": state.thread_id,
-                 "patch": {"waiting_for_team": False, "status": "closed"}},
+                 "patch": {"status": "closed"}},
                 "thread_patch",
             )
         return
     if state.decision == "ask_information":
         await _record_tags(state, pool, ["awaiting-user"])
-        patch = {"waiting_for_team": False, "status": "open"}
+        patch = {"status": "open"}
     elif state.decision in {"bug_existing_task", "bug_new_task"}:
-        patch = {"waiting_for_team": False, "status": "open"}
+        patch = {"status": "open"}
     else:
-        patch = {"waiting_for_team": False, "status": "closed"}
+        patch = {"status": "closed"}
     # A thread a human was already queued on stays queued. Answering it is
     # not the same as doing what the queue was for, and clearing the flag on
     # the way out deleted the case from the human view: measured 31-Aug-2026,
@@ -6095,7 +6076,6 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         state.facts.get("arrived_waiting_for_team")
         and state.decision != "execute_mutation"
     ):
-        patch.pop("waiting_for_team", None)
         patch["status"] = "open"
         state.facts["kept_waiting_for_team"] = True
     await _record_action(
