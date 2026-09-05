@@ -42,6 +42,24 @@ class Case:
 
 
 CASES = (
+    Case("resolved-playback-it", "esound", (
+         ("inbound", "La musica non parte nell'app desktop."),
+         ("outbound", "Installa l'ultima versione e prova una canzone."),
+         ("inbound", "Buongiorno, ho disinstallato la vecchia versione e installato l'ultima, ora la musica è partita")),
+         "resolved_confirmation", "resolved_confirmation", must_not_call=("replio_threads_respond", "clickup_create_task"),
+         expected_outcome="resolved_confirmation"),
+    Case("resolved-correction-it", "esound", (
+         ("inbound", "Ora la musica è partita."),
+         ("outbound", "Quale dispositivo e versione dell'app usi?"),
+         ("inbound", "Ho detto che ora l'app desktop funziona perfettamente, la musica è partita regolarmente")),
+         "resolved_confirmation", "resolved_confirmation", must_not_call=("replio_threads_respond", "clickup_create_task"),
+         expected_outcome="resolved_confirmation"),
+    Case("thanks-with-unmarked-quote", "esound", (
+         ("inbound", "My folders are empty when I try adding songs."),
+         ("outbound", "Folders hold playlists and albums, not individual songs. Put the songs into a playlist first, then move that playlist into the folder."),
+         ("inbound", "So many thanks!\nI will follow your instructions later.\nCheers\n\nFolders hold playlists and albums, not individual songs. Put the songs into a playlist first, then move that playlist into the folder.")),
+         "acknowledgement", "acknowledgement", must_not_call=("replio_threads_respond", "clickup_create_task"),
+         expected_outcome="acknowledgement_no_reply_needed"),
     Case("log-explanation-followup-it", "esound", (
          ("inbound", "La riproduzione si blocca su Android 15, versione 5.2.4, Samsung S21."),
          ("outbound", "Mandaci un log o una registrazione dello schermo."),
@@ -205,7 +223,7 @@ async def replay(command: list[str], selected: list[Case], repeat: int) -> dict[
                         agent=SimpleNamespace(_mcp=doubles.pool(), model=model),
                         event={"slug": "replio-thread"},
                         payload={"payload": {"thread_id": "sim-" + case.id, "product": case.product,
-                            "channel_kind": "email", "message": {"body_text": case.turns[-1][1],
+                            "channel_kind": "email_imap", "message": {"body_text": case.turns[-1][1],
                             **({"attachments": [{"name": case.image_fixture}]} if case.image_fixture else {})}}},
                         session_id=f"replay:{case.id}:{iteration}", delivery_id="simulated",
                     )

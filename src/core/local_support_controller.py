@@ -1347,7 +1347,9 @@ async def _read_reported_turn(
     Only non-destructive support routes can be refined here. Money, deletion,
     legal and explicit confirmations retain their independent authority gates.
     """
-    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change"}:
+    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change", "acknowledgement", "praise"}:
+        return
+    if state.intent in {"acknowledgement", "praise"} and _is_review_channel(state.channel):
         return
     if os.environ.get("OPENAGENT_SUPPORT_TURN_READER", "1").lower() not in _TRUE:
         return
@@ -4606,8 +4608,10 @@ async def _rephrase_from_receipt(
     event: dict[str, Any],
     state: SupportState,
     session_id: str,
+    *,
+    base: str | None = None,
 ) -> str:
-    base = _fallback_reply(state)
+    base = _fallback_reply(state) if base is None else base
     state.facts["reply_source"] = "deterministic:not_eligible"
     if not base or os.environ.get(
         "OPENAGENT_ESOUND_REPHRASE_RECEIPT", "1",
@@ -4624,6 +4628,7 @@ async def _rephrase_from_receipt(
         "step, a contact channel, an identifier, an amount, a timeline, an "
         "apology for something not stated, or any claim that an action "
         "succeeded beyond what must_convey already says. Output JSON only: "
+        "If delivery_repair is supplied, fix that wording problem while preserving all facts. "
         "{\"language\":\"...\",\"reply\":\"...\"}."
     )
     model = getattr(agent, "model", None)
@@ -4643,6 +4648,7 @@ async def _rephrase_from_receipt(
                     "operator_policy": support_context.policy_packet(state.policy_notes),
                     "reply_language": language,
                     "customer_message": state.customer_message[:600],
+                    "delivery_repair": state.facts.get("delivery_guard_reason", ""),
                 }, ensure_ascii=False, default=str)}],
                 system=system,
                 session_id=f"{session_id}:local-support-rephrase",
@@ -7503,6 +7509,7 @@ async def run(
         category = str(blocked.get("category") or "reply_guard")[:80]
         reason = str(blocked.get("reason") or "")[:500]
         state.facts["delivery_guard_retry"] = category
+        state.facts["delivery_guard_reason"] = f"{category}: {reason}"
         state.instructions.append(
             "Replio held the first reply before delivery. Rewrite it now and "
             f"fix this exact guard category: {category}. {reason}"
@@ -7510,9 +7517,23 @@ async def run(
         retry_reply = await _compose_local(
             agent, event, state, f"{session_id}:{delivery_id}:guard-retry",
         )
-        if retry_reply:
+        if retry_reply.strip() == reply.strip():
+            # Fixed policy branches intentionally return the same words. A
+            # retry must change them without inventing product behavior.
+            base = reply
+            if category in {"repeated_opening", "canned_opening"}:
+                base = re.sub(
+                    r"^(?:I understand the ads are frustrating|Capisco che la pubblicità sia fastidiosa)\.\s*",
+                    "", base,
+                )
+            retry_reply = base if base != reply else await _rephrase_from_receipt(
+                agent, event, state, f"{session_id}:{delivery_id}:guard-rephrase", base=base,
+            )
+        if retry_reply and retry_reply.strip() != reply.strip():
             await _apply_lifecycle(pool, state, retry_reply)
             reply = retry_reply
+        else:
+            state.facts["delivery_guard_no_progress"] = True
     state.facts["delivery_state"] = support_turn.delivery_state(state.actions)
     if state.facts["delivery_state"] in {"blocked", "held", "failed", "unknown"}:
         # An uncertain transport result must never be retried blindly. Keep

@@ -70,6 +70,19 @@ async def t_lifecycle_reserved_fields(_ctx: TestContext) -> None:
         assert doubles.args_for("replio_threads_mark_for_human")
         assert all("waiting_for_team" not in call["patch"] for call in doubles.args_for("replio_threads_patch"))
         assert all("needs-human" not in call.get("tags", []) for call in doubles.args_for("replio_threads_tags_add"))
+
+
+@test("support_turn", "blocked canned ads opener is removed without changing product facts")
+async def t_ads_guard_progress(_ctx: TestContext) -> None:
+    doubles = _Doubles(respond_results=[
+        {"sent": False, "blocked": True, "retry_now": True, "category": "repeated_opening"},
+        {"sent": True},
+    ])
+    result = await _drive(doubles, "There are too many ads and I cannot pay for Premium", payload_extra={"product": "lyra"})
+    calls = doubles.args_for("replio_threads_respond")
+    assert len(calls) == 2
+    assert calls[0]["body_text"].split(". ", 1)[1] == calls[1]["body_text"]
+    assert result["facts"]["delivery_state"] == "sent"
 @test("support_turn", "referral reads require one resolved identity and matching product receipts")
 async def t_referral_identity_and_scope(_ctx: TestContext) -> None:
     users = [{"identityId": "kratos-test", "id": "internal-test"}]

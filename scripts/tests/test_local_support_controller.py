@@ -1158,7 +1158,7 @@ async def t_reconcile_recovers_customer_message(_ctx: TestContext) -> None:
 
 @test(
     "local_support_controller",
-    "a guarded reply is not success and is rewritten once in the same turn",
+    "a guarded fixed reply is not resent unchanged",
 )
 async def t_reply_guard_retries_once(_ctx: TestContext) -> None:
     doubles = _Doubles(
@@ -1186,9 +1186,10 @@ async def t_reply_guard_retries_once(_ctx: TestContext) -> None:
         action for action in output["actions"]
         if action.get("kind") == "customer_reply"
     ]
-    assert [action["success"] for action in replies] == [False, True], replies
-    assert len(doubles.args_for("replio_threads_respond")) == 2
+    assert [action["success"] for action in replies] == [False], replies
+    assert len(doubles.args_for("replio_threads_respond")) == 1
     assert output["facts"]["delivery_guard_retry"] == "canned_opening"
+    assert output["facts"]["delivery_guard_no_progress"]
 
 
 @test(
