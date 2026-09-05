@@ -360,6 +360,12 @@ def _adapt_args(pool: Any, server: str, tool: str, args: dict[str, Any]) -> dict
     fn = _tool_functions(pool, server).get(tool)
     props = _schema_properties(fn) if fn is not None else set()
     adapted = dict(args)
+    if server == "clickup":
+        # The installed MCP uses snake_case, while the legacy adapter used
+        # camelCase. Follow the discovered schema, including on task creation.
+        for old, new in (("listId", "list_id"), ("includeClosed", "include_closed")):
+            if old in adapted and new in props and old not in props:
+                adapted[new] = adapted.pop(old)
     # Add and REMOVE both take a singular ``tag`` on Replio. Adapting only the
     # add meant the diagnostics lane could switch a capture on and never switch
     # its thread tag back off: the removal failed validation, the run ended in
@@ -2515,6 +2521,7 @@ _BUG_SYMPTOMS: tuple[tuple[str, str], ...] = (
 # that "in doubt, prefer the core" is the structural default.
 _BUG_SURFACES: tuple[tuple[str, str, str, str], ...] = (
     (r"embed|iframe|widget player|bloom", "the embed player", "bloom", "esound/bloom-embed"),
+    (r"startup|on launch|app icon|before.{0,30}\bui\b", "app startup", "esound", "esound/app"),
     (r"theme|appearance|dark mode|settings screen|impostazioni", "theme settings", "esound", "esound/app"),
     (r"\bads?\b|advertis|pubblicit", "ads", "esound", "esound/app"),
     (r"notification|push notification|notifica", "notifications", "esound", "esound/app"),
@@ -2779,7 +2786,7 @@ async def _already_reported(pool: Any, state: SupportState, task_id: str) -> boo
     """
     tool, result = await _call_first(
         pool, "clickup",
-        ("clickup_get_task_comments", "get_task_comments"),
+        ("clickup_get_comments", "get_comments", "clickup_get_task_comments", "get_task_comments"),
         {"task_id": task_id},
         required=False,
     )
@@ -2997,6 +3004,43 @@ def _is_urgent(text: str) -> bool:
     return bool(_URGENT.search(str(text or "")))
 
 
+async def _search_bug_tasks(pool: Any, list_id: str, query: str) -> list[dict[str, Any]] | None:
+    """Read candidates with the actual MCP contract; incomplete is not empty.
+
+    The current server lists by list_id and page, without a text-query field.
+    Read every page before concluding there is no duplicate. A failed or
+    bounded-out read must never authorize creation of another task.
+    """
+    legacy = ("clickup_get_workspace_tasks", "get_workspace_tasks", "tasks_search")
+    if _pick_tool(pool, "clickup", legacy):
+        _, result = await _call_first(pool, "clickup", legacy, {
+            "listId": list_id, "query": query, "includeClosed": True,
+        })
+        if not isinstance(result, dict) or not isinstance(result.get("tasks"), list) or not _succeeded(result):
+            return None
+        return _find_tasks(result)
+    names = ("clickup_get_tasks", "get_tasks")
+    if not _pick_tool(pool, "clickup", names):
+        return None
+    tasks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in range(20):
+        _, result = await _call_first(pool, "clickup", names, {
+            "list_id": list_id, "include_closed": True, "page": page,
+        })
+        if not isinstance(result, dict) or not isinstance(result.get("tasks"), list) or not _succeeded(result):
+            return None
+        batch = _find_tasks(result)
+        ids = {str(task.get("id")) for task in batch if task.get("id")}
+        if len(ids) != len(batch) or (batch and ids <= seen):
+            return None
+        tasks.extend(task for task in batch if str(task["id"]) not in seen)
+        seen.update(ids)
+        if result.get("last_page") is True or ("last_page" not in result and len(batch) < 100):
+            return tasks
+    return None
+
+
 async def _route_bug(pool: Any, state: SupportState) -> None:
     # The canonical router requires all three bug boundaries.  The lifecycle
     # note is not a substitute for triage or the technical-only exclusion.
@@ -3093,21 +3137,18 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
     query = _bug_query(state.customer_message)
     matches: list[dict[str, Any]] = []
     for list_id in _CLICKUP_LISTS.values():
-        tool, result = await _call_first(
-            pool,
-            "clickup",
-            ("clickup_get_workspace_tasks", "get_workspace_tasks", "tasks_search"),
-            {"listId": list_id, "query": query, "includeClosed": True},
-            required=False,
-        )
-        if tool is None:
-            state.decision = "ask_information"
+        try:
+            candidates = await _search_bug_tasks(pool, list_id, query)
+        except Exception as exc:
+            elog("support_controller.tracker_read_failed", level="warning",
+                 error_type=type(exc).__name__, list_id=list_id)
+            candidates = None
+        if candidates is None:
+            state.decision = "human"
             state.outcome = "clickup_unavailable"
-            state.instructions.append(
-                "ClickUp is unavailable. Ask for diagnostics; do not claim a task exists."
-            )
+            state.human_reason = "Cannot complete the bug-tracker read; preserve the report for manual triage."
             return
-        matches.extend(_find_tasks(result))
+        matches.extend(candidates)
     if not matches:
         # The code-derived feature index is the minimum repository grounding
         # for deterministic component routing. Unknown symptom shapes still

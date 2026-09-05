@@ -3691,3 +3691,51 @@ async def t_vault_push(_ctx: TestContext) -> None:
         failed = git.push(str(root / "nowhere.git"))
         assert failed.get("ok") is False, failed
         assert "error" in failed, failed
+
+
+@test("local_support_controller", "installed ClickUp schema reads every page before dedup")
+async def t_clickup_installed_schema_pagination(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    calls = []
+    async def get_tasks(list_id, include_closed, page):
+        calls.append((list_id, include_closed, page))
+        if page == 0:
+            return {"tasks": [{"id": str(i)} for i in range(100)], "last_page": False}
+        return {"tasks": [{"id": "target-on-page-two", "name": "Fix crash in app startup"}], "last_page": True}
+    pool = _Pool({"clickup": _Toolkit({"clickup_get_tasks": get_tasks})})
+    result = await lsc._search_bug_tasks(pool, "list", "crash")
+    assert len(result) == 101
+    assert result[-1]["id"] == "target-on-page-two"
+    assert calls == [("list", True, 0), ("list", True, 1)]
+
+
+@test("local_support_controller", "ClickUp errors and repeated pages never mean no duplicate")
+async def t_clickup_incomplete_is_not_empty(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    for response in ({"error": "unavailable"}, {"tasks": [], "isError": True}, {"tasks": [{"id": "same"}], "last_page": False}):
+        async def get_tasks(**kwargs):
+            return response
+        pool = _Pool({"clickup": _Toolkit({"clickup_get_tasks": get_tasks})})
+        assert await lsc._search_bug_tasks(pool, "list", "crash") is None
+
+
+@test("local_support_controller", "task creation adapts to the installed snake-case schema")
+async def t_clickup_create_schema(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    toolkit = _Toolkit({"clickup_create_task": lambda **kwargs: None})
+    toolkit.functions["clickup_create_task"].parameters = {"properties": {"list_id": {}, "name": {}}}
+    pool = _Pool({"clickup": toolkit})
+    assert lsc._adapt_args(pool, "clickup", "clickup_create_task", {"listId": "list", "name": "Fix startup crash"}) == {"list_id": "list", "name": "Fix startup crash"}
+
+
+@test("local_support_controller", "tracker outage is team work, not another customer questionnaire")
+async def t_clickup_outage_handoff(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    pool = _Doubles().pool()
+    pool._toolkit_by_name["clickup"] = _Toolkit({})
+    state = lsc.SupportState(thread_id="fixture", customer_message="The app crashes on launch on Samsung S21 Android 15 app 1.4.11", tenant=lsc._TENANTS["lyra"])
+    await lsc._route_bug(pool, state)
+    assert state.outcome == "clickup_unavailable"
+    assert state.decision == "human"
+    assert "manual triage" in state.human_reason
+    assert not any("Ask for diagnostics" in instruction for instruction in state.instructions)
