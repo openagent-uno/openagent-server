@@ -1952,6 +1952,7 @@ def _customer_text(thread: Any, message: str, limit: int = 20000) -> str:
     message one.
     """
     parts: list[str] = []
+    support_bodies = _support_replies(thread, limit=1000, max_chars=None)
     messages = (thread or {}).get("messages") if isinstance(thread, dict) else None
     if isinstance(messages, list):
         for item in messages:
@@ -1962,14 +1963,15 @@ def _customer_text(thread: Any, message: str, limit: int = 20000) -> str:
             for key in ("body_text", "text", "body", "content"):
                 value = item.get(key)
                 if isinstance(value, str) and value.strip():
-                    parts.append(without_support_echo(receipt_request(value.strip())[0], _support_replies(thread, limit=1000)))
+                    parts.append(without_support_echo(receipt_request(value.strip())[0], support_bodies))
                     break
-    if message and message.strip() and (not parts or parts[-1] != message.strip()):
-        parts.append(without_support_echo(receipt_request(message.strip())[0], _support_replies(thread, limit=1000)))
+    current = without_support_echo(receipt_request(message.strip())[0], support_bodies) if message else ""
+    if current and (not parts or parts[-1] != current):
+        parts.append(current)
     return "\n".join(parts)[-limit:]
 
 
-def _support_replies(thread: Any, limit: int = 6) -> list[str]:
+def _support_replies(thread: Any, limit: int = 6, max_chars: int | None = 600) -> list[str]:
     """The outbound bodies already sent on this thread, oldest first.
 
     Quoted history and the legal footer are cut: two different replies quoting
@@ -1992,7 +1994,7 @@ def _support_replies(thread: Any, limit: int = 6) -> list[str]:
                 break
         text = _strip_quoted_history(text)
         if text:
-            out.append(text[:600])
+            out.append(text[:max_chars])
     return out[-limit:]
 
 
@@ -6270,7 +6272,7 @@ async def run(
                     state.facts["language_source"] = "store_country"
             break
     if state.channel == "email_imap":
-        authored = without_support_echo(message, _support_replies(thread, limit=1000))
+        authored = without_support_echo(message, _support_replies(thread, limit=1000, max_chars=None))
         if authored != message:
             message = authored
             state.customer_message = authored

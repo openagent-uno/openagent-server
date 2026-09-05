@@ -48,6 +48,11 @@ async def t_unmarked_support_echo(_ctx: TestContext) -> None:
     history = {"messages": [{"direction": "outbound", "body_text": prior},
                              {"direction": "inbound", "body_text": mail}]}
     assert "Folders hold" not in controller._customer_text(history, mail)
+    long_reply = prior + " More explanation of the folder and playlist behavior." * 20
+    long_mail = thanks + "\n\n" + long_reply
+    long_history = {"messages": [{"direction": "outbound", "body_text": long_reply},
+                                  {"direction": "inbound", "body_text": long_mail}]}
+    assert controller._customer_text(long_history, long_mail).strip() == thanks
     class Model:
         async def generate(self, **kw):
             return SimpleNamespace(content=json.dumps({"kind": "acknowledgement", "evidence": thanks}))
