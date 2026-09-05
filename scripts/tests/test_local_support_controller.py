@@ -3952,3 +3952,14 @@ async def t_library_loss_guarantees(_ctx: TestContext) -> None:
     for text in ("Non hai perso nulla.", "Non avete perso niente.", "You haven't lost anything.", "Nothing was lost.", "No has perdido nada."):
         assert _unverified_recovery_advice(text), text
     assert not _unverified_recovery_advice("Non posso ancora confermare la causa. Controlliamo la libreria.")
+
+
+@test("local_support_controller", "Lyra task links use its own provider even with an eSound override")
+async def t_task_provider_tenant(_ctx: TestContext) -> None:
+    from unittest.mock import patch
+    from src.core import local_support_controller as lsc
+    with patch.dict(os.environ, {"OPENAGENT_ESOUND_CLICKUP_PROVIDER_ID": "esound-only"}):
+        assert lsc._task_provider_id(lsc._TENANTS["esound"]) == "esound-only"
+        assert lsc._task_provider_id(lsc._TENANTS["lyra"]) == lsc._CLICKUP_PROVIDER_IDS["lyra"]
+    with patch.dict(os.environ, {"OPENAGENT_LYRA_CLICKUP_PROVIDER_ID": "configured-lyra"}):
+        assert lsc._task_provider_id(lsc._TENANTS["lyra"]) == "configured-lyra"

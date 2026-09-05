@@ -39,7 +39,10 @@ _MODE_ENV = "OPENAGENT_ESOUND_SUPPORT_CONTROLLER"
 _WRITES_ENV = "OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES"
 _DRAFTS_ENV = "OPENAGENT_ESOUND_SUPPORT_CONTROLLER_DRAFTS"
 _ROUTER = "esound/procedures/customer-response/_routing.md"
-_CLICKUP_PROVIDER_ID = "a819a266-d2b1-48ad-bc86-864284109724"
+_CLICKUP_PROVIDER_IDS = {
+    "esound": "a819a266-d2b1-48ad-bc86-864284109724",
+    "lyra": "135914a7-a707-49bd-b14d-c894cbc84778",
+}
 _BILLINGBEAR_PROJECT_ID = "24b20ea3-1fc4-4d60-961a-43a98235011d"
 _CLICKUP_LISTS = {
     "client": "901512174103",
@@ -3258,9 +3261,7 @@ async def _link_bug_task(pool: Any, state: SupportState, task_id: str) -> bool:
         state, pool, "replio", ("replio_thread_link_task", "thread_link_task"),
         {
             "thread_id": state.thread_id,
-            "task_provider_id": os.environ.get(
-                "OPENAGENT_ESOUND_CLICKUP_PROVIDER_ID", _CLICKUP_PROVIDER_ID,
-            ),
+            "task_provider_id": _task_provider_id(state.tenant),
             "external_task_id": task_id,
         },
         "task_link",
@@ -3274,6 +3275,13 @@ async def _link_bug_task(pool: Any, state: SupportState, task_id: str) -> bool:
         "task_id": task_id,
     })
     return verified
+
+
+def _task_provider_id(tenant: Tenant) -> str:
+    return os.environ.get(
+        f"OPENAGENT_{tenant.key.upper()}_CLICKUP_PROVIDER_ID",
+        _CLICKUP_PROVIDER_IDS[tenant.key],
+    )
 
 
 # Policy scope check: a signal explicitly about the OTHER brand must not
