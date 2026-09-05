@@ -3963,3 +3963,15 @@ async def t_task_provider_tenant(_ctx: TestContext) -> None:
         assert lsc._task_provider_id(lsc._TENANTS["lyra"]) == lsc._CLICKUP_PROVIDER_IDS["lyra"]
     with patch.dict(os.environ, {"OPENAGENT_LYRA_CLICKUP_PROVIDER_ID": "configured-lyra"}):
         assert lsc._task_provider_id(lsc._TENANTS["lyra"]) == "configured-lyra"
+
+
+@test("local_support_controller", "task product ownership outranks references to related reports")
+async def t_task_scope_incidental_reference(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+    task = {"name": "Playback stops", "description": "Lyra issue; previous eSound link was wrong.",
+            "tags": [{"name": "lyra"}]}
+    assert lsc._task_is_other_product(task, lsc._TENANTS["esound"])
+    assert not lsc._task_is_other_product(task, lsc._TENANTS["lyra"])
+    task["tags"] = []
+    task["list"] = {"id": lsc._CLICKUP_LISTS["lyra"]}
+    assert lsc._task_is_other_product(task, lsc._TENANTS["esound"])

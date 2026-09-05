@@ -3043,14 +3043,27 @@ def _task_is_other_product(task: dict[str, Any], tenant: Tenant) -> bool:
     Use the task's declared scope, not comments (which may already contain a
     mistakenly linked report). Explicit multi-product tasks remain eligible.
     """
-    scope = " ".join(str(task.get(key) or "") for key in (
-        "product", "name", "title", "description", "text_content",
-    ))
     tags = task.get("tags") or []
-    scope += " " + " ".join(
+    labels = [str(task.get("product") or "").lower()] + [
         str(tag.get("name") or "") if isinstance(tag, dict) else str(tag)
         for tag in tags
-    )
+    ]
+    declared = {
+        brand for brand in _TENANTS
+        if any(label.lower() == brand or label.lower().startswith(brand + "/") for label in labels)
+    }
+    task_list = task.get("list") or {}
+    list_id = str(task.get("listId") or task.get("list_id") or (
+        task_list.get("id") if isinstance(task_list, dict) else task_list
+    ) or "")
+    declared.update(brand for brand in _TENANTS if _CLICKUP_LISTS[brand] == list_id)
+    if declared:
+        return tenant.key not in declared
+    # A related-task reference can mention the other product. Explicit product
+    # tags/list ownership above outrank those incidental words in prose.
+    scope = " ".join(str(task.get(key) or "") for key in (
+        "name", "title", "description", "text_content",
+    ))
     return _is_other_brand(scope, tenant=tenant)
 
 
