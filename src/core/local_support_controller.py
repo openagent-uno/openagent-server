@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from src.core import reply_guard, support_semantics, tool_trace
+from src.core.support_billing import billing_payload, explicit_premium
+from src.core.support_email import receipt_request
 from src.core.dry_run import is_dry_run
 from src.core.execution_profile import (
     stateless_completion_scope,
@@ -426,7 +428,8 @@ async def _call_first(
         return None, None
     actual_args = _adapt_args(pool, server, tool, args)
     raw = await _call_tool_impl(pool, server, tool, actual_args)
-    result = _jsonable(_clickup_payload(raw) if server == "clickup" else raw)
+    result = (billing_payload(raw) if server == "billingbear" else
+              _jsonable(_clickup_payload(raw) if server == "clickup" else raw))
     safe_args = {
         key: ("[redacted]" if "email" in key.lower() else value)
         for key, value in actual_args.items()
@@ -1706,6 +1709,8 @@ def _recent_exchange(thread: Any, limit: int = 4) -> list[dict[str, str]]:
                 break
         if not text:
             continue
+        if str(item.get("direction") or "").lower() == "inbound":
+            text = receipt_request(text)[0]
         out.append({
             "from": "customer" if str(item.get("direction") or "").lower() == "inbound" else "support",
             "text": text[:400],
@@ -1735,10 +1740,10 @@ def _customer_text(thread: Any, message: str, limit: int = 20000) -> str:
             for key in ("body_text", "text", "body", "content"):
                 value = item.get(key)
                 if isinstance(value, str) and value.strip():
-                    parts.append(value.strip())
+                    parts.append(receipt_request(value.strip())[0])
                     break
     if message and message.strip() and (not parts or parts[-1] != message.strip()):
-        parts.append(message.strip())
+        parts.append(receipt_request(message.strip())[0])
     return "\n".join(parts)[:limit]
 
 
@@ -2039,18 +2044,28 @@ def _entitlement_active(item: Any) -> bool:
     return expires > datetime.now(timezone.utc)
 
 
-def _customer_lookup_state(result: Any) -> tuple[bool, str, str, list[dict[str, Any]]]:
-    if not isinstance(result, dict):
-        return False, "", "", []
-    premium = bool(result.get("isPremium") or result.get("is_premium"))
+def _customer_lookup_state(result: Any) -> tuple[bool | None, str, str, list[dict[str, Any]]]:
+    result = billing_payload(result)
+    if not _succeeded(result):
+        return None, "", "", []
+    premium = explicit_premium(result)
     # The profile field can run ahead of the entitlement, so it may only
     # CONFIRM premium, never resurrect it: an expired date turns it off.
-    expires = _expires_at(result.get("premiumExpiresAt"))
+    raw_expiry = result.get("premiumExpiresAt") or result.get("premium_expires_at")
+    expires = _expires_at(raw_expiry)
+    if raw_expiry and expires is None:
+        premium = None
     if premium and expires is not None and expires <= datetime.now(timezone.utc):
         premium = False
     entitlements = result.get("entitlements") or []
     if isinstance(entitlements, list):
-        premium = premium or any(_entitlement_active(item) for item in entitlements)
+        valid = [item for item in entitlements if isinstance(item, dict) and item
+                 and (not (item.get("expiresAt") or item.get("expires_at"))
+                      or _expires_at(item.get("expiresAt") or item.get("expires_at")) is not None)]
+        if valid and len(valid) == len(entitlements):
+            premium = any(_entitlement_active(item) for item in valid)
+        elif entitlements:
+            premium = None
     else:
         entitlements = []
     return (
@@ -2287,7 +2302,12 @@ async def _billing_lookup(
             ),
             {"appUserId": resolved}, required=False,
         )
-        if _succeeded(full) and isinstance(full, dict):
+        if _succeeded(full) and isinstance(full, dict) and _customer_lookup_state(full)[0] is not None:
+            if full.get("appUserId") and str(full["appUserId"]) != resolved:
+                return {"ok": False, "error": "billing_identity_conflict"}
+            initial = _customer_lookup_state(by_email)[0]
+            if initial is not None and initial != _customer_lookup_state(full)[0]:
+                return {"ok": False, "error": "billing_state_conflict"}
             full.setdefault("appUserId", resolved)
             return full
         return by_email
@@ -3400,6 +3420,18 @@ def _fallback_reply(state: SupportState) -> str:
             if italian else
             "Premium is active. Tell me where you purchased — App Store, Google Play, or the website — so I can give you the right step to recover it."
         )
+    if state.outcome == "premium_receipt_verified":
+        return (
+            "Ho ricevuto la ricevuta. Il Premium sul tuo account risulta già attivo: non serve un nuovo pagamento o un’attivazione manuale. Nell’app ti compare attivo?"
+            if italian else
+            "I received the receipt. Premium is already active on your account: no new payment or manual activation is needed. Does it show as active in the app?"
+        )
+    if state.outcome == "billing_unverified_human":
+        return (
+            "Al momento non riesco a verificare lo stato dell’abbonamento. La verifica resta in carico all’assistenza; non ti chiedo di pagare di nuovo."
+            if italian else
+            "I cannot verify the subscription status right now. Support has the verification queued; I am not asking you to pay again."
+        )
     if state.outcome == "duplicate_other_store_active":
         # Deterministic on purpose, and not only as a fallback: the composer
         # runs on a single local endpoint, and while it is down EVERY reply is
@@ -4307,7 +4339,7 @@ async def _compose_local(
     session_id: str,
 ) -> str:
     state.facts["reply_source"] = "deterministic"
-    if state.outcome == "premium_active":
+    if state.outcome in {"premium_active", "premium_receipt_verified", "billing_unverified_human"}:
         # Store-specific recovery is policy, not prose: a measured composer
         # changed "close and reopen the app" into "close your browser" for a
         # web subscription. Keep the verified store branch deterministic.
@@ -5713,16 +5745,39 @@ async def run(
             # Keep the richer object for sender identity and lifecycle gates.
             if state.linked_task_id:
                 thread = full_thread
+    # Recover the complete inbound before trimming/splitting documents. A
+    # reconciliation delivery omits payload.message, including receipt-only mail.
+    if not message.strip() and isinstance(thread, dict):
+        for item in reversed(thread.get("messages") or []):
+            if isinstance(item, dict) and item.get("direction") == "inbound":
+                recovered = next((item[k] for k in ("body_text", "text", "body", "content")
+                                  if isinstance(item.get(k), str) and item[k].strip()), "")
+                if recovered and state.channel == "email_imap" and receipt_request(recovered)[1]:
+                    message = recovered
+                    state.customer_message = recovered
+                    state.facts["message_source"] = "thread_brief"
+                    state.facts["language_signal"] = recovered
+                    state.facts["language"] = _language_hint(recovered)
+                if recovered:
+                    break
     state.recent_exchange = _recent_exchange(thread)
     state.prior_support_replies = _support_replies(thread)
     state.thread_customer_text = _customer_text(thread, message)
+    # A forwarding header separates document evidence from what the customer
+    # actually asked. Store boilerplate must never authorize a money route.
+    if state.channel == "email_imap":
+        authored, is_receipt = receipt_request(message)
+        if is_receipt:
+            state.facts["receipt_received"] = True
+            message = authored
+            state.customer_message = authored
     # Replio's realtime webhook includes ``payload.message``, but its guarded
     # reconciliation sweep intentionally rebuilds an event from the thread
     # row and therefore carries no message body.  The thread brief is the
     # authoritative fallback in that path.  Without this recovery every
     # genuinely missed reply was re-fired only to become ``no_content`` and
     # stay unanswered forever.
-    if not message.strip():
+    if not message.strip() and not state.facts.get("receipt_received"):
         for turn in reversed(state.recent_exchange):
             if turn.get("from") != "customer":
                 continue
@@ -5815,7 +5870,7 @@ async def run(
         state.intent = "channel_expired"
         state.decision = "noop"
         state.outcome = "undeliverable"
-    elif not message.strip() and not _extract_attachments({"payload": payload, "thread": thread}):
+    elif not message.strip() and not state.facts.get("receipt_received") and not _extract_attachments({"payload": payload, "thread": thread}):
         state.outcome = "no_content"
         state.decision = "noop"
     else:
@@ -5836,10 +5891,15 @@ async def run(
         if stars is not None:
             state.facts["review_stars"] = stars
         state.intent = (
+            "premium" if state.facts.get("receipt_received") and not message.strip() else
             "attachment_only"
             if (not message.strip() or placeholder_only) and attachments
             else _intent(message, state.channel)
         )
+        if state.facts.get("receipt_received") and state.intent in {
+            "general", "acknowledgement", "praise",
+        }:
+            state.intent = "premium"
         # A live thread's last message is often a fragment ("son adresse mail
         # x@y.com") while the SUBJECT carries the topic ("j'essaye de
         # renouveler le premium"). Classifying on the message alone sent a
@@ -6023,6 +6083,15 @@ async def run(
         app_user_id = _extract_app_user_id({"payload": payload, "thread": thread}, message)
         email = _extract_email({"payload": payload, "thread": thread}, message)
         sender_email = _extract_verified_sender_email({"payload": payload, "thread": thread})
+        # The brief already resolved the sender. Use that verified identity,
+        # never an arbitrary email copied from a forwarded store document.
+        profile = thread.get("customer") if isinstance(thread, dict) else None
+        if isinstance(profile, dict):
+            profile_email = str(profile.get("email") or "").strip().lower()
+            if profile_email and profile_email == (sender_email or email).strip().lower():
+                if not app_user_id:
+                    app_user_id = str(profile.get("identity_id") or "").strip()
+                state.facts["brief_premium_active"] = profile.get("is_premium") is True
         if not email:
             # The address the form declared, from ANY message on the thread.
             # `_extract_email` falls back to a regex over the message in hand,
@@ -6257,9 +6326,9 @@ async def run(
                     already_paying, _store, _version, _subs = _customer_lookup_state(
                         verified
                     )
-                    if already_paying:
+                    if already_paying is not False:
                         ads_policy_only = False
-                        state.facts["ads_claim_overruled_by_account"] = True
+                        state.facts["ads_claim_overruled_by_account"] = already_paying is True
             if state.intent == "premium" and ads_policy_only:
                 # "Too many ads" is a product-policy complaint, not evidence
                 # that this person bought Premium. Give the verified exits
@@ -6361,15 +6430,36 @@ async def run(
                 )
                 state.facts["paddle_scope_only"] = paddle_only
                 # A Paddle-scoped answer is not verification of account state.
-                state.facts["billing_verified"] = _succeeded(billing) and not paddle_only
                 premium, store, version, subscriptions = _customer_lookup_state(billing)
+                if paddle_only or (isinstance(billing, dict) and billing.get("appUserId")
+                                   and app_user_id and str(billing["appUserId"]) != app_user_id):
+                    premium = None
+                if premium is False and state.facts.get("brief_premium_active"):
+                    # Conflicting live sources are a verification failure,
+                    # never permission to ask an existing subscriber to pay.
+                    premium = None
+                    state.facts["billing_conflict"] = True
+                state.facts["billing_verified"] = (
+                    premium is not None and _succeeded(billing) and not paddle_only
+                )
+                state.facts["billing_state"] = (
+                    "unknown" if premium is None else "active" if premium else "inactive"
+                )
                 state.facts.update({
                     "isPremium": premium,
                     "store": store,
                     "clientVersion": version,
                     "subscriptions": subscriptions,
                 })
-                if state.outcome == "refund_malfunction_resolve_first":
+                if premium is None:
+                    state.decision = "human"
+                    state.outcome = "billing_unverified_human"
+                    state.human_reason = "Billing lookup did not return a readable, explicit account entitlement state. No billing mutation performed."
+                elif state.intent == "premium" and not premium and state.facts.get("receipt_received"):
+                    state.decision = "human"
+                    state.outcome = "billing_unverified_human"
+                    state.human_reason = "Store receipt received but no active entitlement verified on the resolved account. Investigate the purchase association; do not request the same receipt again."
+                elif state.outcome == "refund_malfunction_resolve_first":
                     # Rule 5 already decided: fix it before touching money.
                     pass
                 elif state.intent == "refund":
@@ -6712,7 +6802,10 @@ async def run(
                                     )
                 elif premium:
                     state.decision = "self_help"
-                    state.outcome = "premium_active"
+                    state.outcome = (
+                        "premium_receipt_verified" if state.facts.get("receipt_received")
+                        else "premium_active"
+                    )
                     # The recovery action differs by where the money was
                     # taken. Telling an App Store buyer to "sign in with the
                     # purchase email" is useless - an in-app purchase is tied
@@ -6852,6 +6945,12 @@ async def run(
         "outcome": state.outcome,
         "intent": state.intent,
         "decision": state.decision,
+        "billing_evidence": {
+            key: state.facts[key] for key in (
+                "billing_state", "billing_verified", "billing_conflict",
+                "brief_premium_active", "receipt_received", "isPremium", "store",
+            ) if key in state.facts
+        },
         "reply": reply,
         "actions": state.actions,
         "policy_paths": state.policy_paths,
