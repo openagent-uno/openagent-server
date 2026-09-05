@@ -26,7 +26,9 @@ Return JSON only:
  "reported":{"app_version":"exact quote","device":"exact quote","os":"exact quote",
  "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote"}}
 Omit unknown fields; never infer a version, OS, account state or successful action.
-Quotes must occur literally in customer_text (not in prior_support). Keep them short.
+Quotes must be ONE contiguous substring of customer_text (not prior_support).
+Use a short verbatim phrase. Never join separate sentences or omit words from
+inside a quote, even if the resulting summary means the same thing.
 Read latest_message in context; an explicit change of topic wins over older history.
 resolved_confirmation means the latest message clearly says the reported problem
 now works, with no remaining problem or new question. 'I installed the update and
@@ -51,6 +53,9 @@ it, or saying they cannot carry it out (for example, "what is a log?" or "I don'
 know how to record the screen"). Answer that question, not the original bug again.
 It also covers explicit questions about supported platforms or how a product
 feature works, which require documentation. A malfunction report is still bug.
+When the customer corrects our misunderstanding and says they only asked about
+iOS availability, that is guidance_question, NOT a bug. A denial of a malfunction
+is not evidence of one. Moving from Android to iOS alone is not a fault either.
 bug means a reported malfunction. For a crash before any UI, launching the app IS
 the reproduction step; do not require impossible navigation inside the app.
 For a follow-up, preserve steps and results already given by the customer. A reply

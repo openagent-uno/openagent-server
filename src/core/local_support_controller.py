@@ -1347,7 +1347,7 @@ async def _read_reported_turn(
     Only non-destructive support routes can be refined here. Money, deletion,
     legal and explicit confirmations retain their independent authority gates.
     """
-    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change", "acknowledgement", "praise"}:
+    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change", "acknowledgement", "praise", "ios_availability"}:
         return
     if state.intent in {"acknowledgement", "praise"} and _is_review_channel(state.channel):
         return
@@ -1380,6 +1380,25 @@ async def _read_reported_turn(
         assessment = support_turn.read_reported_turn(
             _extract_json(getattr(response, "content", "")), customer_text,
         )
+        if assessment is None:
+            # A model may splice real phrases into a nonliteral quote. Give
+            # it one bounded chance to cite correctly; never relax grounding.
+            repair_packet = {**packet, "citation_error": (
+                "The previous evidence was not a valid contiguous quote. Read the conversation "
+                "again and return the same schema with ONE SHORT exact substring copied from "
+                "customer_text. Do not join phrases, omit internal words, or paraphrase."
+            )}
+            with strict_local_only_scope(True), stateless_completion_scope(True):
+                response = await _generate_support_model(
+                    model, messages=[{"role": "user", "content": json.dumps(repair_packet, ensure_ascii=False)}],
+                    system=support_turn.READER_SYSTEM,
+                    session_id=f"{session_id}:support-turn-reader-repair",
+                    timeout_env="OPENAGENT_SUPPORT_TURN_READER_TIMEOUT_SECONDS",
+                )
+            assessment = support_turn.read_reported_turn(
+                _extract_json(getattr(response, "content", "")), customer_text,
+            )
+            state.facts["turn_reader_citation_retry"] = True
     except Exception as exc:
         state.facts["turn_reader"] = "unavailable"
         state.intent = "request_review"
@@ -6265,6 +6284,22 @@ async def run(
                     state.facts["language"] = _language_hint(recovered)
                 if recovered:
                     break
+    # A media webhook may be queued just before the customer's explanation
+    # arrives. The brief's freshness receipt already points at that newer
+    # inbound; compose from its text, not the obsolete attachment placeholder.
+    if _body_is_attachment_placeholder(message) and isinstance(thread, dict):
+        for item in reversed(thread.get("messages") or []):
+            if not isinstance(item, dict) or item.get("direction") != "inbound":
+                continue
+            latest = next((item[k] for k in ("body_text", "text", "body", "content")
+                           if isinstance(item.get(k), str) and item[k].strip()), "")
+            if latest and not _body_is_attachment_placeholder(latest):
+                message = latest
+                state.customer_message = latest
+                state.facts["message_source"] = "latest_thread_inbound"
+                state.facts["language_signal"] = latest
+                state.facts["language"] = _language_hint(latest)
+            break
     state.recent_exchange = _recent_exchange(thread)
     state.prior_support_replies = _support_replies(thread)
     state.thread_customer_text = _customer_text(thread, message)
@@ -6859,7 +6894,7 @@ async def run(
                     "Do not repeat steps or ask for an invitee's private identity. If eligible rewards "
                     "are still pending, state that status without promising a credit or completion time."
                 )
-        elif state.intent == "guidance_question":
+        elif state.intent in {"guidance_question", "ios_availability"}:
             _tool, documents = await _call_first(pool, "replio",
                 ("replio_docs_search", "docs_search"),
                 {"query": state.customer_message, "product": state.tenant.key, "limit": 4}, required=False)

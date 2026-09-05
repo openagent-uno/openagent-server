@@ -39,9 +39,25 @@ class Case:
     expected_outcome: str = ""
     image_fixture: str = ""
     expected_image_text: str = ""
+    incoming_message: str = ""
 
 
 CASES = (
+    Case("media-burst-explanation-survives", "esound", (
+         ("inbound", "When I search and play a song, a different song plays instead.\n---\napp_version: 5.2.4\ndevice: Samsung S21\nos: Android 15\nplatform: android"),
+         ("outbound", "Try playing the song from a fresh search."),
+         ("inbound", "[1 attachment(s): video]"),
+         ("inbound", "Now it gives me an AI voice explaining the song instead of playing it."),
+         ("inbound", "Is this a prank?")),
+         "bug", "bug", ("app_version", "device", "steps"),
+         forbidden_reply=("describe the attachment", "send it again"),
+         incoming_message="[1 attachment(s): video]"),
+    Case("ios-availability-is-not-a-bug-questionnaire", "esound", (
+         ("inbound", "Are you available on iOS?"),
+         ("outbound", "What happens in the app? Send your device and version."),
+         ("inbound", "dawg nothing is happening, i just switched from android to ios on the same account and i just asked if its available on ios thats all")),
+         "guidance_question", "guidance_question", ("app_version", "device", "steps"),
+         must_not_call=("clickup_create_task",), expected_outcome="guidance_answer"),
     Case("resolved-playback-it", "esound", (
          ("inbound", "La musica non parte nell'app desktop."),
          ("outbound", "Installa l'ultima versione e prova una canzone."),
@@ -223,7 +239,7 @@ async def replay(command: list[str], selected: list[Case], repeat: int) -> dict[
                         agent=SimpleNamespace(_mcp=doubles.pool(), model=model),
                         event={"slug": "replio-thread"},
                         payload={"payload": {"thread_id": "sim-" + case.id, "product": case.product,
-                            "channel_kind": "email_imap", "message": {"body_text": case.turns[-1][1],
+                            "channel_kind": "email_imap", "message": {"body_text": case.incoming_message or case.turns[-1][1],
                             **({"attachments": [{"name": case.image_fixture}]} if case.image_fixture else {})}}},
                         session_id=f"replay:{case.id}:{iteration}", delivery_id="simulated",
                     )

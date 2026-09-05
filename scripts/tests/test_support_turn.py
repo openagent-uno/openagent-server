@@ -31,6 +31,38 @@ async def t_resolved_followup(_ctx: TestContext) -> None:
     assert state.facts["turn_reader"] == "invalid_latest_evidence"
 
 
+@test("support_turn", "iOS availability has a guidance route even without a reader override")
+async def t_ios_availability_route(_ctx: TestContext) -> None:
+    result = await _drive(_Doubles(), "I switched from Android to iOS. Is the app available on iOS?")
+    assert result["intent"] == "ios_availability"
+    assert result["outcome"] == "guidance_answer"
+    assert result["decision"] == "self_help"
+
+
+@test("support_turn", "iOS topic words cannot suppress a newly reported playback bug")
+async def t_ios_reader_overrides_old_topic(_ctx: TestContext) -> None:
+    text = "Every song is unavailable on my iPhone, including newly searched songs."
+    class Model:
+        async def generate(self, **kw):
+            return SimpleNamespace(content=json.dumps({"kind": "bug", "evidence": text}))
+    state = controller.SupportState(thread_id="sim", customer_message=text, intent="ios_availability")
+    await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "unit")
+    assert state.intent == "bug"
+
+
+@test("support_turn", "a media webhook uses the explanation that arrived before its brief")
+async def t_media_burst_latest_text(_ctx: TestContext) -> None:
+    latest = "Now it plays a voice explaining the song instead of the song. Is this a prank?"
+    doubles = _Doubles(thread={"messages": [
+        {"direction": "inbound", "body_text": "[1 attachment(s): video]"},
+        {"direction": "inbound", "body_text": latest},
+    ]})
+    result = await _drive(doubles, "[1 attachment(s): video]", payload_extra={"channel_kind": "instagram_dm"})
+    assert result["facts"]["message_source"] == "latest_thread_inbound"
+    assert result["facts"]["language_signal"] == latest
+    assert result["outcome"] != "attachment_unreadable"
+
+
 @test("support_turn", "unmarked support quote cannot turn thanks into another bug report")
 async def t_unmarked_support_echo(_ctx: TestContext) -> None:
     from src.core.support_email import without_support_echo
@@ -216,6 +248,28 @@ async def t_reader_failure(_ctx: TestContext) -> None:
     await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "unit")
     assert state.intent == "request_review" and state.reported_turn is None
     assert state.facts["turn_reader"] == "unavailable"
+
+
+@test("support_turn", "a spliced citation has one repair attempt without relaxing evidence")
+async def t_reader_citation_repair(_ctx: TestContext) -> None:
+    text = "Nothing is happening, I switched phones and just asked about iOS availability."
+    class Model:
+        calls = 0
+        valid_repair = True
+        async def generate(self, **kw):
+            self.calls += 1
+            evidence = "Nothing is happening, just asked about iOS availability."
+            if self.calls == 2 and self.valid_repair:
+                evidence = "just asked about iOS availability"
+            return SimpleNamespace(content=json.dumps({"kind": "guidance_question", "evidence": evidence}))
+    for valid in (True, False):
+        model = Model()
+        model.valid_repair = valid
+        state = controller.SupportState(thread_id="sim", customer_message=text, intent="ios_availability")
+        await controller._read_reported_turn(SimpleNamespace(model=model), {}, state, "unit")
+        assert model.calls == 2
+        assert state.facts["turn_reader_citation_retry"] is True
+        assert state.intent == ("guidance_question" if valid else "request_review")
 
 
 @test("support_turn", "startup crash never requests an impossible in-app capture")
