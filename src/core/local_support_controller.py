@@ -4637,6 +4637,14 @@ async def _compose_local(
         if not state.facts.get("human_handoff_confirmed"):
             state.facts["human_handoff_confirmed"] = await _queue_for_human(getattr(agent, "_mcp", None), state)
         return ""
+    if state.decision == "ask_information" and state.facts.get("missing_evidence"):
+        # The decision has already selected the missing evidence. Free prose
+        # generation was inventing UI choices even with a complete operator
+        # policy. Render that one field, then translate only if necessary.
+        state.facts["reply_source"] = "deterministic:missing_evidence"
+        if state.facts.get("language", "en") in {"en", "it"}:
+            return _fallback_reply(state)
+        return await _fallback_in_language(agent, event, state, session_id, "missing_evidence")
     if state.outcome in {"premium_active", "premium_receipt_verified", "billing_unverified_human"}:
         # Store-specific recovery is policy, not prose: a measured composer
         # changed "close and reopen the app" into "close your browser" for a

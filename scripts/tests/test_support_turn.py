@@ -115,5 +115,18 @@ async def t_known_question_guard(_ctx: TestContext) -> None:
         async def generate(self, **kw):
             return SimpleNamespace(content=json.dumps({"language": "en", "reply": "What app version and device are you using?"}))
     reply = await controller._compose_local(SimpleNamespace(model=Model()), {}, state, "unit")
-    assert "app_version" in state.facts["question_repair"]
+    assert state.facts["reply_source"] == "deterministic:missing_evidence"
     assert "version" not in reply and "device" not in reply
+
+
+@test("support_turn", "a selected custom evidence field cannot acquire invented UI options")
+async def t_custom_question_no_options(_ctx: TestContext) -> None:
+    state = controller.SupportState(thread_id="sim", customer_message="The widget is blank", intent="bug",
+                                    outcome="bug_needs_evidence", decision="ask_information")
+    state.facts.update(language="en", missing_evidence=["widget size"])
+    class Model:
+        async def generate(self, **kw):
+            raise AssertionError("an already selected evidence question needs no free composition")
+    reply = await controller._compose_local(SimpleNamespace(model=Model()), {}, state, "unit")
+    assert "widget size" in reply and all(x not in reply for x in ("small", "medium", "large"))
+    assert state.facts["reply_source"] == "deterministic:missing_evidence"
