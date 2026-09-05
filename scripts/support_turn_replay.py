@@ -42,6 +42,19 @@ class Case:
 
 
 CASES = (
+    Case("log-explanation-followup-it", "esound", (
+         ("inbound", "La riproduzione si blocca su Android 15, versione 5.2.4, Samsung S21."),
+         ("outbound", "Mandaci un log o una registrazione dello schermo."),
+         ("inbound", "Non so cos’è un log e come trovarlo.")),
+         "guidance_question", "guidance_question", ("app_version", "device"),
+         must_not_call=("clickup_create_task",),
+         forbidden_reply=("support review", "versione?"), expected_outcome="guidance_answer"),
+    Case("recording-instruction-followup-en", "lyra", (
+         ("inbound", "Playback stops on my Samsung S21, Android 15, app 1.4.11."),
+         ("outbound", "Please send a screen recording."),
+         ("inbound", "I don't know how to do that.")),
+         "guidance_question", "guidance_question", ("app_version", "device"),
+         must_not_call=("clickup_create_task",), expected_outcome="guidance_answer"),
     Case("signup-pt", "esound", (("inbound", "Quero fazer minha conta"),),
          "account_signup", "signup", must_not_call=("clickup_create_task", "esound_identity_delete_account")),
     Case("catalog-download-es", "esound", (("inbound", "Quiero descargar canciones para escuchar sin internet."),),

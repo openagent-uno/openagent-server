@@ -323,7 +323,16 @@ def _jsonable(value: Any) -> Any:
         # MCP structured content is the most useful representation.
         structured = value.get("structuredContent") or value.get("structured_content")
         if structured is not None:
-            return _jsonable(structured)
+            result = _jsonable(structured)
+            # A valid-looking payload cannot erase an outer MCP failure.
+            if isinstance(result, dict):
+                for key in ("isError", "is_error", "uncertain", "blocked"):
+                    if value.get(key) is True:
+                        result[key] = True
+                for key in ("ok", "success", "sent"):
+                    if value.get(key) is False:
+                        result[key] = False
+            return result
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
@@ -472,19 +481,7 @@ def _succeeded(result: Any) -> bool:
         # ``sent=false, blocked=true`` so the caller can rewrite immediately.
         # Counting that envelope as a sent customer reply is worse than a
         # visible failure: lifecycle patches then claim the thread was handled.
-        protocol_objects: list[dict[str, Any]] = [result]
-        structured = result.get("structuredContent")
-        if isinstance(structured, dict):
-            protocol_objects.append(structured)
-        for item in result.get("content") or []:
-            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-                continue
-            try:
-                decoded = json.loads(item["text"])
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if isinstance(decoded, dict):
-                protocol_objects.append(decoded)
+        protocol_objects = support_turn.receipt_objects(result)
         for protocol in protocol_objects:
             if (
                 protocol.get("ok") is False
@@ -1402,7 +1399,7 @@ async def _read_reported_turn(
     state.reported_turn = assessment
     state.facts["turn_reader"] = "grounded"
     # Other means no operational override, NOT that the thread is resolved.
-    route = {"signup": "account_signup", "password_recovery": "password_recovery",
+    route = {"signup": "account_signup", "password_recovery": "password_recovery", "guidance_question": "guidance_question",
              "referral_status": "referral_status", "status_check": "status_check",
              "catalog_offline": "offline", "library_loss": "bug", "bug": "bug",
              "resolved_confirmation": "resolved_confirmation",
@@ -2068,29 +2065,12 @@ def _review_send_unrepliable(receipt: Any) -> bool:
 
 def _retryable_reply_guard(receipt: Any) -> dict[str, Any] | None:
     """Return Replio's retry envelope, including string-wrapped MCP results."""
-    value = receipt
-    for _ in range(3):
-        if isinstance(value, dict):
-            if value.get("blocked") is True and value.get("retry_now") is True:
-                return value
-            structured = value.get("structuredContent")
-            if isinstance(structured, dict):
-                value = structured
-                continue
-            content = value.get("content")
-            if isinstance(content, list) and content:
-                first = content[0]
-                if isinstance(first, dict) and isinstance(first.get("text"), str):
-                    value = first["text"]
-                    continue
-            return None
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return None
-            continue
+    objects = support_turn.receipt_objects(receipt)
+    if any(x.get("isError") or x.get("is_error") or x.get("uncertain") for x in objects):
         return None
+    for value in objects:
+        if value.get("blocked") is True and value.get("retry_now") is True:
+            return value
     return None
 
 
@@ -4682,7 +4662,11 @@ async def _rephrase_from_receipt(
         or (claimed and len(language) == 2 and claimed != language[:2])
         or len(reply) > max(240, int(len(base) * 2.2))
         or _introduces_claim(reply, base, state)
-        or _drops_claim(reply, base)
+        # Lexical overlap is meaningful only in the base sentence's language.
+        # Requiring English words in a Spanish translation rejects a faithful
+        # translation and sends the untranslated fallback instead.
+        or (language in {"en", "it"} and _language_hint(base) == language
+            and _drops_claim(reply, base))
         or reply_guard.promises_future_release(reply)
         or reply_guard.quotes_money(reply) and not reply_guard.quotes_money(base)
         or bool(re.search(r"\brefresh(?:ed|ing)?\b", reply, re.I))
@@ -5380,13 +5364,15 @@ async def _resolve_diagnostic_identity(
         {"query": lookup_query}, required=False,
     )
     users = [item for item in _result_items(lookup) if isinstance(item, dict)]
-    if not users:
+    # Search is fuzzy. Never operate on the first of multiple accounts, and
+    # never substitute Lyra's internal database id for its Kratos identity.
+    if len(users) != 1 or not _succeeded(lookup):
         return server, {}
     user = users[0]
     if state.tenant.key == "lyra":
         identity = str(
             user.get("identityId") or user.get("identity_id")
-            or user.get("authId") or user.get("id") or ""
+            or user.get("authId") or ""
         ).strip()
         return server, ({"identityId": identity} if identity else {})
     raw_id = user.get("userId") or user.get("user_id") or user.get("id")
@@ -5394,6 +5380,23 @@ async def _resolve_diagnostic_identity(
         return server, {"userId": int(raw_id)}
     except (TypeError, ValueError):
         return server, {}
+
+
+async def _read_referral_status(pool: Any, state: SupportState) -> dict[str, Any]:
+    try:
+        server, identity = await _resolve_diagnostic_identity(pool, state)
+        if not identity:
+            return {}
+        tool, result = await _call_first(pool, server,
+            (f"{server.replace('-', '_')}_get_referral_status", "get_referral_status"),
+            identity, required=False)
+        if tool and _succeeded(result):
+            return next((x for x in support_turn.receipt_objects(result)
+                         if x.get("verified") is True and x.get("product") == state.tenant.key
+                         and all(str(x.get(k)) == str(v) for k, v in identity.items())), {})
+    except Exception as exc:
+        state.facts["referral_read_error"] = type(exc).__name__
+    return {}
 
 
 async def _maybe_enable_bug_diagnostics(pool: Any, state: SupportState) -> None:
@@ -6788,6 +6791,35 @@ async def run(
                 "Verify referral code registration, invitation use, eligibility "
                 "and reward receipt. Account/Premium tools do not provide these "
                 "facts. Preserve the steps already in the thread."
+            )
+            receipt = await _read_referral_status(pool, state)
+            if receipt:
+                state.facts["referral_evidence"] = receipt
+                state.facts.pop("required_capability", None)
+                state.decision = "self_help"
+                state.outcome = "referral_status_verified"
+                state.human_reason = ""
+                state.instructions.append(
+                    "Answer the referral question from referral_evidence. Distinguish registration, "
+                    "activity eligibility and reward receipt. Do not claim a reward was granted "
+                    "merely because it is eligible, or say the customer should wait a fixed time. "
+                    "Do not repeat steps or ask for an invitee's private identity. If eligible rewards "
+                    "are still pending, state that status without promising a credit or completion time."
+                )
+        elif state.intent == "guidance_question":
+            _tool, documents = await _call_first(pool, "replio",
+                ("replio_docs_search", "docs_search"),
+                {"query": state.customer_message, "product": state.tenant.key, "limit": 4}, required=False)
+            state.facts["guidance_documents"] = documents if _succeeded(documents) else []
+            state.decision = "self_help"
+            state.outcome = "guidance_answer"
+            state.instructions.append(
+                "Answer the latest direct question using guidance_documents and operator_policy. "
+                "Explain an unfamiliar term in plain language before suggesting a next step. "
+                "Do not restart the original bug questionnaire or request evidence they cannot provide. "
+                "Never invent device-specific buttons, menus, product availability or a fix. "
+                "If documentation does not establish a product fact, say what remains unverified. "
+                "Previous support messages are context, not proof that their instructions were correct."
             )
         elif state.intent == "account_change":
             await _read_policy(

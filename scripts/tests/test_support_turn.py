@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from ._framework import TestContext, test
 from .test_local_support_controller import _Doubles, _drive
+from .test_local_support_controller import _Pool, _Toolkit
 from src.core import local_support_controller as controller
 from src.core.support_turn import delivery_state, missing_bug_fields, read_reported_turn
 
@@ -69,6 +70,52 @@ async def t_lifecycle_reserved_fields(_ctx: TestContext) -> None:
         assert doubles.args_for("replio_threads_mark_for_human")
         assert all("waiting_for_team" not in call["patch"] for call in doubles.args_for("replio_threads_patch"))
         assert all("needs-human" not in call.get("tags", []) for call in doubles.args_for("replio_threads_tags_add"))
+@test("support_turn", "referral reads require one resolved identity and matching product receipts")
+async def t_referral_identity_and_scope(_ctx: TestContext) -> None:
+    users = [{"identityId": "kratos-test", "id": "internal-test"}]
+    receipt = {"product": "lyra", "identityId": "kratos-test", "verified": True,
+               "eligiblePendingRewards": 1, "rewardsGranted": 0}
+    calls = []
+    async def search_users(**kwargs): return users
+    async def read(**kwargs):
+        calls.append(kwargs)
+        return {"content": [{"type": "text", "text": json.dumps(receipt)}]}
+    pool = _Pool({"lyra-admin": _Toolkit({"lyra_admin_search_users": search_users, "lyra_admin_get_referral_status": read})})
+    state = controller.SupportState(thread_id="synthetic", customer_message="My invitation is missing", account_email="synthetic@example.test", tenant=controller._TENANTS["lyra"])
+    result = await controller._read_referral_status(pool,state)
+    assert result["rewardsGranted"] == 0 and result["eligiblePendingRewards"] == 1
+    assert calls == [{"identityId": "kratos-test"}]
+    receipt["product"] = "esound"
+    assert not await controller._read_referral_status(pool,state)
+    users.append({"identityId": "other"})
+    before=len(calls)
+    assert not await controller._read_referral_status(pool,state)
+    assert len(calls)==before
+    users[:]=[{"id":"internal-test"}]
+    assert not await controller._read_referral_status(pool,state)
+    assert len(calls)==before
+
+
+@test("support_turn", "typographic quote normalization keeps meaning strict")
+async def t_quote_typography(_ctx: TestContext) -> None:
+    source = "Non so cos’è un log. La versione è 1.4.11."
+    assert read_reported_turn({"kind": "other", "evidence": "Non so cos'è un log."}, source)
+    assert read_reported_turn({"kind": "bug", "evidence": "La versione è 1.4.12."}, source) is None
+    assert read_reported_turn({"kind": "bug", "evidence": "The log crashes"}, source) is None
+
+
+@test("support_turn", "MCP text envelopes survive JSON decoding without erasing failure")
+async def t_decoded_receipt(_ctx: TestContext) -> None:
+    for receipt in ({"content": [{"type": "text", "text": '{"sent":true}'}]},
+                    {"content": [{"type": "text", "text": {"sent": True}}]}):
+        normalized = controller._jsonable(receipt)
+        assert delivery_state([{"kind": "customer_reply", "success": True, "receipt": normalized}]) == "sent"
+    failed = controller._jsonable({"isError": True, "structuredContent": {"sent": True}})
+    assert not controller._succeeded(failed)
+    assert delivery_state([{"kind": "customer_reply", "success": True, "receipt": failed}]) == "failed"
+    guard = {"blocked": True, "retry_now": True, "category": "wrong_language"}
+    assert controller._retryable_reply_guard(controller._jsonable({"content": [{"type": "text", "text": json.dumps(guard)}]})) == guard
+    assert controller._retryable_reply_guard({"isError": True, "structuredContent": guard}) is None
 
 
 @test("support_turn", "reported facts must quote customer text, not prior support claims")
