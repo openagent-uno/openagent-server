@@ -347,3 +347,96 @@ async def t_compact_delivery_receipt(_ctx: TestContext) -> None:
     result=summarize(actions)
     assert result['state']=='sent' and result['attempts']==2
     assert 'error_hints' not in result and 'body_text' not in json.dumps(result)
+
+
+@test("support_turn", "explicit bot opt-out persists across later attachments without sending")
+async def t_bot_optout(_ctx: TestContext) -> None:
+    for thread, latest in [({}, "Bot don’t reply"),
+        ({"messages": [{"direction": "inbound", "body_text": "Bot don't reply"},
+                        *[{"direction": "inbound", "body_text": "More details already supplied"} for _ in range(8)],
+                        {"direction": "inbound", "body_text": "[1 attachment(s): image]"}]}, "[1 attachment(s): image]"),
+        ({"tags": ["human-request"]}, "Here is another receipt")]:
+        doubles = _Doubles(thread=thread)
+        result = await _drive(doubles, latest)
+        assert result["outcome"] == "human_requested_no_reply", result
+        assert result["reply"] == ""
+        assert "replio_threads_mark_for_human" in doubles.names
+        assert "replio_threads_respond" not in doubles.names
+        assert "replio_threads_patch" not in doubles.names
+
+
+@test("support_turn", "literal repeats are refused when the semantic service is unavailable")
+async def t_repeat_without_embedder(_ctx: TestContext) -> None:
+    text = "To verify refund eligibility, please send the account email and the order ID."
+    state = controller.SupportState(thread_id="sim", customer_message="I already sent that", intent="refund",
+        outcome="refund_identity_required", decision="ask_information", prior_support_replies=[text])
+    doubles = _Doubles()
+    async def no_match(*args, **kwargs): return None
+    async def compose(*args, **kwargs): return "A person will review the information already provided."
+    with patch.dict(os.environ, {"OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES":"1"}), \
+         patch.object(controller.support_semantics, "matches_previous", no_match), \
+         patch.object(controller.support_semantics, "signal_present", no_match), \
+         patch.object(controller, "_compose_local", compose):
+        await controller._refuse_to_repeat(doubles.pool(), SimpleNamespace(), {}, state, text, "test")
+    assert state.outcome == "repeated_advice_human"
+    assert "replio_threads_mark_for_human" in doubles.names
+
+
+@test("support_turn", "reader distinguishes privacy channel and praise with latest evidence")
+async def t_channel_and_praise(_ctx: TestContext) -> None:
+    for kind, text in [("support_channel", "Can we talk in DMs? I do not want to post my email."),
+                       ("praise", "Muito bom, adorei o aplicativo!"),
+                       ("human_request", "Je veux parler à une personne.")]:
+        class Model:
+            async def generate(self, **kw):
+                return SimpleNamespace(content=json.dumps({"kind": kind, "evidence": text}))
+        state = controller.SupportState(thread_id="sim", customer_message=text, intent="general")
+        await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "test")
+        assert state.intent == kind, state.facts
+        state.customer_message = "Now I have a different problem, the player crashes."
+        state.thread_customer_text = text + "\n" + state.customer_message
+        state.intent = "general"
+        await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "test")
+        assert state.intent == "request_review"
+
+
+@test("support_turn", "private support channel answer stays here without asserting account ownership")
+async def t_private_channel_answer(_ctx: TestContext) -> None:
+    state = controller.SupportState(thread_id="sim", customer_message="Can I use DM?", channel="instagram_dm",
+        outcome="support_channel_answer", decision="self_help")
+    state.facts["language"] = "en"
+    reply = await controller._compose_local(SimpleNamespace(), {}, state, "test")
+    assert "continue here" in reply
+    assert "email" not in reply and "secure" not in reply
+    state.channel = "instagram_comment"
+    reply = controller._fallback_reply(state)
+    assert "direct message" in reply and "Do not post" in reply
+
+
+@test("support_turn", "unambiguous history email is a lookup lead not verified sender authority")
+async def t_history_email_readonly(_ctx: TestContext) -> None:
+    doubles = _Doubles(thread={"messages": [
+        {"direction": "inbound", "body_text": "My email is listener@example.com"},
+        {"direction": "inbound", "body_text": "Please change my account email"}]})
+    result = await _drive(doubles, "Please change my account email", payload_extra={"channel_kind":"messenger"})
+    assert result["facts"].get("account_email_from_customer_history")
+    assert not result["facts"]["verified_sender_email_present"]
+    assert result["outcome"] == "account_change_identity_required"
+    assert not any("delete" in name or "grant" in name for name in doubles.names)
+
+
+@test("support_turn", "human request negatives do not stop ordinary bot questions")
+async def t_human_request_negatives(_ctx: TestContext) -> None:
+    from src.core.support_turn import human_requested, repeated_reply
+    assert human_requested("Bot don’t reply")
+    assert human_requested("I want to talk to a real person")
+    assert not human_requested("I don't want to talk to a human")
+    assert not human_requested("Why doesn't the bot reply?")
+    assert not repeated_reply("Please send the version of the app.", ["We have the version of the app."])
+
+
+@test("support_turn", "next-step guidance is not a request for reproduction steps")
+async def t_next_step_is_not_question(_ctx: TestContext) -> None:
+    from src.core.support_turn import requested_fields
+    assert "steps" not in requested_fields("Your best next step is to search the store to see what is available.")
+    assert "steps" in requested_fields("Which steps did you take before the error?")

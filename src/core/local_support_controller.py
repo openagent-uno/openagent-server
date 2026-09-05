@@ -1410,7 +1410,7 @@ async def _read_reported_turn(
         state.facts["turn_reader"] = "invalid_evidence"
         state.intent = "request_review"
         return
-    if assessment.kind in {"resolved_confirmation", "acknowledgement"} and (
+    if assessment.kind in {"resolved_confirmation", "acknowledgement", "praise", "support_channel", "human_request"} and (
         support_turn.read_reported_turn(assessment.packet(), state.customer_message) is None
     ):
         # An old "it worked" cannot close a newly reported problem.
@@ -1424,7 +1424,8 @@ async def _read_reported_turn(
              "referral_status": "referral_status", "status_check": "status_check",
              "catalog_offline": "offline", "library_loss": "bug", "bug": "bug",
              "resolved_confirmation": "resolved_confirmation",
-             "acknowledgement": "acknowledgement"}.get(assessment.kind)
+             "acknowledgement": "acknowledgement", "praise": "praise",
+             "support_channel": "support_channel", "human_request": "human_request"}.get(assessment.kind)
     if route:
         state.intent = route
         state.facts["intent_source"] = "conversation_reader"
@@ -1605,7 +1606,7 @@ async def _inspect_support_attachments(
     state.facts.update({
         "attachment_count": len(state.facts.get("attachments") or []),
         "attachment_read_attempted": bool(attempted),
-        "attachment_readable": bool(texts) and not incomplete,
+        "attachment_readable": bool(texts),
         "attachment_text_only_runtime": not texts and bool(attempted),
         "attachment_inspection_incomplete": incomplete,
         "attachment_images_processed": min(len(images), 6) if vision_readable else 0,
@@ -1626,6 +1627,12 @@ async def _route_attachment(pool: Any, state: SupportState) -> None:
     # controller believe it had read a screenshot it never saw - and a claim
     # about an unseen image is the worst kind of fabrication in support.
     placeholder = not state.facts.get("attachment_readable")
+    if not placeholder and state.facts.get("attachment_inspection_incomplete"):
+        state.decision = "human"
+        state.outcome = "attachment_partial_review"
+        state.human_reason = "Some attachment evidence was read, but older files or remaining pages exceed the bounded inspection or were unavailable. Review remaining evidence without asking the customer to resend what is already present."
+        state.instructions.append("Some visible evidence is available. Do not claim all attachments were read, call all content unreadable, or request the same files again.")
+        return
     state.decision = "ask_information"
     if placeholder:
         state.outcome = "attachment_unreadable"
@@ -3830,6 +3837,13 @@ def _fallback_reply(state: SupportState) -> str:
             if italian else
             "Nothing shows on the web purchase channel for this address, but that does not cover App Store or Google Play purchases. Send me the store receipt or order ID and I'll check."
         )
+    if state.outcome == "support_channel_answer":
+        private = state.channel in {"messenger", "instagram_dm", "email_imap", "web_form", "whatsapp", "telegram"}
+        if private:
+            return ("Possiamo continuare qui. Descrivi il problema in questa conversazione, senza inviare password o dati della carta."
+                    if italian else "We can continue here. Describe the issue in this conversation; do not send passwords or card details.")
+        return ("Puoi scriverci in un messaggio privato. Non pubblicare email dell’account o dati di pagamento nei commenti."
+                if italian else "You can send us a direct message. Do not post your account email or payment details in public comments.")
     if state.outcome == "praise_thanks":
         return (
             "Grazie mille, ci fa davvero piacere."
@@ -4798,6 +4812,11 @@ async def _compose_local(
         return await _fallback_in_language(
             agent, event, state, session_id, "product_policy",
         )
+    if state.outcome in {"support_channel_answer", "praise_thanks"}:
+        state.facts["reply_source"] = "deterministic:conversation_route"
+        if state.facts.get("language", "en") in {"en", "it"}:
+            return _fallback_reply(state)
+        return await _fallback_in_language(agent, event, state, session_id, "conversation_route")
     if state.outcome == "general_needs_detail":
         # A generic route has no verified product fact at all. Letting the
         # composer fill that vacuum produced a real reply which asserted both
@@ -5856,15 +5875,16 @@ async def _refuse_to_repeat(
         return reply
     if state.outcome in _TERMINAL_NO_REPLY or not state.prior_support_replies:
         return reply
-    repeat = await support_semantics.matches_previous(
+    exact_repeat = support_turn.repeated_reply(reply, state.prior_support_replies)
+    repeat = None if exact_repeat else await support_semantics.matches_previous(
         reply, state.prior_support_replies,
     )
-    if repeat is None:
+    if repeat is None and not exact_repeat:
         return reply
     ineffective = await support_semantics.signal_present(
         "previous_advice_ineffective", state.customer_message,
     )
-    state.facts["repeated_reply_semantic"] = repeat.as_facts()
+    state.facts["repeated_reply_semantic"] = repeat.as_facts() if repeat else {"source": "normalized_exact", "score": 1.0}
     state.facts["previous_advice_ineffective"] = (
         ineffective.as_facts() if ineffective is not None else None
     )
@@ -5880,7 +5900,7 @@ async def _refuse_to_repeat(
     )
     elog(
         "support_controller.repeat_blocked",
-        thread_id=state.thread_id, similarity=round(repeat.score, 3),
+        thread_id=state.thread_id, similarity=round(repeat.score, 3) if repeat else 1.0,
         ineffective=bool(ineffective),
     )
     state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
@@ -6405,6 +6425,15 @@ async def run(
         state.decision = "noop"
         state.facts["legal_silence"] = True
         await _notify_owner_legal(pool, state)
+    elif "human-request" in _thread_tags(thread) or support_turn.human_requested(
+        state.thread_customer_text or message
+    ):
+        state.intent = "human_request"
+        state.decision = "noop"
+        state.outcome = "human_requested_no_reply"
+        state.human_reason = "Customer explicitly requested a person or asked automated replies to stop. Keep this thread in the human queue without another bot reply."
+        await _record_tags(state, pool, ["human-request"])
+        state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
     elif _is_machine_mail(message, state.subject):
         state.intent = "machine_mail"
         state.outcome = "machine_mail"
@@ -6695,6 +6724,12 @@ async def run(
             ).strip()
             if email:
                 state.facts["account_email_from_thread"] = True
+        if not email:
+            candidates = {match.casefold() for match in re.findall(
+                r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", state.thread_customer_text)}
+            if len(candidates) == 1:
+                email = candidates.pop()
+                state.facts["account_email_from_customer_history"] = True
         state.account_ref = app_user_id or email
         state.account_email = email
         state.facts.update({
@@ -6722,7 +6757,13 @@ async def run(
 
         # A money or deletion route the MODEL guessed is classified, never
         # executed: it goes to a person, with the guess stated as a guess.
-        if "diagnostics-active" in _thread_tags(thread):
+        if state.intent == "human_request":
+            state.decision = "noop"
+            state.outcome = "human_requested_no_reply"
+            state.human_reason = "Customer explicitly requests human support. Preserve their question and supplied evidence without another automatic reply."
+            await _record_tags(state, pool, ["human-request"])
+            state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
+        elif "diagnostics-active" in _thread_tags(thread):
             state.intent = "diagnostic_followup"
             state.facts["intent"] = state.intent
             await _collect_bug_diagnostics(pool, state)
@@ -6862,6 +6903,15 @@ async def run(
                 "Customer asks for status of the existing report. Verify task "
                 "and exact released artifact; do not restart troubleshooting "
                 "or treat a previous support promise as release proof."
+            )
+        elif state.intent == "support_channel":
+            state.decision = "self_help"
+            state.outcome = "support_channel_answer"
+            state.instructions.append(
+                "Answer the customer's channel question directly. This Replio conversation is already "
+                "a support channel. On a private channel continue here; do not redirect to email or "
+                "invent a privacy/security guarantee. On a public channel invite a direct message "
+                "without asking for account identifiers publicly or promising to initiate the DM."
             )
         elif state.intent == "password_recovery":
             state.decision = "self_help"

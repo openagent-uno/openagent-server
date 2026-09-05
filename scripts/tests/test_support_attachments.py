@@ -76,3 +76,19 @@ async def t_known_receipt_identity(_ctx: TestContext) -> None:
     assert state.decision == "human" and state.outcome == "attachment_billing_review"
     assert "email" not in controller._fallback_reply(state).lower()
     assert not state.facts.get("billing_verified")
+
+
+@test("support_attachments", "historical media overflow does not erase readable current evidence")
+async def t_partial_evidence(_ctx: TestContext) -> None:
+    _, receipt = _receipt()
+    doubles = _Doubles(attachment=receipt)
+    class Model:
+        async def generate(self, **kw):
+            return SimpleNamespace(content=json.dumps({"readable": True, "visible_text": "Receipt TEST-ORDER", "observation": "A purchase document"}))
+    state = controller.SupportState(thread_id="sim", customer_message="[1 attachment(s): image]", intent="attachment_only")
+    state.facts["attachment_budget_exceeded"] = True
+    await controller._inspect_support_attachments(doubles.pool(), state, SimpleNamespace(model=Model()), {}, "test")
+    assert state.facts["attachment_readable"] and state.facts["attachment_inspection_incomplete"]
+    assert "TEST-ORDER" in state.attachment_visible_text
+    await controller._route_attachment(doubles.pool(), state)
+    assert state.outcome == "attachment_partial_review" and state.decision == "human"

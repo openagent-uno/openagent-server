@@ -40,9 +40,29 @@ class Case:
     image_fixture: str = ""
     expected_image_text: str = ""
     incoming_message: str = ""
+    channel: str = "email_imap"
 
 
 CASES = (
+    Case("private-channel-stays-here", "lyra", (
+        ("inbound", "Can I message you in DMs? I do not want to put my email here."),),
+        "support_channel", "support_channel", expected_outcome="support_channel_answer",
+        forbidden_reply=("email us", "main support channel", "secure", "what problem"), channel="instagram_dm"),
+    Case("public-channel-invites-dm", "lyra", (
+        ("inbound", "Could we talk in DMs? This comment is too long."),),
+        "support_channel", "support_channel", expected_outcome="support_channel_answer",
+        forbidden_reply=("post your email", "email us", "I have sent"), channel="instagram_comment"),
+    Case("positive-portuguese-review", "esound", (
+        ("inbound", "Muito bom, adorei o aplicativo, excelente para ouvir música!"),),
+        "praise", "", expected_outcome="praise_thanks",
+        forbidden_reply=("?", "problema", "versão", "device"), channel="playstore_reviews"),
+    Case("bot-stop-persists-on-image", "esound", (
+        ("inbound", "Here are the account details you already asked for."),
+        ("outbound", "Please send your account email and receipt."),
+        ("inbound", "Bot don't reply"),
+        ("inbound", "[1 attachment(s): image]")),
+        "human_request", "", expected_outcome="human_requested_no_reply",
+        must_call=("replio_threads_mark_for_human",), must_not_call=("replio_threads_respond",), channel="messenger"),
     Case("media-burst-explanation-survives", "esound", (
          ("inbound", "When I search and play a song, a different song plays instead.\n---\napp_version: 5.2.4\ndevice: Samsung S21\nos: Android 15\nplatform: android"),
          ("outbound", "Try playing the song from a fresh search."),
@@ -239,7 +259,7 @@ async def replay(command: list[str], selected: list[Case], repeat: int) -> dict[
                         agent=SimpleNamespace(_mcp=doubles.pool(), model=model),
                         event={"slug": "replio-thread"},
                         payload={"payload": {"thread_id": "sim-" + case.id, "product": case.product,
-                            "channel_kind": "email_imap", "message": {"body_text": case.incoming_message or case.turns[-1][1],
+                            "channel_kind": case.channel, "message": {"body_text": case.incoming_message or case.turns[-1][1],
                             **({"attachments": [{"name": case.image_fixture}]} if case.image_fixture else {})}}},
                         session_id=f"replay:{case.id}:{iteration}", delivery_id="simulated",
                     )

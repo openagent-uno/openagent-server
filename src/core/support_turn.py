@@ -15,13 +15,13 @@ from typing import Any
 
 KINDS = frozenset({
     "other", "signup", "password_recovery", "catalog_offline", "library_loss", "referral_status", "status_check", "bug",
-    "resolved_confirmation", "acknowledgement", "guidance_question",
+    "resolved_confirmation", "acknowledgement", "guidance_question", "praise", "support_channel", "human_request",
 })
 FIELDS = frozenset({"app_version", "device", "os", "platform", "steps", "observed", "expected"})
 
 READER_SYSTEM = """Read the customer's support conversation, not just topic words.
 Return JSON only:
-{"kind":"other|signup|password_recovery|catalog_offline|library_loss|referral_status|status_check|bug|resolved_confirmation|acknowledgement|guidance_question",
+{"kind":"other|signup|password_recovery|catalog_offline|library_loss|referral_status|status_check|bug|resolved_confirmation|acknowledgement|guidance_question|praise|support_channel|human_request",
  "evidence":"exact customer quote supporting the kind",
  "reported":{"app_version":"exact quote","device":"exact quote","os":"exact quote",
  "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote"}}
@@ -38,6 +38,12 @@ there is no question, new evidence or request. 'Thanks, I will try later' does N
 mean the problem is resolved. Never use either kind for a pending authorization,
 an answer to our diagnostic question, or a message reporting another problem.
 For these two kinds evidence MUST quote latest_message, never older history.
+praise means positive feedback with no question, problem or requested action. Positive
+reviews are not requests for troubleshooting. Mixed praise and complaints are NOT praise.
+support_channel means asking to continue support here/in direct messages, or requesting
+a private channel instead of public comments/email. It does not change the account.
+human_request means explicitly asking the bot to stop replying or asking for a human.
+For praise, support_channel and human_request evidence MUST quote latest_message.
 signup means asking how to CREATE an account, not change credentials or recover one.
 password_recovery means asking how to reset a forgotten password or recover sign-in;
 it is self-service guidance, not a request to send support a new password.
@@ -191,7 +197,34 @@ def requested_fields(reply: str) -> set[str]:
         "app_version": r"\bversion\w*|vers[aã]o",
         "device": r"\bdevice|dispositiv\w*|aparelho|modelo|modello",
         "os": r"\boperating system|sistema operativ\w*|\bos\b",
-        "steps": r"\bstep\w*|passagg\w*|passo\w*|what you do|cosa fai",
+        "steps": r"\bsteps\b|\b(?:which|what) step\b|passagg\w*|passo\w*|what you do|cosa fai",
     }
     return {field for field, pattern in patterns.items()
             if any(re.search(pattern, sentence, re.I) for sentence in requests)}
+
+
+def repeated_reply(reply: str, prior: list[str]) -> bool:
+    """Exact normalized repeats do not depend on embedding availability."""
+    normalize = lambda text: re.sub(r"[^\w]+", " ", _fold(text)).strip()
+    proposed = normalize(reply)
+    return len(proposed) >= 20 and any(normalize(text) == proposed for text in prior)
+
+
+_HUMAN_REQUEST = re.compile(
+    r"(?:\bbot[, ]+(?:please )?(?:don['’]?t|do not|stop)\s+(?:reply|respond|replying|responding)\b|"
+    r"\b(?:stop|no more) (?:automated|automatic|bot) (?:replies|responses)\b|"
+    r"\b(?:speak|talk) to (?:a |an )?(?:real )?(?:human|person|agent)\b|"
+    r"\b(?:voglio|vorrei) parlare con (?:una persona|un operatore)\b|"
+    r"\bquiero hablar con (?:una persona|un humano|un operador)\b|"
+    r"\bquero falar com (?:uma pessoa|um humano|um operador)\b|"
+    r"\bje (?:veux|voudrais) parler [àa] (?:une personne|un humain|un agent)\b)", re.I)
+
+
+def human_requested(text: str) -> bool:
+    # Match a direct customer request, not a question about how a bot behaves.
+    for match in _HUMAN_REQUEST.finditer(text):
+        prefix = re.split(r"[.!?\n]", text[:match.start()])[-1][-100:]
+        if re.search(r"\b(?:don['’]?t|do not|no longer) (?:want|need) to\s*$|\bnot\s*$", prefix, re.I):
+            continue
+        return True
+    return False
