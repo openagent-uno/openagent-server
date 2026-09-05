@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import time
@@ -36,6 +37,8 @@ class Case:
     must_not_call: tuple[str, ...] = ()
     forbidden_reply: tuple[str, ...] = ()
     expected_outcome: str = ""
+    image_fixture: str = ""
+    expected_image_text: str = ""
 
 
 CASES = (
@@ -86,6 +89,11 @@ CASES = (
          ("outbound", "Your library issue is fixed."),
          ("inbound", "Different question now: how can I download catalog music to listen offline?")),
          "offline", "catalog_offline", must_not_call=("clickup_create_task",)),
+    Case("vision-error-screenshot", "esound", (("inbound", ""),), "bug", "",
+         must_call=("replio_thread_read_attachment",),
+         must_not_call=("clickup_create_task",),
+         forbidden_reply=("cannot read", "describe the attachment", "send it again"),
+         image_fixture="support-vision-wc037.png", expected_image_text="WC037"),
 )
 
 
@@ -93,8 +101,15 @@ class StdioModel:
     def __init__(self, command: list[str]):
         self.command = command
         self.calls: list[dict[str, Any]] = []
+        self.override = ""
 
-    async def generate(self, *, messages, system, session_id):
+    def build_override_model(self, spec):
+        model = StdioModel(self.command)
+        model.calls = self.calls
+        model.override = spec
+        return model
+
+    async def generate(self, *, messages, system, session_id, images=None):
         proc = await asyncio.create_subprocess_exec(
             *self.command, stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -102,6 +117,9 @@ class StdioModel:
         try:
             stdout, _stderr = await proc.communicate(json.dumps({
                 "messages": messages, "system": system,
+                "model": self.override,
+                "images": [{"mime_type": img.mime_type, "data": base64.b64encode(img.content).decode()}
+                           for img in images or []],
             }).encode())
         except BaseException:
             if proc.returncode is None:
@@ -124,6 +142,10 @@ def score(case: Case, output: dict[str, Any], doubles: _Doubles) -> list[str]:
         failures.append("conversation reader did not recover expected request")
     if case.expected_outcome and output.get("outcome") != case.expected_outcome:
         failures.append("wrong resolution: " + str(output.get("outcome")))
+    if case.image_fixture and not output.get("facts", {}).get("attachment_readable"):
+        failures.append("image was not actually interpreted")
+    if case.expected_image_text and case.expected_image_text not in output.get("attachment_evidence", {}).get("visible_text", ""):
+        failures.append("visible image text did not match ground truth")
     requests = requested_fields(output.get("reply", ""))
     if requests.intersection(case.forbidden_requests):
         failures.append("asked again for provided fields: " + str(sorted(requests.intersection(case.forbidden_requests))))
@@ -155,9 +177,14 @@ async def replay(command: list[str], selected: list[Case], repeat: int) -> dict[
     for iteration in range(repeat):
         for case in selected:
             model = StdioModel(command)
+            attachment = None
+            if case.image_fixture:
+                raw = (Path(__file__).parent / "fixtures" / case.image_fixture).read_bytes()
+                attachment = {"content": [{"type": "image", "mimeType": "image/png",
+                                           "data": base64.b64encode(raw).decode()}]}
             doubles = _Doubles(thread={"product": case.product, "messages": [
                 {"direction": direction, "body_text": body} for direction, body in case.turns
-            ]})
+            ]}, attachment=attachment)
             started = time.monotonic()
             try:
                 with dry_run_scope(True):
@@ -165,7 +192,8 @@ async def replay(command: list[str], selected: list[Case], repeat: int) -> dict[
                         agent=SimpleNamespace(_mcp=doubles.pool(), model=model),
                         event={"slug": "replio-thread"},
                         payload={"payload": {"thread_id": "sim-" + case.id, "product": case.product,
-                            "channel_kind": "email", "message": {"body_text": case.turns[-1][1]}}},
+                            "channel_kind": "email", "message": {"body_text": case.turns[-1][1],
+                            **({"attachments": [{"name": case.image_fixture}]} if case.image_fixture else {})}}},
                         session_id=f"replay:{case.id}:{iteration}", delivery_id="simulated",
                     )
                 output = json.loads(result.text)
@@ -188,11 +216,14 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--case", action="append")
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--vision-model", default="", help="Registered vision model, independent of the composer")
     args = parser.parse_args()
     command = json.loads(Path(args.model_command_file).read_text())
     if not isinstance(command, list) or not command or not all(isinstance(v, str) for v in command):
         parser.error("model command must be a nonempty string array")
     selected = [case for case in CASES if not args.case or case.id in args.case]
+    if args.vision_model:
+        os.environ["OPENAGENT_SUPPORT_VISION_MODEL"] = args.vision_model
     if not selected or not 1 <= args.repeat <= 10:
         parser.error("choose at least one case and repeat between 1 and 10")
     report = asyncio.run(replay(command, selected, args.repeat))

@@ -102,6 +102,9 @@ async def _run_case(brief, message, *, full=None, billing=None, label="general")
     async def ok(**kwargs): return {"ok": True}
     class Model:
         async def generate(self, **kwargs):
+            if kwargs.get("system") == c.support_turn.READER_SYSTEM:
+                packet = json.loads(kwargs["messages"][0]["content"])
+                return SimpleNamespace(content=json.dumps({"kind": "other", "evidence": packet["latest_message"][:500]}))
             return SimpleNamespace(content=json.dumps({"label": label, "language": "en", "reply": "Which step fails?"}))
     pool = _Pool({"replio": _Toolkit({"replio_thread_brief": get_brief,
                   "replio_threads_get": get_full, "replio_threads_mark_for_human": ok}),

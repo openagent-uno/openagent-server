@@ -443,6 +443,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_reply_guard",
     "test_local_support_controller",
     "test_support_turn",
+    "test_support_attachments",
     "test_task_directive",
     # Quality digest — the scheduled push side: summary + flagged-session review
     # list + threshold alerts (incl. embedder-down via embed-error spikes).

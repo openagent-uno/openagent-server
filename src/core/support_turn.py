@@ -125,20 +125,22 @@ def delivery_state(actions: list[dict[str, Any]]) -> str:
         if action.get("planned"):
             return "planned"
         objects = receipt_objects(action.get("receipt"))
-        if any(x.get("simulated") or x.get("dryRun") for x in objects):
-            return "simulated"
+        if any(x.get("uncertain") is True for x in objects):
+            return "unknown"
         if any(x.get("blocked") is True for x in objects):
             return "blocked"
         if any(x.get("isError") or x.get("is_error") or x.get("ok") is False
                or x.get("success") is False for x in objects):
             return "failed"
+        if any(x.get("simulated") or x.get("dryRun") for x in objects):
+            return "simulated"
         if action.get("kind") == "customer_draft":
             return "draft" if action.get("success") else "failed"
         if any(x.get("sent") is False for x in objects):
             return "held"
         if any(x.get("sent") is True for x in objects) and action.get("success"):
             return "sent"
-        return "unknown" if action.get("success") else "failed"
+        return "unknown"
     return "not_attempted"
 
 

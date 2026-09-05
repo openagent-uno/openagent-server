@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from src.core import reply_guard, support_context, support_semantics, support_turn, tool_trace
+from src.core import reply_guard, support_attachments, support_context, support_semantics, support_turn, tool_trace
 from src.core.dry_run import is_dry_run
 from src.core.execution_profile import (
     stateless_completion_scope,
@@ -68,6 +68,7 @@ async def _generate_support_model(
     session_id: str,
     timeout_env: str,
     default_timeout: str = "12",
+    images: list[Any] | None = None,
 ) -> Any:
     """Run one tool-less support model call through the bounded local lane."""
     async with _SUPPORT_MODEL_GATE:
@@ -76,6 +77,7 @@ async def _generate_support_model(
                 messages=messages,
                 system=system,
                 session_id=session_id,
+                **({"images": images} if images else {}),
             ),
             timeout=max(1.0, float(os.environ.get(timeout_env, default_timeout))),
         )
@@ -209,6 +211,9 @@ class SupportState:
     # A customer's report is not a verified product/account fact. Keep this
     # separate from facts, which carries actual tool receipts to the composer.
     reported_turn: support_turn.ReportedTurn | None = None
+    attachment_observation: str = ""
+    attachment_visible_text: str = ""
+    attachment_targets: list[dict[str, Any]] = field(default_factory=list)
     # Everything the CUSTOMER has written on the thread, oldest first. The bug
     # evidence gates read this rather than the latest message alone: a report
     # becomes detailed over two or three messages, and judging only the last
@@ -434,16 +439,21 @@ async def _call_first(
     raw = await _call_tool_impl(pool, server, tool, actual_args)
     result = (
         support_context.unwrap_billing(raw) if server == "billingbear"
+        else raw if tool.endswith("read_attachment")
         else _jsonable(_clickup_payload(raw) if server == "clickup" else raw)
     )
     safe_args = {
         key: ("[redacted]" if "email" in key.lower() else value)
         for key, value in actual_args.items()
     }
+    trace_result = result
+    if tool.endswith("read_attachment"):
+        media, incomplete = support_attachments.images_from_receipt(result)
+        trace_result = {"image_count": len(media), "incomplete": incomplete}
     tool_trace.record_execution({
         "tool_name": tool,
         "tool_args": safe_args,
-        "result": result,
+        "result": trace_result,
     })
     return tool, result
 
@@ -1335,7 +1345,7 @@ async def _read_reported_turn(
     Only non-destructive support routes can be refined here. Money, deletion,
     legal and explicit confirmations retain their independent authority gates.
     """
-    if state.intent not in {"general", "offline", "bug", "feature_request", "account_change"}:
+    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change"}:
         return
     if os.environ.get("OPENAGENT_SUPPORT_TURN_READER", "1").lower() not in _TRUE:
         return
@@ -1352,6 +1362,7 @@ async def _read_reported_turn(
         "customer_text": customer_text,
         "latest_message": state.customer_message[-4000:],
         "prior_support": state.prior_support_replies[-3:],
+        "policy": support_context.policy_packet(state.policy_notes),
     }
     token = set_tool_allowlist([])
     try:
@@ -1367,19 +1378,21 @@ async def _read_reported_turn(
         )
     except Exception as exc:
         state.facts["turn_reader"] = "unavailable"
+        state.intent = "request_review"
         elog("support_controller.turn_reader_failed", level="warning", error_type=type(exc).__name__)
         return
     finally:
         reset_tool_allowlist(token)
     if assessment is None:
         state.facts["turn_reader"] = "invalid_evidence"
+        state.intent = "request_review"
         return
     state.reported_turn = assessment
     state.facts["turn_reader"] = "grounded"
     # Other means no operational override, NOT that the thread is resolved.
     route = {"signup": "account_signup", "password_recovery": "password_recovery",
              "referral_status": "referral_status", "status_check": "status_check",
-             "library_loss": "bug", "bug": "bug"}.get(assessment.kind)
+             "catalog_offline": "offline", "library_loss": "bug", "bug": "bug"}.get(assessment.kind)
     if route:
         state.intent = route
         state.facts["intent_source"] = "conversation_reader"
@@ -1482,36 +1495,105 @@ async def _load_corrections(pool: Any, state: SupportState) -> list[str]:
         state.facts["corrections_applied"] = len(out)
     return out
 
+async def _inspect_support_attachments(
+    pool: Any, state: SupportState, agent: Any, event: dict, session_id: str,
+) -> None:
+    texts: list[str] = []
+    visible_texts: list[str] = []
+    images: list[Any] = []
+    vision_readable = False
+    incomplete = bool(state.facts.get("attachment_budget_exceeded"))
+    attempted = 0
+    for target in state.attachment_targets or [{"attachment_index": 0}]:
+        try:
+            tool, result = await _call_first(
+                pool, "replio", ("replio_thread_read_attachment", "thread_read_attachment"),
+                {"thread_id": state.thread_id, **target}, required=False,
+            )
+        except Exception:
+            incomplete = True
+            continue
+        attempted += bool(tool)
+        if not _succeeded(result):
+            incomplete = True
+            continue
+        pictures, limited = support_attachments.images_from_receipt(result)
+        for picture in pictures:
+            if sum(len(img.content or b"") for img in images) + len(picture.content or b"") > 12_000_000:
+                incomplete = True
+            else:
+                images.append(picture)
+        incomplete |= limited
+        text = _attachment_text(result)
+        placeholder = not text or any(term in text.lower() for term in (
+            "image is not included", "no image content", "placeholder", "unable to read",
+            "cannot read", "image has been generated", "added to the response",
+            "not registered on this message",
+        ))
+        if isinstance(result, dict) and result.get("read") is False:
+            placeholder = True
+        if not placeholder:
+            texts.append(text[:8000])
+            visible_texts.append(text[:8000])
+        elif not pictures:
+            incomplete = True
+    if images:
+        if len(images) > 6:
+            incomplete = True
+        model = getattr(agent, "model", None)
+        model_id = str(event.get("vision_model") or os.environ.get("OPENAGENT_SUPPORT_VISION_MODEL") or event.get("model") or "")
+        token = set_tool_allowlist([])
+        try:
+            if model_id and callable(getattr(model, "build_override_model", None)):
+                model = model.build_override_model(model_id)
+            with strict_local_only_scope(True), stateless_completion_scope(True):
+                response = await _generate_support_model(
+                    model, messages=[{"role": "user", "content": "Read the attached support evidence."}],
+                    images=images[:6], system=support_attachments.VISION_SYSTEM,
+                    session_id=f"{session_id}:support-attachment-vision",
+                    timeout_env="OPENAGENT_SUPPORT_VISION_TIMEOUT_SECONDS", default_timeout="30",
+                )
+            observation = _extract_json(getattr(response, "content", "")) or {}
+            parts = [observation.get("visible_text"), observation.get("observation")]
+            observed = "\n".join(v for v in parts if isinstance(v, str) and v.strip())[:8000]
+            if observation.get("readable") is True and observed:
+                vision_readable = True
+                texts.append(observed)
+                if isinstance(observation.get("visible_text"), str):
+                    visible_texts.append(observation["visible_text"][:8000])
+            else:
+                incomplete = True
+        except Exception as exc:
+            incomplete = True
+            elog("support_controller.vision_failed", level="warning", error_type=type(exc).__name__)
+        finally:
+            reset_tool_allowlist(token)
+    state.attachment_observation = "\n".join(texts)[:12000]
+    state.attachment_visible_text = "\n".join(visible_texts)[:12000]
+    state.facts.update({
+        "attachment_count": len(state.facts.get("attachments") or []),
+        "attachment_read_attempted": bool(attempted),
+        "attachment_readable": bool(texts) and not incomplete,
+        "attachment_text_only_runtime": not texts and bool(attempted),
+        "attachment_inspection_incomplete": incomplete,
+        "attachment_images_processed": min(len(images), 6) if vision_readable else 0,
+    })
+
+
 async def _route_attachment(pool: Any, state: SupportState) -> None:
     for path in (
         "esound/procedures/customer-response/triage-workflow.md",
         "esound/procedures/customer-response/attachment-reading-gotcha.md",
     ):
         await _read_policy(pool, state, path)
-    tool, result = await _call_first(
-        pool, "replio",
-        ("replio_thread_read_attachment", "thread_read_attachment"),
-        {"thread_id": state.thread_id, "attachment_index": 0},
-        required=False,
-    )
-    text = _attachment_text(result)
+    text = state.attachment_observation
     # The Replio tool answers "Image has been generated and added to the
     # response" and ships the picture as an MCP image block. A vision model
     # sees it; the self-hosted text-only model receives that sentence and
     # nothing else. Treating that acknowledgement as content made the
     # controller believe it had read a screenshot it never saw - and a claim
     # about an unseen image is the worst kind of fabrication in support.
-    placeholder = not text or any(term in text.lower() for term in (
-        "image is not included", "no image content", "placeholder",
-        "unable to read", "cannot read", "image has been generated",
-        "added to the response", "not registered on this message",
-    ))
-    state.facts.update({
-        "attachment_count": len(state.facts.get("attachments") or []),
-        "attachment_read_attempted": bool(tool),
-        "attachment_readable": not placeholder,
-        "attachment_text_only_runtime": placeholder and bool(tool),
-    })
+    placeholder = not state.facts.get("attachment_readable")
     state.decision = "ask_information"
     if placeholder:
         state.outcome = "attachment_unreadable"
@@ -1519,15 +1601,23 @@ async def _route_attachment(pool: Any, state: SupportState) -> None:
             "Say the attachment content was not available; ask for the key details in text. Never describe the image."
         )
     elif re.search(r"\b(?:receipt|invoice|order|purchase|ricevuta|fattura)\b", text, re.I):
+        if state.account_ref or state.account_email:
+            state.decision = "human"
+            state.outcome = "attachment_billing_review"
+            state.human_reason = "Purchase attachment read; account reference already available. Review it against authoritative billing records without requesting the same identity or receipt again."
+            state.instructions.append("The receipt is available for billing review; it does not itself verify a payment or Premium status. Do not request the account email or receipt again.")
+            return
         state.outcome = "attachment_receipt_unverified"
         state.instructions.append(
-            "The attachment looks purchase-related but is not billing proof by itself. Ask for account email and order ID in text."
+            "The attachment looks purchase-related but is not billing proof by itself. Ask only for the account email if it is missing; do not ask to retype the receipt."
         )
     else:
-        state.outcome = "attachment_needs_description"
-        state.instructions.append(
-            "Ask for a text description, device/OS, app version and reproduction steps."
-        )
+        if _intent(text) == "bug":
+            state.intent = "bug"
+            await _route_bug(pool, state)
+        else:
+            state.outcome = "attachment_needs_description"
+            state.instructions.append("The image was read. Ask only what the customer needs help with; do not ask them to transcribe it.")
 
 
 # The policy's closed token list. Matching one of these is necessary, never
@@ -2717,7 +2807,7 @@ _BUG_SURFACES: tuple[tuple[str, str, str, str], ...] = (
      r"skip(?:s|ping)? (?:songs?|tracks?)|riprodurre (?:un )?(?:brano|canzone)",
      "playback", "client", "esound/client-core"),
     (r"playlist|library|folder|libreria|cartell", "the library", "client", "esound/client-core"),
-    (r"play(?:back|er|ing)?\b|track|song|queue|riproduzione|brano", "playback", "client", "esound/client-core"),
+    (r"\bplay(?:back|er|ing)?\b|\btracks?\b|\bsongs?\b|\bqueue\b|riproduzione|brano", "playback", "client", "esound/client-core"),
 )
 
 
@@ -2974,12 +3064,19 @@ def _reported_bug_route(state: SupportState) -> tuple[str, str, str] | None:
     if state.reported_turn and state.reported_turn.kind == "library_loss":
         return ("Fix missing content in the library", _CLICKUP_LISTS["client"],
                 f"{state.tenant.component_prefix}/client-core")
-    return _bug_symptom_route(state.thread_customer_text or state.customer_message, state.tenant)
+    return _bug_symptom_route(_bug_report_text(state), state.tenant)
+
+
+def _bug_report_text(state: SupportState) -> str:
+    text = state.thread_customer_text or state.customer_message
+    if state.attachment_visible_text:
+        text += "\nText read from attachment (verify before diagnosis):\n" + state.attachment_visible_text
+    return text
 
 
 def _new_bug_task_payload(state: SupportState) -> dict[str, Any] | None:
     """Build a canonical task only for deterministic, clearly routed symptoms."""
-    text = (state.thread_customer_text or state.customer_message).strip()
+    text = _bug_report_text(state).strip()
     route = _reported_bug_route(state)
     if route is None:
         return None
@@ -3315,7 +3412,7 @@ async def _route_bug(pool: Any, state: SupportState) -> None:
     ):
         await _read_policy(pool, state, path)
 
-    report_text = state.thread_customer_text or state.customer_message
+    report_text = _bug_report_text(state)
     query = _bug_query(report_text)
     matches: list[dict[str, Any]] = []
     list_only = not _pick_tool(pool, "clickup", (
@@ -3765,15 +3862,15 @@ def _fallback_reply(state: SupportState) -> str:
         )
     if state.outcome == "attachment_receipt_unverified":
         return (
-            "L’allegato sembra relativo a un acquisto, ma devo incrociarlo con i dati di fatturazione. Invia a testo l’email dell’account e l’ID ordine."
+            "L’allegato sembra relativo a un acquisto e va verificato nei dati di fatturazione. Qual è l’email del tuo account nell’app?"
             if italian else
-            "The attachment appears purchase-related, but it must be cross-checked with billing. Please send the account email and order ID as text."
+            "The attachment appears purchase-related and needs to be checked against billing records. What is your account email in the app?"
         )
     if state.outcome == "attachment_needs_description":
         return (
-            "Descrivi a testo cosa mostra l’allegato e indica dispositivo, sistema operativo, versione dell’app e passaggi per riprodurre il problema."
+            "Per quale problema o domanda relativa all’allegato vorresti aiuto?"
             if italian else
-            "Please describe the attachment in text and include the device, OS, app version, and reproduction steps."
+            "What issue or question about the attachment would you like help with?"
         )
     if state.outcome in {"account_delete_identity_required", "account_change_identity_required"}:
         return (
@@ -3980,9 +4077,9 @@ def _fallback_reply(state: SupportState) -> str:
                 "write again."
             )
         return (
-            "Grazie del messaggio. Lo stiamo guardando e ti rispondiamo qui."
+            "Non sono riuscito a completare la verifica. Il caso richiede una revisione del supporto."
             if italian else
-            "Thanks for writing. We are looking at this and will answer you here."
+            "I could not complete the verification. The case needs a support review."
         )
     # The last resort, and therefore the sentence a customer is most likely to
     # get when nothing else matched — including in answer to a question we
@@ -4611,6 +4708,7 @@ async def _compose_local(
         "customer_name": state.facts.get("customer_name") or "",
         "already_known": state.facts.get("already_known_from_form") or {},
         "customer_reported": state.reported_turn.packet() if state.reported_turn else {},
+        "attachment_observation": state.attachment_observation,
         "decision": state.decision,
         "outcome": state.outcome,
         "verified_facts": state.facts,
@@ -4673,7 +4771,9 @@ async def _compose_local(
         "for factual claims; never add a "
         "password request: passwords and authentication codes must never be "
         "collected in support chat, including a new password during signup. "
-        "Never add a "
+        "When asking for a missing detail, do not invent menu paths, buttons, "
+        "field choices or UI variants; offer options only when provided by "
+        "verified facts or operator policy. Never add a "
         "troubleshooting step, a contact channel, or a timeline that is not "
         "there. Output JSON only: {\"language\":\"...\",\"reply\":\"...\"}."
     )
@@ -4965,7 +5065,8 @@ async def _record_action(
         tool, result = await _call_first(pool, server, candidates, args)
     except Exception as exc:
         state.actions.append({"kind": kind, "success": False,
-                              "receipt": {"ok": False, "error_type": type(exc).__name__}})
+                              "receipt": {"ok": False, "error_type": type(exc).__name__,
+                                          "uncertain": kind == "customer_reply"}})
         return False
     success = _succeeded(result)
     if kind == "customer_reply" and success:
@@ -6118,6 +6219,18 @@ async def run(
             if isinstance(item, dict) else "attachment"
             for item in attachments
         ]
+        targets = []
+        for item in (thread or {}).get("messages", []) if isinstance(thread, dict) else []:
+            if not isinstance(item, dict) or item.get("direction") != "inbound":
+                continue
+            external_id = item.get("external_message_id")
+            if external_id:
+                targets.extend({"message_external_id": external_id, "attachment_index": index}
+                               for index, _ in enumerate(item.get("attachments") or []))
+        if not targets:
+            targets = [{"attachment_index": index} for index in range(len(attachments))]
+        state.facts["attachment_budget_exceeded"] = len(targets) > 6
+        state.attachment_targets = targets[-6:]
         placeholder_only = _body_is_attachment_placeholder(message)
         if placeholder_only and not attachments:
             # The placeholder itself is the evidence an attachment exists.
@@ -6310,7 +6423,13 @@ async def run(
                     # with an internal sentence. Read, explain, and stop at
                     # the mutation instead.
                     state.facts["money_execution_requires_human"] = True
+        if attachments:
+            await _inspect_support_attachments(pool, state, agent, event, session_id)
         await _read_reported_turn(agent, event, state, session_id)
+        if (state.intent in {"general", "attachment_only"} and state.facts.get("attachment_readable")
+                and _intent(state.attachment_visible_text) == "bug"):
+            state.intent = "bug"
+            state.facts["intent_source"] = "attachment_observation"
         if state.facts.get("money_execution_requires_human"):
             # The label was inferred, not stated. The route may be served, but
             # nothing about their money may be asserted or spent on an
@@ -6496,6 +6615,10 @@ async def run(
                 )
             else:
                 await _delete_account(pool, state, sender_email)
+        elif state.intent == "request_review":
+            state.decision = "human"
+            state.outcome = "request_understanding_human"
+            state.human_reason = "Conversation reader unavailable or evidence invalid. Review the full customer request before answering from a topic keyword."
         elif state.intent == "status_check":
             if state.linked_task_id:
                 _tool, task_read = await _call_first(
@@ -7227,6 +7350,8 @@ async def run(
         "facts": state.facts,
         "customer_reported": state.reported_turn.packet() if state.reported_turn else {},
         "controller": "esound-local-v1",
+        "attachment_evidence": {"visible_text": state.attachment_visible_text,
+                                "interpretation": state.attachment_observation},
         "local_only": True,
         "language": state.facts.get("language", "en"),
     }

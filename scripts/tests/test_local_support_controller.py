@@ -113,11 +113,17 @@ class _Model:
         self.saw_strict_local = False
 
     async def generate(self, **_kwargs: Any) -> Any:
+        from src.core import support_turn
         from src.core.execution_profile import strict_local_only_active
         from src.core.tool_scope import current_tool_allowlist
 
         self.saw_empty_tools = current_tool_allowlist() == frozenset()
         self.saw_strict_local = strict_local_only_active()
+        if _kwargs.get("system") == support_turn.READER_SYSTEM:
+            packet = json.loads(_kwargs["messages"][0]["content"])
+            return SimpleNamespace(content=json.dumps({
+                "kind": "other", "evidence": packet["latest_message"][:500],
+            }))
         return SimpleNamespace(content=json.dumps({
             "language": "en",
             "reply": "Premium is active. Sign in with the purchase email, then close and reopen the app.",
@@ -285,10 +291,9 @@ async def t_active_premium(_ctx: TestContext) -> None:
         "vault:esound/procedures/customer-response/_routing.md",
         "billing:test-active",
     ], calls
-    # Store-specific recovery is policy, so the model is intentionally not
-    # called: it previously changed "reopen the app" into "reopen browser".
+    # The reader may use the model, but store recovery wording stays policy.
     assert output["facts"]["reply_source"] == "deterministic:billing_policy"
-    assert model.saw_empty_tools is False
+    assert model.saw_empty_tools is True
     assert not any("human" in call for call in calls)
 
 

@@ -90,7 +90,7 @@ async def t_reader_failure(_ctx: TestContext) -> None:
             raise TimeoutError("unavailable")
     state = controller.SupportState(thread_id="sim", customer_message="cannot download offline", intent="offline")
     await controller._read_reported_turn(SimpleNamespace(model=Model()), {}, state, "unit")
-    assert state.intent == "offline" and state.reported_turn is None
+    assert state.intent == "request_review" and state.reported_turn is None
     assert state.facts["turn_reader"] == "unavailable"
 
 
@@ -117,4 +117,3 @@ async def t_known_question_guard(_ctx: TestContext) -> None:
     reply = await controller._compose_local(SimpleNamespace(model=Model()), {}, state, "unit")
     assert "app_version" in state.facts["question_repair"]
     assert "version" not in reply and "device" not in reply
-
