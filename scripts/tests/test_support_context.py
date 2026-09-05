@@ -10,6 +10,25 @@ from .test_local_support_controller import _Model, _Pool, _Toolkit
 from src.core import local_support_controller as c, support_context as sc
 
 
+@test("support_context", "live-sized policy stays complete; overflow queues review without a partial-policy reply")
+async def t_policy_budget(_ctx: TestContext):
+    from .test_local_support_controller import _Doubles
+    notes = {"replio:rules": "r" * 123000, "event": "e" * 25000, "vault": "v" * 100000}
+    assert sum(len(s["content"]) for s in sc.policy_packet(notes)["sources"]) == 248000
+    notes["extra"] = "x" * 100000
+    assert len(sc.policy_sources(notes)) == 4
+    doubles = _Doubles()
+    state = c.SupportState(thread_id="fixture", customer_message="Please help with the widget", policy_notes=notes)
+    class Model:
+        async def generate(self, **kwargs):
+            raise AssertionError("model must not see a truncated policy")
+    with patch.dict(os.environ, {"OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES": "1"}):
+        reply = await c._compose_local(SimpleNamespace(model=Model(), _mcp=doubles.pool()), {}, state, "test")
+    assert reply == "" and state.outcome == "policy_context_overflow_human"
+    assert state.facts["human_handoff_confirmed"]
+    assert "replio_threads_respond" not in doubles.names
+
+
 @test("support_context", "billing text envelopes preserve active state and outer errors")
 async def t_billing_envelopes(_ctx: TestContext):
     active = {"isPremium": True, "store": "google"}

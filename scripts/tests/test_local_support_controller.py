@@ -2351,7 +2351,8 @@ async def t_paddle_email_lookup(_ctx: TestContext) -> None:
     assert seen[0]["query"] == {"email": "a@b.com"}, seen
     # A Paddle-only negative must NOT count as verified account state.
     assert output["facts"]["billing_verified"] is False, output["facts"]
-    assert output["outcome"] == "premium_unverified_paddle_scope", output
+    assert output["outcome"] == "billing_unverified_human", output
+    assert output["facts"]["billing_state"] == "unknown", output
     low = output["reply"].lower()
     assert "no subscription" not in low and "not premium" not in low, output["reply"]
 
@@ -3791,3 +3792,107 @@ async def t_clickup_unfiltered_new_bug(_ctx: TestContext) -> None:
     assert reads == [lsc._CLICKUP_LISTS["lyra"]], reads
     assert state.outcome == "bug_created", (state.outcome, state.facts)
     assert "clickup_create_task" in doubles.names
+
+
+@test("local_support_controller", "billing transport envelopes preserve explicit account evidence")
+async def t_billing_transport_evidence(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import _customer_lookup_state
+    from src.core.support_billing import billing_payload
+    for active in (True, False):
+        body = {"appUserId": "customer-test", "isPremium": active, "premiumSource": "Google"}
+        envelope = {"content": [{"type": "text", "text": "HTTP 200 OK\n" + json.dumps(body)}]}
+        assert billing_payload(envelope) == body
+        assert _customer_lookup_state(envelope)[:2] == (active, "google")
+        assert _customer_lookup_state({"structuredContent": body})[0] is active
+    for unknown in ({}, {"isPremium": "false"}, {"isPremium": None},
+                    {"isPremium": True, "is_premium": False},
+                    {"content": [{"type": "text", "text": "HTTP 503 Unavailable\n{}"}]},
+                    {"content": [{"type": "text", "text": "HTTP 200 OK\nnot-json"}]},
+                    {"isError": True, "structuredContent": {"isPremium": True}},
+                    {"entitlements": [{}]},
+                    {"entitlements": [{"id": "premium", "expiresAt": "broken"}]}):
+        assert _customer_lookup_state(unknown)[0] is None, unknown
+
+
+_RECEIPT_FIXTURE = (
+    "---------- Forwarded message ---------\n"
+    "Da: Google Play <noreply@example.com>\n"
+    "Ricevuta Google Play. Numero ordine: GPA.1234-5678-9012-34567\n"
+    "Rimborsi: se l'articolo non funziona puoi richiedere un rimborso."
+)
+
+
+@test("local_support_controller", "forwarded receipt is checked against billing before replying")
+async def t_receipt_with_real_billing_envelope(_ctx: TestContext) -> None:
+    for authored in ("", "Ecco la ricevuta.\n"):
+        d = _Doubles(thread={"channel_kind": "email_imap", "author_email": "listener@example.com",
+                             "customer": {"email": "listener@example.com", "identity_id": "test-identity", "is_premium": True}},
+                     customer={"content": [{"type": "text", "text": "HTTP 200 OK\n" + json.dumps({
+                         "appUserId": "test-identity", "isPremium": True, "premiumSource": "Google",
+                         "premiumExpiresAt": "2099-09-05T08:32:27Z"})}]})
+        out = await _drive(d, authored + _RECEIPT_FIXTURE,
+                           payload_extra={"product": "lyra", "channel_kind": "email_imap"})
+        assert out["outcome"] == "premium_receipt_verified", out
+        assert out["billing_evidence"]["billing_state"] == "active", out
+        assert out["facts"]["intent"] == "premium", out
+        assert "billingbear_get_v1_customers_by_appUserId" in d.names, d.names
+        assert not any("refund" in name for name in d.names), d.names
+        assert "replio_threads_respond" in d.names, out
+        assert "send" not in out["reply"].lower(), out["reply"]
+
+
+@test("local_support_controller", "unreadable billing queues a human instead of an activation request")
+async def t_unreadable_billing_is_not_inactive(_ctx: TestContext) -> None:
+    d = _Doubles(customer={"content": [{"type": "text", "text": "HTTP 200 OK\n{}"}]})
+    out = await _drive(d, "Ho pagato Premium ma non si attiva", payload_extra={"appUserId": "5f8349b40a31dbebd7063a5d"})
+    assert out["outcome"] == "billing_unverified_human", out
+    assert out["billing_evidence"]["billing_state"] == "unknown", out
+    assert "replio_threads_mark_for_human" in d.names, d.names
+    assert "ricevuta" not in out["reply"].lower(), out["reply"]
+
+
+@test("local_support_controller", "receipt parsing preserves the actual refund request")
+async def t_receipt_preserves_request(_ctx: TestContext) -> None:
+    from src.core.support_email import receipt_request
+    from src.core.local_support_controller import _intent, _customer_text, _recent_exchange
+    authored, receipt = receipt_request("Voglio un rimborso.\n" + _RECEIPT_FIXTURE)
+    assert receipt and _intent(authored, "email_imap") == "refund", authored
+    thread = {"messages": [{"direction": "inbound", "body_text": _RECEIPT_FIXTURE}]}
+    assert "rimbors" not in _customer_text(thread, _RECEIPT_FIXTURE).lower()
+    assert "rimbors" not in str(_recent_exchange(thread)).lower()
+
+
+@test("local_support_controller", "reconciled receipt-only mail keeps its document boundary")
+async def t_receipt_reconciliation(_ctx: TestContext) -> None:
+    d = _Doubles(thread={"channel_kind": "email_imap", "messages": [
+        {"direction": "inbound", "body_text": _RECEIPT_FIXTURE}]},
+        customer={"isPremium": True, "premiumSource": "Google"})
+    out = await _drive(d, "", payload_extra={"product": "lyra", "channel_kind": "email_imap",
+                                            "appUserId": "5f8349b40a31dbebd7063a5d"})
+    assert out["outcome"] == "premium_receipt_verified", out
+
+
+@test("local_support_controller", "reconciliation uses the latest confirmation after a receipt")
+async def t_receipt_reconciliation_does_not_replay_old_receipt(_ctx: TestContext) -> None:
+    d = _Doubles(thread={"channel_kind": "email_imap", "messages": [
+        {"direction": "inbound", "body_text": _RECEIPT_FIXTURE},
+        {"direction": "inbound", "body_text": "Thanks, it works now!"}]},
+        customer={"isPremium": True, "premiumSource": "Google"})
+    out = await _drive(d, "", payload_extra={"product": "lyra", "channel_kind": "email_imap"})
+    assert out["outcome"] == "resolved_confirmation", out
+    assert "replio_threads_respond" not in d.names, d.names
+
+
+@test("local_support_controller", "billing enrichment never replaces evidence with a mismatched account")
+async def t_billing_enrichment_conflict(_ctx: TestContext) -> None:
+    from src.core.local_support_controller import _billing_lookup, _customer_lookup_state
+    async def by_email(**kwargs):
+        return {"content": [{"type": "text", "text": 'HTTP 200 OK\n{"appUserId":"test-id","isPremium":true}'}]}
+    for full in ({"appUserId": "other-id", "isPremium": True},
+                 {"appUserId": "test-id", "isPremium": False}, {}):
+        async def customer(**kwargs):
+            return full
+        pool = _Pool({"billingbear": _Toolkit({"billingbear_get_customer_by_email": by_email,
+            "billingbear_get_v1_customers_by_appUserId": customer})})
+        got = await _billing_lookup(pool, "", "listener@example.com")
+        assert _customer_lookup_state(got)[0] is (True if not full else None), got

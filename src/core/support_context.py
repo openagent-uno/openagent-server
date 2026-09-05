@@ -139,11 +139,19 @@ def policies_from_brief(brief: Any, event: dict) -> dict[str, str]:
     return notes
 
 
+MAX_POLICY_CHARS = 320_000
+
+
+def policy_sources(notes: dict[str, str]) -> list[dict[str, str]]:
+    return [{"source": key, "sha256": hashlib.sha256(text.encode()).hexdigest()}
+            for key, text in notes.items()]
+
+
 def policy_packet(notes: dict[str, str]) -> dict:
     # No silent dropping of operator rules to fit an input window. An explicit
     # failure is recoverable; answering with half a policy is not.
-    if sum(len(text) for text in notes.values()) > 160_000:
-        raise RuntimeError("support policy exceeds 160000 characters; consolidate operator rules")
+    if sum(len(text) for text in notes.values()) > MAX_POLICY_CHARS:
+        raise RuntimeError(f"support policy exceeds {MAX_POLICY_CHARS} characters; consolidate operator rules")
     return {
         "precedence": "Replio standing rules, then event/profile instructions, then vault procedures. "
                       "None establishes customer account state or proves a completed action. "
