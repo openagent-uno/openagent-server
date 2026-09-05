@@ -5407,9 +5407,52 @@ async def _read_referral_status(pool: Any, state: SupportState) -> dict[str, Any
     return {}
 
 
+async def _read_support_evidence(pool: Any, state: SupportState, kind: str) -> dict[str, Any]:
+    """Read app-scoped evidence; missing metadata never selects a default app."""
+    fields = state.facts.get("already_known_from_form") or _form_fields(state.thread_customer_text or state.customer_message)
+    package = str(fields.get("package") or "").strip()
+    raw_platform = str(fields.get("platform") or fields.get("os") or "").strip().lower()
+    platform = "android" if raw_platform.startswith("android") else "ios" if raw_platform.startswith(("ios", "ipados")) else ""
+    if not package or not platform:
+        state.facts[kind + "_evidence_unavailable"] = "reported_package_and_platform_required"
+        return {}
+    args: dict[str, Any] = {"packageName": package, "platform": platform}
+    if kind == "native_crash":
+        version = str(fields.get("native_version") or fields.get("app_version") or "").strip()
+        match = re.fullmatch(r"(\d+(?:\.\d+){1,3})(?:\s*\((\d+)\))?", version)
+        if not match:
+            state.facts[kind + "_evidence_unavailable"] = "reported_native_version_required"
+            return {}
+        args["version"] = match.group(1)
+        if match.group(2): args["build"] = match.group(2)
+        args["days"] = 7
+    tool_name = "read_native_crashes" if kind == "native_crash" else "read_release_status"
+    try:
+        tool, result = await _call_first(pool, "support-evidence", ("support_evidence_" + tool_name, tool_name), args, required=False)
+        if tool and _succeeded(result):
+            receipt = next((x for x in support_turn.receipt_objects(result)
+                if x.get("verified") is True and x.get("product") == state.tenant.key
+                and x.get("packageName") == package and x.get("platform") == platform), {})
+            if receipt:
+                state.facts[kind + "_evidence"] = receipt
+                state.instructions.append("This is source evidence for the reported app/platform. Crash cohorts do not identify this customer's cause. Store availability does not prove a particular task's fix is included; require exact artifact-to-fix evidence. Never infer absence from an unavailable read.")
+                return receipt
+    except Exception as exc:
+        state.facts[kind + "_evidence_error"] = type(exc).__name__
+    return {}
+
+
 async def _maybe_enable_bug_diagnostics(pool: Any, state: SupportState) -> None:
     route = _reported_bug_route(state)
     if route and "app startup" in route[0]:
+        receipt = await _read_support_evidence(pool, state, "native_crash")
+        if receipt and state.linked_task_id:
+            await _record_action(state, pool, "clickup",
+                ("clickup_create_comment", "create_comment", "clickup_create_task_comment", "create_task_comment"),
+                {"task_id": state.linked_task_id, "comment_text": (
+                    f"{_source_marker(state)}\n\nNative FATAL crash cohort for the reported app/version. "
+                    "This is NOT a verified match to the individual customer's event or root cause.\n"
+                    + json.dumps(receipt, ensure_ascii=False, default=str)[:6000])}, "task_comment")
         state.facts["diagnostics_skipped"] = "native_startup_capture_required"
         state.facts["required_capability"] = "native_startup_crash_read"
         state.instructions.append(
@@ -6776,6 +6819,7 @@ async def run(
                     {"task_id": state.linked_task_id}, required=False,
                 )
                 state.facts["status_task_read_succeeded"] = _succeeded(task_read)
+            await _read_support_evidence(pool, state, "release")
             state.decision = "human"
             state.outcome = "status_verification_human"
             state.human_reason = (

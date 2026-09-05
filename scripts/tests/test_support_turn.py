@@ -254,3 +254,27 @@ async def t_custom_question_no_options(_ctx: TestContext) -> None:
     reply = await controller._compose_local(SimpleNamespace(model=Model()), {}, state, "unit")
     assert "widget size" in reply and all(x not in reply for x in ("small", "medium", "large"))
     assert state.facts["reply_source"] == "deterministic:missing_evidence"
+
+@test("support_turn", "native evidence is scoped, versioned and cannot turn a cohort into an individual diagnosis")
+async def t_native_evidence_scope(_ctx: TestContext) -> None:
+    calls=[]
+    receipt={"verified":True,"product":"lyra","packageName":"com.fixture","platform":"android","individualCustomerMatch":False,"scope":"version_cohort","evidence":{"groups":[]}}
+    async def read(**kwargs):
+        calls.append(kwargs)
+        return {"content":[{"type":"text","text":json.dumps(receipt)}]}
+    pool=_Pool({"support-evidence":_Toolkit({"support_evidence_read_native_crashes":read,"support_evidence_read_release_status":read})})
+    state=controller.SupportState(thread_id="synthetic",customer_message="crashes at startup",tenant=controller._TENANTS["lyra"])
+    assert not await controller._read_support_evidence(pool,state,"native_crash")
+    assert not calls
+    state.facts["already_known_from_form"]={"package":"com.fixture","platform":"Android 15","native_version":"1.4.13 (71)"}
+    got=await controller._read_support_evidence(pool,state,"native_crash")
+    assert got["individualCustomerMatch"] is False
+    assert calls[-1]=={"packageName":"com.fixture","platform":"android","version":"1.4.13","build":"71","days":7}
+    receipt["product"]="esound"
+    assert not await controller._read_support_evidence(pool,state,"native_crash")
+    receipt["product"]="lyra";receipt["verified"]=False
+    assert not await controller._read_support_evidence(pool,state,"native_crash")
+    receipt["verified"]=True
+    assert await controller._read_support_evidence(pool,state,"release")
+    assert state.decision != "resolved"
+    assert "particular task's fix" in state.instructions[-1]
