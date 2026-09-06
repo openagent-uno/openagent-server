@@ -1130,3 +1130,19 @@ async def guard_reply(
         except Exception:  # noqa: BLE001
             pass
         return reply
+
+
+def claims_profile_change(text: Optional[str]) -> bool:
+    """Profile/email mutations are unavailable to the support controller.
+
+    Future commitments are as misleading as past-tense receipts. Customer
+    instructions and an offer to request human review are not these claims.
+    """
+    if not text:
+        return False
+    return bool(re.search(
+        r"\b(?:i(?:['’]ll| will| have|'ve)|we(?:['’]ll| will| have|'ve)|"
+        r"voy a|vamos a|he|hemos|vou|vamos|ho|abbiamo|je vais|j'ai|nous allons|ich werde|ich habe)"
+        r"\s+(?:\w+\s+){0,2}(?:chang\w*|updat\w*|merg\w*|cambi\w*|modific\w*|alter\w*|troc\w*|aggiorn\w*|unific\w*|änder\w*|fusion\w*)"
+        r"[^.!?\n]{0,100}\b(?:e-?mail|correo|correio|profil\w*|account|cuenta|conta|compte|konto)\b",
+        text, re.I))

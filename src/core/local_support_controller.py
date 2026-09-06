@@ -831,13 +831,27 @@ _MACHINE_MAIL = re.compile(
     r"mailer-daemon|postmaster@|report domain:|dmarc aggregate|"
     r"we noticed a (?:new )?login|new login to|new sign-?in|"
     r"security alert for your|verify it.s you|"
-    r"automatic reply|out of office|risposta automatica",
+    r"automatic reply|out of office|risposta automatica|"
+    r"we have completed our review of your submission|review of your submission has been completed|submission is now eligible for distribution",
     re.IGNORECASE,
 )
 
 
 def _is_machine_mail(text: str, subject: str = "") -> bool:
     return bool(_MACHINE_MAIL.search(f"{subject}\n{text}"))
+
+
+def _machine_sender(thread: Any, payload: Any) -> bool:
+    messages = (thread or {}).get("messages", []) if isinstance(thread, dict) else []
+    inbound = [m for m in messages if isinstance(m, dict) and m.get("direction") == "inbound"]
+    message = inbound[-1] if inbound else (payload or {}).get("message", {})
+    if not isinstance(message, dict):
+        return False
+    handle = str(message.get("author_handle") or message.get("reply_to_handle") or "").lower().strip()
+    host = handle.rsplit("@", 1)[-1] if "@" in handle else ""
+    return bool(host in {"email.apple.com", "mail.instagram.com", "cloudtestlabaccounts.com"}
+                or re.match(r"^(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|notifications?)(?:[+@])", handle)
+                or re.search(r"(?im)^account_email:\s*[^\s@]+@cloudtestlabaccounts\.com\b", str(message.get("body_text") or "")))
 
 
 _EMOJI_ONLY = re.compile(
@@ -979,6 +993,11 @@ def _intent(text: str, channel: str = "") -> str:
         r"^[^\n]{0,80}\?\s*:\s*[^\n]{0,40}$", "", prose, flags=re.MULTILINE,
     )
     low = _normalise(prose if prose.strip() else text).lower()
+    conditional = re.sub(
+        r"\b(?:se no|altrimenti|otherwise|or else|si no|sinon|caso contr[aá]rio)\b[^.!?\n]*?"
+        r"(?:refund\w*|money back|rimbor\w*|reembols\w*|rembours\w*)[^.!?\n]*", "", prose, flags=re.I)
+    if conditional != prose and conditional.strip():
+        return _intent(conditional, channel)
     if _resolved_confirmation(text):
         return "resolved_confirmation"
     if _is_acknowledgement(text):
@@ -1007,6 +1026,7 @@ def _intent(text: str, channel: str = "") -> str:
         "change my email", "change my account email", "update my email",
         "merge my account", "merge accounts", "recover my account",
         "recover my data", "account banned", "reimposta password",
+        "recuperar mi cuenta", "recuperar minha conta", "récupérer mon compte",
         "cambia email", "unire gli account",
     )):
         return "account_change"
@@ -1347,7 +1367,7 @@ async def _read_reported_turn(
     Only non-destructive support routes can be refined here. Money, deletion,
     legal and explicit confirmations retain their independent authority gates.
     """
-    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change", "acknowledgement", "praise", "ios_availability"}:
+    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change", "acknowledgement", "praise", "ios_availability", "refund", "business_request"}:
         return
     if state.intent in {"acknowledgement", "praise"} and _is_review_channel(state.channel):
         return
@@ -1425,10 +1445,24 @@ async def _read_reported_turn(
              "catalog_offline": "offline", "library_loss": "bug", "bug": "bug",
              "resolved_confirmation": "resolved_confirmation",
              "acknowledgement": "acknowledgement", "praise": "praise",
-             "support_channel": "support_channel", "human_request": "human_request"}.get(assessment.kind)
+             "support_channel": "support_channel", "human_request": "human_request",
+             "account_recovery": "account_change", "account_change": "account_change",
+             "refund_request": "refund", "ads_feedback": "premium",
+             "business_request": "business_request"}.get(assessment.kind)
+    if state.intent == "refund" and assessment.kind == "other" and state.facts.get("intent_source") in {"semantic", "model"}:
+        # An inferred money label must not survive an ungrounded request.
+        state.intent = "request_review"
     if route:
+        if route == "refund" and state.intent != "refund":
+            state.facts["money_execution_requires_human"] = True
         state.intent = route
         state.facts["intent_source"] = "conversation_reader"
+    unavailable = assessment.reported.get("unavailable_instruction") or (assessment.evidence if assessment.kind == "unavailable_instruction" else "")
+    if unavailable and state.prior_support_replies and support_turn._fold(unavailable) in support_turn._fold(state.customer_message):
+        state.facts["unavailable_instruction"] = unavailable
+        state.intent = "guidance_question"
+    if assessment.kind == "ads_feedback":
+        state.facts["ads_feedback"] = True
     if assessment.kind == "library_loss":
         state.instructions.append(
             "The customer reports previously saved content disappearing. Do not answer "
@@ -3750,6 +3784,12 @@ def _fallback_reply(state: SupportState) -> str:
             "I could not verify the subscription status. This does not mean your Premium is expired or inactive."
         )
     if state.outcome == "ads_policy_explained":
+        if state.facts.get("ads_feedback"):
+            return (
+                "Capisco: la frequenza delle pubblicità sta interrompendo l’ascolto. La versione gratuita include pubblicità; Premium le rimuove."
+                if italian else
+                "The frequency of the ads is interrupting your listening. The free version includes ads; Premium removes them."
+            )
         if state.tenant.key == "lyra":
             return (
                 "Capisco che la pubblicità sia fastidiosa. Gratis puoi ottenere Premium con i referral; se nell’app vedi l’opzione video premio, puoi usarla per il periodo senza ads indicato. Per chi è idoneo c’è anche il percorso Creator. In alternativa, Premium rimuove gli ads."
@@ -3991,6 +4031,22 @@ def _fallback_reply(state: SupportState) -> str:
             if italian else
             "What issue or question about the attachment would you like help with?"
         )
+    if state.outcome == "business_request_human":
+        return ""
+    if state.outcome == "guidance_unavailable_human":
+        if not state.facts.get("human_handoff_confirmed"):
+            return ""
+        return (
+            "Grazie della correzione: il percorso suggerito non è utilizzabile nel tuo caso. Ho passato la conversazione a un collega per verificare un'alternativa; non devi ripetere quel passaggio."
+            if italian else
+            "Thanks for correcting us: the suggested steps do not work in your case. I have passed the conversation to a colleague to verify an alternative; you do not need to repeat those steps."
+        )
+    if state.outcome == "account_change_identity_required" and state.reported_turn and state.reported_turn.kind == "account_recovery":
+        return (
+            "Per recuperare l'accesso, scrivi dall'indirizzo email associato all'account. Se non puoi più accedere a quell'indirizzo, indicacelo qui così possiamo verificare come procedere."
+            if italian else
+            "To recover access, write from the email address associated with the account. If you can no longer access that email, tell us here so we can check how to proceed."
+        )
     if state.outcome in {"account_delete_identity_required", "account_change_identity_required"}:
         return (
             "Per questa operazione sull’account, scrivi dal suo indirizzo email verificato e descrivi esattamente la modifica richiesta."
@@ -4135,9 +4191,9 @@ def _fallback_reply(state: SupportState) -> str:
             # component route exist. Asking again for version/device would be
             # wrong: the customer already supplied them.
             return (
-                "Grazie, le informazioni ci sono. Per riprodurlo mi servono un log o una breve registrazione dello schermo: senza una corrispondenza verificata non apro né dichiaro un task."
+                "Grazie per i dettagli. Puoi inviare una breve registrazione dello schermo o un log del momento in cui si verifica il problema? Mi aiuterà a ricostruire cosa succede."
                 if italian else
-                "Thanks, those details are enough. To reproduce it I need a log or a short screen recording: without a verified match I won’t open or claim a task."
+                "Thanks for the details. Could you send a short screen recording or a log from when the problem occurs? That will help me understand what happens."
             )
         if state.outcome == "bug_deduplicated":
             task = state.facts.get("clickup_task") or {}
@@ -4489,6 +4545,8 @@ def _model_may_compose(state: SupportState) -> bool:
     Every composed reply still passes the guards below, so a widened surface
     degrades to the deterministic text rather than to an invented claim.
     """
+    if state.intent in {"account_change", "account_delete"}:
+        return False
     if state.decision not in {"ask_information", "self_help"}:
         return False
     if state.facts.get("form_says_never_purchased"):
@@ -4550,6 +4608,13 @@ def _drops_claim(reply: str, base: str) -> bool:
     return (len(kept) / len(anchor)) < 0.35
 
 
+async def _hold_untranslated(agent: Any, state: SupportState) -> str:
+    state.facts["reply_source"] = "none:translation_unavailable"
+    state.human_reason = "A reply in the customer's language could not be verified. Review the response before sending."
+    state.facts["human_handoff_confirmed"] = await _queue_for_human(getattr(agent, "_mcp", None), state)
+    return ""
+
+
 async def _fallback_in_language(
     agent: Any,
     event: dict[str, Any],
@@ -4567,14 +4632,14 @@ async def _fallback_in_language(
     base = _fallback_reply(state)
     state.facts["reply_source"] = f"deterministic:{reason}"
     language = str(state.facts.get("language") or "en")
-    if not base or language in ("en", ""):
+    if not base or language in ("en", "") or (language == "it" and _language_hint(base) == "it"):
         return base
     model = getattr(agent, "model", None)
     model_id = str(event.get("model") or "").strip()
     if model_id and callable(getattr(model, "build_override_model", None)):
         model = model.build_override_model(model_id)
     if model is None:
-        return base
+        return await _hold_untranslated(agent, state)
     # A translation, not a rewrite: the receipt-rephrase pass is free to keep
     # the sentence as it stands, and measured on a Greek thread it did exactly
     # that - handing a Greek customer the English text unchanged.
@@ -4605,12 +4670,14 @@ async def _fallback_in_language(
                 session_id=f"{session_id}:local-support-translate",
                 timeout_env="OPENAGENT_ESOUND_COMPOSER_TIMEOUT_SECONDS",
             )
-    except Exception as exc:  # noqa: BLE001 - English text beats no text
+    except Exception as exc:  # noqa: BLE001 - retain the request for review
         elog("support_controller.translate_failed", level="warning",
              error=str(exc)[:200])
-        return base
+        response = None
     finally:
         reset_tool_allowlist(token)
+    if response is None:
+        return await _hold_untranslated(agent, state)
     payload = _extract_json(getattr(response, "content", ""))
     said = str((payload or {}).get("reply") or "").strip()
     # Verify it actually IS the requested language. A model that echoes the
@@ -4632,10 +4699,11 @@ async def _fallback_in_language(
         translated
         and len(said) <= len(base) * 3
         and not _introduces_claim(said, base, state)
+        and not reply_guard.claims_profile_change(said)
     ):
         state.facts["reply_source"] = f"model:translate_{reason}"
         return said
-    return base
+    return await _hold_untranslated(agent, state)
 
 
 async def _rephrase_from_receipt(
@@ -4758,6 +4826,8 @@ async def _compose_local(
         if state.facts.get("language", "en") in {"en", "it"}:
             return _fallback_reply(state)
         return await _fallback_in_language(agent, event, state, session_id, "missing_evidence")
+    if state.intent == "account_change" or state.outcome == "guidance_unavailable_human":
+        return await _fallback_in_language(agent, event, state, session_id, "account_authority")
     if state.outcome in {"premium_active", "premium_receipt_verified", "billing_unverified_human"}:
         # Store-specific recovery is policy, not prose: a measured composer
         # changed "close and reopen the app" into "close your browser" for a
@@ -4841,6 +4911,7 @@ async def _compose_local(
         "operator_policy": support_context.policy_packet(state.policy_notes),
         "thread_subject": state.subject or "",
         "recent_exchange": state.recent_exchange,
+        "customer_history": state.thread_customer_text[-16000:],
         # "und" means we could not name the language. Telling the model to
         # mirror the customer beats asserting English at someone who wrote in
         # a language our marker lists do not cover.
@@ -5098,7 +5169,7 @@ async def _compose_local(
             agent, event, state, session_id, "guard",
         )
     if reply_guard.claims_completed_action(reply) and not any(
-        action.get("success") for action in state.actions
+        action.get("success") and action.get("kind") in _MUTATION_KINDS for action in state.actions
     ):
         return await _fallback_in_language(
             agent, event, state, session_id, "guard",
@@ -5167,6 +5238,18 @@ async def _compose_local(
 # stays planned. Without this, turning drafts on would have silently armed the
 # whole write surface against production, because drafting counts as writing.
 _DRAFT_RUNG_ALLOWED = frozenset({"customer_draft"})
+
+
+async def _validate_final_reply(agent: Any, event: dict[str, Any], state: SupportState, reply: str, session_id: str) -> str:
+    if not reply:
+        return reply
+    if reply_guard.claims_profile_change(reply):
+        state.facts["account_promise_rejected"] = True
+        return await _fallback_in_language(agent, event, state, session_id, "account_promise")
+    language = str(state.facts.get("language") or "und")
+    if language not in {"und", ""} and _language_hint(reply) not in {language, "und"}:
+        return await _fallback_in_language(agent, event, state, session_id, "final_language")
+    return reply
 
 
 async def _record_tags(
@@ -6434,7 +6517,11 @@ async def run(
         state.human_reason = "Customer explicitly requested a person or asked automated replies to stop. Keep this thread in the human queue without another bot reply."
         await _record_tags(state, pool, ["human-request"])
         state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
-    elif _is_machine_mail(message, state.subject):
+    elif "support-review-required" in _thread_tags(thread):
+        state.intent = "support_review"
+        state.outcome = "support_review_no_reply"
+        state.decision = "noop"
+    elif "automated-notice" in _thread_tags(thread) or _machine_sender(thread, payload) or _is_machine_mail(message, state.subject):
         state.intent = "machine_mail"
         state.outcome = "machine_mail"
         state.decision = "noop"
@@ -6951,11 +7038,16 @@ async def run(
             state.facts["guidance_documents"] = documents if _succeeded(documents) else []
             state.decision = "self_help"
             state.outcome = "guidance_answer"
+            if state.facts.get("unavailable_instruction"):
+                state.decision = "human"
+                state.outcome = "guidance_unavailable_human"
+                state.human_reason = "The customer corrected an unavailable or failed support instruction. Verify an alternative against their app/platform before replying; preserve the existing conversation and retrieved documentation."
             state.instructions.append(
                 "Answer the latest direct question using guidance_documents and operator_policy. "
                 "Explain an unfamiliar term in plain language before suggesting a next step. "
                 "Do not restart the original bug questionnaire or request evidence they cannot provide. "
                 "Never invent device-specific buttons, menus, product availability or a fix. "
+                "If the customer says a menu is absent or a step failed, do not suggest it again. "
                 "If documentation does not establish a product fact, say what remains unverified. "
                 "Previous support messages are context, not proof that their instructions were correct."
             )
@@ -6999,7 +7091,7 @@ async def run(
                 "Explain streaming catalog plus offline import of the customer's own audio files. Do not create a bug task."
             )
         elif state.intent in {"premium", "duplicate_charge", "cancel_subscription", "refund"}:
-            ads_policy_only = _is_ads_policy_complaint(message)
+            ads_policy_only = bool(state.facts.get("ads_feedback")) or _is_ads_policy_complaint(message)
             if ads_policy_only:
                 # The paid-claim regex knows the phrasings somebody wrote
                 # down. Measured: "got Premium and new Altstore Update bit
@@ -7624,6 +7716,7 @@ async def run(
         agent, event, state, f"{session_id}:{delivery_id}",
     )
     reply = await _refuse_to_repeat(pool, agent, event, state, reply, session_id)
+    reply = await _validate_final_reply(agent, event, state, reply, session_id)
     await _apply_lifecycle(pool, state, reply)
     # A reply guard block is an instruction to rewrite in the SAME turn.  The
     # first text never reached the customer, so one bounded retry cannot create
@@ -7662,6 +7755,7 @@ async def run(
                 agent, event, state, f"{session_id}:{delivery_id}:guard-rephrase", base=base,
             )
         if retry_reply and retry_reply.strip() != reply.strip():
+            retry_reply = await _validate_final_reply(agent, event, state, retry_reply, session_id)
             await _apply_lifecycle(pool, state, retry_reply)
             reply = retry_reply
         else:
@@ -7682,6 +7776,11 @@ async def run(
             "delivery_handoff",
         )
         state.facts["delivery_handoff_confirmed"] = handed
+    elog("support_controller.action_summary", thread_id=state.thread_id,
+         actions=[{"kind": a.get("kind"), "success": bool(a.get("success"))} for a in state.actions],
+         delivery_handoff_confirmed=bool(state.facts.get("delivery_handoff_confirmed")),
+         final_reply_language=state.facts.get("language"),
+         reply_source=state.facts.get("reply_source"))
     state.facts["policy_sources"] = support_context.policy_sources(state.policy_notes)
     output = {
         "thread_id": state.thread_id,

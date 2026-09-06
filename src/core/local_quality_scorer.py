@@ -47,7 +47,13 @@ _SYSTEM = (
     "grounding: is every claim backed by the receipts given? A reply that says "
     "a bug is known or tracked while has_task is false AND escalated is false "
     "scores 0.\n"
-    "appropriateness: is the advice right for the state actually shown?\n"
+    "appropriateness: is the advice right for the state actually shown? "
+    "Score at most 0.3 if the reply ignores the latest question, repeats a menu "
+    "the customer says is absent, or repeats a step they already tried unsuccessfully.\n"
+    "Task links, tags and handoffs do not prove a profile/email change or a refund. "
+    "For eSound/Lyra, automated support cannot change profile emails or merge accounts: "
+    "a promise to do so is ungrounded even in the future tense. "
+    "Other financial actions may have external receipts: their absence here is not proof of fabrication.\n"
     "tone: warm and specific, especially to an angry customer.\n"
     "f7_read: 1 if there was no attachment, or the attachment was read; 0 if "
     "the thread had an attachment and attachment_read is false.\n"
@@ -83,7 +89,8 @@ def verdict_for(score: float, dimensions: dict[str, float] | None = None) -> str
     # A reply that asserts something nothing backs is not "acceptable" however
     # warm and well-formed the rest of it is: the weighted average alone would
     # have called a fabricated tracking claim OK.
-    if dimensions is not None and dimensions.get("grounding", 1.0) <= 0.0:
+    if dimensions is not None and (min(dimensions.get("grounding", 1.0), dimensions.get("appropriateness", 1.0)) <= 0.3
+                                   or dimensions.get("language", 1.0) <= 0.0):
         return "BAD"
     if score >= 0.8:
         return "GOOD"
@@ -129,7 +136,7 @@ async def run(
                 "product": product,
                 "channel_kind": str(item.get("channel_kind") or ""),
                 "score": score, "verdict": verdict, "dimensions": dimensions,
-                "grader": "qwen3-moe-local/deterministic-scorer",
+                "grader": f"{event.get('model') or 'configured-model'}/deterministic-scorer-v2",
                 "notes": _weakest(dimensions),
             },
             required=False,
@@ -312,7 +319,12 @@ async def grade_one(agent: Any, event: dict[str, Any], item: dict[str, Any],
         model = model.build_override_model(model_id)
     if model is None:
         return None
+    from src.core.local_support_controller import _form_fields
+    declared_language = _form_fields(str(item.get("last_inbound") or "")).get("reviewer_language", "")
     packet = {
+        "product": str(item.get("product") or ""),
+        "actions": list(item.get("actions") or [])[:100],
+        "reviewer_language": str(item.get("reviewer_language") or declared_language),
         "customer_message": str(item.get("last_inbound") or "")[:2000],
         "reply": str(item.get("reply") or "")[:2000],
         "has_task": bool(item.get("has_task")),
@@ -349,4 +361,7 @@ async def grade_one(agent: Any, event: dict[str, Any], item: dict[str, Any],
             # meaningless score in the table is worse than a gap.
             return None
         graded[name] = value
+    from src.core.reply_guard import claims_profile_change
+    if packet["product"].lower() in {"esound", "lyra"} and claims_profile_change(packet["reply"]):
+        graded["grounding"] = 0.0
     return graded

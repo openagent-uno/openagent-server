@@ -49,6 +49,7 @@ from scripts.tests._setup import build_test_config, cleanup_extras  # noqa: E402
 # execution order of the whole suite, so add new modules deliberately.
 _TEST_MODULES: tuple[str, ...] = (
     "test_support_context",
+    "test_support_sept6",
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
     "test_iroh_discovery",

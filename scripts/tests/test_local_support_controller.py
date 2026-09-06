@@ -3014,7 +3014,7 @@ async def t_correction_for(_ctx: TestContext) -> None:
     assert earned is not None and earned[0] == "correction: language"
     # It still earns one even though the weighted score reads as GOOD: a reply
     # in the wrong language is not a good reply.
-    assert verdict_for(weighted_score(wrong_language), wrong_language) == "GOOD"
+    assert verdict_for(weighted_score(wrong_language), wrong_language) == "BAD"
 
     invented = {**good, "grounding": 0.0}
     assert verdict_for(weighted_score(invented), invented) == "BAD"
@@ -3213,8 +3213,7 @@ async def t_handoff_precedes_reply(_ctx: TestContext) -> None:
             agent=SimpleNamespace(_mcp=doubles.pool(), model=_Model()),
             event={"slug": "replio-thread", "model": ""},
             payload={"payload": {"thread_id": "t-partner", "message": {
-                "body_text": "Hello, we are a marketing agency and we would "
-                             "like to propose a partnership with your app.",
+                "body_text": "I opened a card chargeback for this payment.",
             }}},
             session_id="s", delivery_id="d",
         )).text)

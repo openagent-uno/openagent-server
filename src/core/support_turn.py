@@ -15,16 +15,19 @@ from typing import Any
 
 KINDS = frozenset({
     "other", "signup", "password_recovery", "catalog_offline", "library_loss", "referral_status", "status_check", "bug",
-    "resolved_confirmation", "acknowledgement", "guidance_question", "praise", "support_channel", "human_request",
+    "resolved_confirmation", "acknowledgement", "guidance_question", "praise", "support_channel", "human_request", "account_recovery", "account_change", "refund_request", "ads_feedback", "business_request", "unavailable_instruction",
 })
-FIELDS = frozenset({"app_version", "device", "os", "platform", "steps", "observed", "expected"})
+FIELDS = frozenset({"app_version", "device", "os", "platform", "steps", "observed", "expected", "unavailable_instruction"})
 
 READER_SYSTEM = """Read the customer's support conversation, not just topic words.
 Return JSON only:
-{"kind":"other|signup|password_recovery|catalog_offline|library_loss|referral_status|status_check|bug|resolved_confirmation|acknowledgement|guidance_question|praise|support_channel|human_request",
+{"kind":"other|signup|password_recovery|catalog_offline|library_loss|referral_status|status_check|bug|resolved_confirmation|acknowledgement|guidance_question|praise|support_channel|human_request|account_recovery|account_change|refund_request|ads_feedback|business_request|unavailable_instruction",
  "evidence":"exact customer quote supporting the kind",
  "reported":{"app_version":"exact quote","device":"exact quote","os":"exact quote",
- "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote"}}
+ "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote","unavailable_instruction":"exact quote"}}
+unavailable_instruction means the latest customer correction that a button/menu we
+previously suggested is absent, or that our proposed step was already tried and failed.
+Do not set it for an ordinary new bug or a question asking how to perform a step.
 Omit unknown fields; never infer a version, OS, account state or successful action.
 Quotes must be ONE contiguous substring of customer_text (not prior_support).
 Use a short verbatim phrase. Never join separate sentences or omit words from
@@ -44,7 +47,17 @@ support_channel means asking to continue support here/in direct messages, or req
 a private channel instead of public comments/email. It does not change the account.
 human_request means explicitly asking the bot to stop replying or asking for a human.
 For praise, support_channel and human_request evidence MUST quote latest_message.
+account_recovery means recovering access to an existing account ("recuperar mi cuenta"),
+not a refund. account_change means changing email/profile or merging accounts; the
+customer's words never prove identity or permission to execute that change.
+refund_request means an explicit request to return a payment. Merely mentioning
+Premium, payment or a CONDITIONAL refund ("fix the bug or I'll ask for a refund")
+is not this kind: preserve the main bug/request. Do not infer financial consent.
+ads_feedback means a complaint about ad frequency/length, without a concrete
+malfunction. Ad audio overlapping music, frozen controls or playback failures are bug.
+business_request means a partnership, sales pitch or commercial proposal, not app support.
 signup means asking how to CREATE an account, not change credentials or recover one.
+An attempted signup that fails is bug, not instructions to open the signup screen.
 password_recovery means asking how to reset a forgotten password or recover sign-in;
 it is self-service guidance, not a request to send support a new password.
 catalog_offline means asking how to download catalog music or enable that feature.

@@ -44,6 +44,42 @@ class Case:
 
 
 CASES = (
+    Case("audit-explicit-refund-de", "esound", (("inbound", "Ich möchte eine Rückerstattung für meine letzte Premium-Zahlung."),),
+         "refund", "refund_request", expected_outcome="refund_identity_required",
+         forbidden_reply=("I need", "Please send", "erstattet habe")),
+    Case("audit-signup-failure-pt", "lyra", (("inbound", "Estou tentando criar uma conta, mas depois de preencher o email e tocar em Criar conta aparece um erro e a conta não é criada."),),
+         "bug", "bug", forbidden_reply=("abra o aplicativo", "toque em criar conta para começar")),
+
+    Case("audit-account-recovery-es", "esound", (("inbound", "Quiero recuperar mi cuenta"),),
+         "account_change", "account_recovery", forbidden_requests=("receipt",),
+         forbidden_reply=("voy a cambiar", "procesarlo", "reembolso", "recibo"),
+         expected_outcome="account_change_identity_required"),
+    Case("audit-account-change-confirm-es", "esound", (
+         ("inbound", "Quiero cambiar el correo de mi perfil."),
+         ("outbound", "Voy a cambiar el correo de tu perfil. Déjame procesarlo."),
+         ("inbound", "Sí, puedes hacerlo.")),
+         "account_change", "account_change", forbidden_reply=("voy a cambiar", "he cambiado", "procesarlo"),
+         expected_outcome="account_change_identity_required"),
+    Case("audit-conditional-refund-it", "esound", (("inbound",
+         "L'app si blocca quando apro una canzone. Se no sarò costretto a chiedere il rimborso. Android 15, Samsung S21, app 5.2.4."),),
+         "bug", "bug", must_not_call=("billingbear_refund",), forbidden_reply=("ricevuta", "ordine di acquisto")),
+    Case("audit-apple-notice", "esound", (("inbound", "We have completed our review of your submission."),),
+         "machine_mail", "", must_not_call=("replio_threads_respond",), expected_outcome="machine_mail"),
+    Case("audit-business-enquiry", "lyra", (("inbound", "We propose a business partnership with your company. Can we schedule a call about our advertising service?"),),
+         "business_request", "business_request", must_call=("replio_threads_mark_for_human",),
+         must_not_call=("replio_threads_respond",), expected_outcome="business_request_human"),
+    Case("audit-ad-frequency-review", "esound", (("inbound", "There are way too many ads. An ad every two songs is unbearable."),),
+         "premium", "ads_feedback", forbidden_requests=("app_version", "device", "steps"),
+         expected_outcome="ads_policy_explained", channel="playstore_reviews"),
+    Case("audit-ad-overlay-bug", "esound", (("inbound", "After an ad finishes its overlay stays on the screen and its audio keeps playing over my music. Android 15, Samsung S21, version 5.2.4."),),
+         "bug", "bug", forbidden_reply=("upgrade to premium",)),
+    Case("audit-missing-logout-pt", "lyra", (
+         ("inbound", "Como faço para trocar de conta?"),
+         ("outbound", "Abra as configurações e toque em Sair para fazer login com outra conta."),
+         ("inbound", "Não existe botão Sair nas configurações. Já procurei lá. Esse menu não existe no meu app.")),
+         "guidance_question", "", forbidden_reply=("toque em sair", "tap log out", "clique em sair"),
+         expected_outcome="guidance_unavailable_human", must_call=("replio_threads_mark_for_human",)),
+
     Case("private-channel-stays-here", "lyra", (
         ("inbound", "Can I message you in DMs? I do not want to put my email here."),),
         "support_channel", "support_channel", expected_outcome="support_channel_answer",
