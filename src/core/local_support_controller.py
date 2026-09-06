@@ -3809,6 +3809,47 @@ def _unknown_bug_evidence(state: SupportState) -> list[str]:
     return missing
 
 
+def _missing_bug_question_reply(state: SupportState, italian: bool) -> str:
+    """Keep fallback questions helpful without letting prose invent next steps.
+
+    The planner owns the missing field. Courtesy changes neither that field nor
+    the authority to act; quoted customer values are never interpolated here.
+    """
+    missing = _unknown_bug_evidence(state)
+    if not missing:
+        return ""
+    opening = ("Mi dispiace che tu stia avendo problemi con l’app." if italian else
+               "I'm sorry you're having trouble with the app.")
+    reported = state.reported_turn.reported if state.reported_turn else {}
+    latest = support_turn._fold(state.customer_message)
+    # A short answer to our question deserves acknowledgement of that answer,
+    # not another apology as if the conversation had just started.
+    if state.prior_support_replies and len(latest) <= 100:
+        for key, labels in (
+            ("app_version", ("la versione dell’app", "the app version")),
+            ("device", ("il dispositivo", "your device")),
+            ("os", ("il sistema operativo", "your operating system")),
+        ):
+            value = reported.get(key)
+            if value and support_turn._fold(value) in latest:
+                opening = (f"Grazie per aver indicato {labels[0]}." if italian else
+                           f"Thanks for the information about {labels[1]}.")
+                break
+    rationale = {
+        "app version": ("Ci aiuta a verificare il problema sulla versione che usi.",
+                        "This helps us check the problem on the version you use."),
+        "device and OS": ("Ci aiuta a verificare il problema sullo stesso tipo di dispositivo.",
+                          "This helps us check the problem on the same type of device."),
+        "steps to reproduce and exact behavior": ("Ci aiuta a ricostruire ciò che succede.",
+                                                  "This helps us reproduce what happens."),
+        "source playlist link": ("Ci permette di controllare la playlist originale.",
+                                 "This lets us check the original playlist."),
+    }.get(missing[0], ("Ci aiuta ad approfondire la segnalazione.", "This helps us investigate your report."))
+    field = _next_bug_question_field(state, italian)
+    question = f"Puoi indicarmi {field}?" if italian else f"Could you share {field}?"
+    return f"{opening} {question} {rationale[0 if italian else 1]}"
+
+
 def _unverified_recovery_advice(reply: str) -> bool:
     return bool(re.search(
         r"\b(?:reinstall\w*|uninstall\w*|clear (?:the |your )?(?:data|storage)|"
@@ -4111,16 +4152,20 @@ def _fallback_reply(state: SupportState) -> str:
         )
     if state.outcome == "account_change_identity_required" and state.reported_turn and state.reported_turn.kind == "account_recovery":
         return (
-            "Per recuperare l'accesso, scrivi dall'indirizzo email associato all'account. Se non puoi più accedere a quell'indirizzo, indicacelo qui così possiamo verificare come procedere."
+            "Capisco che vuoi recuperare l’accesso. Per proteggere il tuo account, scrivici dal suo indirizzo email. Se non puoi più accedere a quell’indirizzo, indicacelo qui così possiamo verificare come procedere."
             if italian else
-            "To recover access, write from the email address associated with the account. If you can no longer access that email, tell us here so we can check how to proceed."
+            "I understand you want to recover access. To protect your account, please write from its associated email address. If you can no longer access that address, let us know here so we can check how to proceed."
         )
     if state.outcome in {"account_delete_identity_required", "account_change_identity_required"}:
-        return (
-            "Per questa operazione sull’account, scrivi dal suo indirizzo email verificato e descrivi esattamente la modifica richiesta."
-            if italian else
-            "For this account operation, write from its verified email address and describe the exact change requested."
+        opening = (
+            ("Ho capito che vuoi cancellare l’account." if italian else
+             "I understand you'd like to delete your account.")
+            if state.outcome == "account_delete_identity_required" else
+            ("Per aiutarti con la modifica all’account, dobbiamo prima verificarne la titolarità." if italian else
+             "To help with the account change, we first need to verify ownership.")
         )
+        return opening + (" Per proteggere i tuoi dati, scrivici dall’indirizzo email associato all’account. Se non puoi più accedere a quell’indirizzo, indicacelo qui." if italian else
+                          " To protect your data, please write from the email address associated with the account. If you can no longer access that address, let us know here.")
     if state.outcome == "account_delete_confirmation_required":
         # The subscription warning is part of the same sentence on purpose:
         # someone who deletes the account without cancelling the store
@@ -4223,15 +4268,15 @@ def _fallback_reply(state: SupportState) -> str:
             task_id = str(task.get("id") or "the new task")
             if _simulated(state):
                 base = (
-                    f"Il dry run ha simulato l’apertura del task {task_id} con le tue evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita e non posso indicare tempi di rilascio."
+                    f"Grazie per i dettagli. Il dry run ha simulato l’apertura del task {task_id} con le tue evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita e non posso indicare tempi di rilascio."
                     if italian else
-                    f"The dry run simulated opening task {task_id} with your evidence and linking it to this thread; no real change was made and I can’t give a release date."
+                    f"Thanks for the details. The dry run simulated opening task {task_id} with your evidence and linking it to this thread; no real change was made and I can’t give a release date."
                 )
             else:
                 base = (
-                    "Ho registrato il problema con i dettagli che ci hai fornito. Non posso ancora indicare tempi di risoluzione."
+                    "Grazie per i dettagli. Ho registrato il problema con le informazioni che ci hai fornito. Non posso ancora indicare tempi di risoluzione."
                     if italian else
-                    "I recorded the issue with the details you provided. I can’t give a resolution date yet."
+                    "Thanks for the details. I recorded the issue with the information you provided. I can’t give a resolution date yet."
                 )
             return (
                 base
@@ -4266,15 +4311,15 @@ def _fallback_reply(state: SupportState) -> str:
             task_id = str(task.get("id") or "the existing task")
             if _simulated(state):
                 base = (
-                    f"Il dry run ha trovato il task esistente {task_id} e simulato l’aggiunta delle nuove evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita."
+                    f"Grazie per averci spiegato cosa succede. Il dry run ha trovato il task esistente {task_id} e simulato l’aggiunta delle nuove evidenze e il collegamento al thread; nessuna modifica reale è stata eseguita."
                     if italian else
-                    f"The dry run found existing task {task_id} and simulated adding this evidence and linking the thread; no real change was made."
+                    f"Thanks for explaining what happens. The dry run found existing task {task_id} and simulated adding this evidence and linking the thread; no real change was made."
                 )
             else:
                 base = (
-                    "Ho aggiunto i dettagli della tua segnalazione al problema già tracciato."
+                    "Grazie per averci spiegato cosa succede. Ho aggiunto i dettagli della tua segnalazione al problema già tracciato."
                     if italian else
-                    "I added the details from your report to the issue already being tracked."
+                    "Thanks for explaining what happens. I added the details from your report to the issue already being tracked."
                 )
             return (
                 base
@@ -4295,12 +4340,7 @@ def _fallback_reply(state: SupportState) -> str:
                 if italian else
                 "Thanks, those details are enough. To reproduce it I need a log or a short screen recording."
             )
-        missing = _next_bug_question_field(state, italian)
-        return (
-            f"Per verificare il problema, inviami {missing}."
-            if italian else
-            f"To investigate this, please send {missing}."
-        )
+        return _missing_bug_question_reply(state, italian)
     if state.decision == "human":
         # Never the internal verdict. "This report requires specialist human
         # review." is triage language: it was sent verbatim to a customer who
@@ -4791,10 +4831,12 @@ async def _rephrase_from_receipt(
     if language == "und":
         language = "the same language the customer wrote in"
     system = (
-        "You rephrase one eSound support sentence. You have NO tools and NO "
+        "You rephrase one support reply. You have NO tools and NO "
         "knowledge beyond the text given. Rewrite must_convey so it reads "
         f"naturally to a customer writing in '{language}', keeping the exact "
-        "same meaning and roughly the same length. You may NOT add a fact, a "
+        "same meaning and roughly the same length. Preserve its acknowledgement "
+        "and the purpose of any requested information. Use polite questions "
+        "instead of commands. You may NOT add a fact, a "
         "step, a contact channel, an identifier, an amount, a timeline, an "
         "apology for something not stated, or any claim that an action "
         "succeeded beyond what must_convey already says. Output JSON only: "

@@ -240,7 +240,7 @@ def requested_fields(reply: str) -> set[str]:
         "app_version": r"\bversion\w*|vers[aã]o",
         "device": r"\bdevice|dispositiv\w*|aparelho|modelo|modello",
         "os": r"\boperating system|sistema operativ\w*|\bos\b",
-        "steps": r"\bsteps\b|\b(?:which|what) step\b|passagg\w*|passo\w*|what you do|cosa fai",
+        "steps": r"\bsteps\b|\bstep that (?:triggers|causes)\b|\b(?:which|what) step\b|passagg\w*|passo\w*|what you do|cosa fai",
     }
     return {field for field, pattern in patterns.items()
             if any(re.search(pattern, sentence, re.I) for sentence in requests)}
