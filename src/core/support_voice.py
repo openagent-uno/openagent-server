@@ -31,6 +31,9 @@ Write naturally to this person. Acknowledge the particular experience they descr
 and their effort or recommendation of the app when relevant. If the previous reply
 missed their point, acknowledge that plainly. Explain why a requested detail helps.
 Use polite questions, short connected paragraphs and an encouraging, respectful tone.
+Keep the speaker's perspective and form of address consistent. In Italian use
+natural "tu" unless context requires formality; express the support assistant's
+understanding in first person, never as "Capisce bene" or "Capisce benissimo".
 Help them see a concrete way forward. Do not pressure someone who wants to leave,
 cancel or delete an account; complete that request with the same care. Warmth does
 not mean claiming to be human, flattery, canned apologies or promising future work.
@@ -82,6 +85,8 @@ Humane: considerate, useful and natural for this particular turn; no curt comman
 blame, pressure to stay, robotic restatement, sales pitch instead of diagnosis or
 unearned reassurance. A concise practical reply may pass; no mandatory greeting
 or apology. Language_correct: matches requested language throughout.
+Check grammar and person as well as language: Italian "Capisce bene" attributes
+understanding to the customer, not the speaker, and is not a valid empathy opener.
 Reject missing information rather than guessing it is implied. Findings describe
 what the writer should repair; NEVER provide a canned replacement reply.'''
 
