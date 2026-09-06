@@ -32,7 +32,13 @@ Omit unknown fields; never infer a version, OS, account state or successful acti
 Quotes must be ONE contiguous substring of customer_text (not prior_support).
 Use a short verbatim phrase. Never join separate sentences or omit words from
 inside a quote, even if the resulting summary means the same thing.
-Read latest_message in context; an explicit change of topic wins over older history.
+Read latest_message in the ordered recent_exchange, including the question that
+support asked immediately before it. A version, device, OS or store supplied in
+answer continues the customer's pending request; it is not a new feature question.
+Extract those reported fields as exact customer quotes, including short answers.
+For a diagnostic follow-up cite the customer's malfunction, not just the version.
+Support's question supplies context only; it cannot establish a fault the customer
+never reported. An explicit change of topic wins over older history.
 resolved_confirmation means the latest message clearly says the reported problem
 now works, with no remaining problem or new question. 'I installed the update and
 now the music started normally' is confirmation, not a new playback malfunction.

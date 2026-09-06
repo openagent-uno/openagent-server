@@ -41,9 +41,36 @@ class Case:
     expected_image_text: str = ""
     incoming_message: str = ""
     channel: str = "email_imap"
+    receipt_turns: tuple[int, ...] = ()
+    contracted_latest: bool = False
 
 
 CASES = (
+    Case("post51-version-followup-pt", "esound", (
+        ("inbound", "não consigo mais baixar musica"),
+        ("outbound", "Para investigar isso, envie a versão do aplicativo."),
+        ("inbound", "4.15.10.16")), "bug", "bug", forbidden_requests=("app_version",),
+        forbidden_reply=("Premium não permite", "catálogo")),
+    Case("post51-device-burst-pt", "esound", (
+        ("inbound", "não consigo mais baixar musica"),
+        ("outbound", "Para investigar isso, envie a versão do aplicativo."),
+        ("inbound", "4.15.10.16"),
+        ("outbound", "eSound transmite seu catálogo: Premium não permite downloads do catálogo."),
+        ("inbound", "o problema é que tbm nao da para ouvir musicas novas tbm"),
+        ("outbound", "Para investigar isto, envie o dispositivo e o sistema operativo."),
+        ("inbound", "abcdef0123456789abcdef0123456789"),
+        ("inbound", "iphone11")), "bug", "bug", forbidden_requests=("app_version", "device"),
+        forbidden_reply=("catálogo",), incoming_message="abcdef0123456789abcdef0123456789",
+        contracted_latest=True),
+    Case("post51-short-version", "lyra", (
+        ("inbound", "The player crashes whenever I tap Play."),
+        ("outbound", "Which app version are you using?"),
+        ("inbound", "5.2.4")), "bug", "bug", forbidden_requests=("app_version",)),
+    Case("post51-auto-receipt-is-not-answer", "esound", (
+        ("inbound", "The app crashes whenever I open my playlist."),
+        ("outbound", "Thanks for your comment! Our team has received it and will get back to you shortly.")),
+        "bug", "bug", incoming_message="The app crashes whenever I open my playlist.",
+        must_call=("replio_threads_respond",), receipt_turns=(1,), channel="instagram_dm"),
     Case("audit-explicit-refund-de", "esound", (("inbound", "Ich möchte eine Rückerstattung für meine letzte Premium-Zahlung."),),
          "refund", "refund_request", expected_outcome="refund_identity_required",
          forbidden_reply=("I need", "Please send", "erstattet habe")),
@@ -239,6 +266,8 @@ class StdioModel:
 
 def score(case: Case, output: dict[str, Any], doubles: _Doubles) -> list[str]:
     failures = []
+    if case.contracted_latest and output.get("facts", {}).get("message_source") != "latest_contracted_inbound":
+        failures.append("queued text was not aligned with the verified latest inbound")
     if output["intent"] != case.intent:
         failures.append(f"intent: expected {case.intent}, got {output['intent']}")
     if case.reader_kind and output.get("customer_reported", {}).get("kind") != case.reader_kind:
@@ -285,9 +314,16 @@ async def replay(command: list[str], selected: list[Case], repeat: int) -> dict[
                 raw = (Path(__file__).parent / "fixtures" / case.image_fixture).read_bytes()
                 attachment = {"content": [{"type": "image", "mimeType": "image/png",
                                            "data": base64.b64encode(raw).decode()}]}
-            doubles = _Doubles(thread={"product": case.product, "messages": [
-                {"direction": direction, "body_text": body} for direction, body in case.turns
-            ]}, attachment=attachment)
+            messages = [
+                {"direction": direction, "body_text": body,
+                 "external_message_id": f"fixture-{i}",
+                 "counts_as_answer": i not in case.receipt_turns}
+                for i, (direction, body) in enumerate(case.turns)
+            ]
+            thread = {"product": case.product, "messages": messages}
+            if case.contracted_latest:
+                thread["reply_contract"] = {"expected_last_inbound_message_id": messages[-1]["external_message_id"]}
+            doubles = _Doubles(thread=thread, attachment=attachment)
             started = time.monotonic()
             try:
                 with dry_run_scope(True):

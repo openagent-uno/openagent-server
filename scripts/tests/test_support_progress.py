@@ -200,3 +200,46 @@ async def doc_query(_):
     assert not turn.reported
     assert t.read_reported_turn({**payload,"evidence":"Invented symptom"},state.customer_message) is None
     assert not t.read_reported_turn({**payload,"search_query":"user@example.test"},state.customer_message).search_query
+
+
+@test("support_progress", "an ingestion receipt does not answer or close an open request")
+async def auto_receipt(_):
+    messages=[{"direction":"inbound","body_text":"The app crashes when I open a playlist."},
+              {"direction":"outbound","body_text":"Our team has received your comment.","counts_as_answer":False}]
+    assert not c._thread_already_answered({"messages":messages})
+    out=await _drive(_Doubles(thread={"messages":messages}),messages[0]["body_text"])
+    assert out["outcome"] != "already_answered_no_reply" and out["intent"]=="bug",out
+    assert not any(a.get("args",{}).get("patch",{}).get("status")=="closed" for a in out["actions"])
+    messages.append({"direction":"outbound","body_text":"Which app version?"})
+    assert c._thread_already_answered({"messages":messages})
+    messages.append({"direction":"inbound","body_text":"5.2.4"})
+    assert not c._thread_already_answered({"messages":messages})
+
+
+@test("support_progress", "queued text advances only to the inbound certified by the read contract")
+async def contracted_burst(_):
+    old={"direction":"inbound","body_text":"synthetic lookup reference","external_message_id":"old"}
+    new={"direction":"inbound","body_text":"iphone11","external_message_id":"new"}
+    thread={"messages":[old,new]}
+    assert c._newer_contracted_inbound(thread,old["body_text"],"new")=="iphone11"
+    assert not c._newer_contracted_inbound(thread,"a newer message absent from this read","new")
+    assert not c._newer_contracted_inbound(thread,old["body_text"],"old")
+    assert not c._newer_contracted_inbound(thread,old["body_text"],"")
+    assert not c._newer_contracted_inbound(thread,"iphone11","new")
+
+
+@test("support_progress", "a short diagnostic answer reaches the reader with its ordered question")
+async def short_detail(_):
+    exchange=[{"from":"customer","text":"It crashes when I tap Play."},
+              {"from":"support","text":"Which app version?"},
+              {"from":"customer","text":"5.2.4"}]
+    class Model:
+        async def generate(self,**kwargs):
+            packet=json.loads(kwargs["messages"][0]["content"])
+            assert packet["recent_exchange"]==exchange
+            return SimpleNamespace(content=json.dumps({"kind":"bug","evidence":"It crashes when I tap Play.","reported":{"app_version":"5.2.4"}}))
+    state=c.SupportState("test","5.2.4",intent="general",recent_exchange=exchange,
+        thread_customer_text="It crashes when I tap Play.\n5.2.4",prior_support_replies=["Which app version?"])
+    with patch.dict(os.environ,{"OPENAGENT_SUPPORT_TURN_READER":"1"}):
+        await c._read_reported_turn(SimpleNamespace(model=Model()),{},state,"unit")
+    assert state.intent=="bug" and state.reported_turn.reported["app_version"]=="5.2.4"

@@ -1391,7 +1391,7 @@ async def _read_reported_turn(
         return
     model = getattr(agent, "model", None)
     model_id = str(event.get("model") or "").strip()
-    if model is None or len(state.customer_message.strip()) < 8:
+    if model is None or (len(state.customer_message.strip()) < 8 and not state.prior_support_replies):
         return
     # Keep the latest message even on a long thread; _customer_text used to
     # retain only the first 20k characters and discard the answer just given.
@@ -1400,6 +1400,7 @@ async def _read_reported_turn(
         "customer_text": customer_text,
         "latest_message": state.customer_message[-4000:],
         "prior_support": state.prior_support_replies[-3:],
+        "recent_exchange": state.recent_exchange,
     }
     token = set_tool_allowlist([])
     try:
@@ -1992,7 +1993,7 @@ def _deletion_phase(thread: Any, message: str) -> str:
     return "ask"
 
 
-def _recent_exchange(thread: Any, limit: int = 4) -> list[dict[str, str]]:
+def _recent_exchange(thread: Any, limit: int = 8) -> list[dict[str, str]]:
     """The last few turns, trimmed, as plain direction/text pairs.
 
     Only what is needed to read a one-word reply in context. Truncated hard:
@@ -2095,6 +2096,31 @@ def _strip_quoted_history(text: str) -> str:
     return body.strip()
 
 
+def _newer_contracted_inbound(thread: Any, message: str, expected_id: str) -> str:
+    """Bind queued text to the same persisted inbound as the send contract.
+
+    Only advance a webhook already present in the transcript. An unseen webhook
+    may be newer than the read, and a mismatched contract must never be used to
+    bless a different inbound. The send endpoint still checks freshness again.
+    """
+    if not isinstance(thread, dict) or not expected_id or not message.strip():
+        return ""
+    inbound = [m for m in thread.get("messages", [])
+               if isinstance(m, dict) and m.get("direction") == "inbound"]
+    if len(inbound) < 2:
+        return ""
+    def body(item):
+        return next((item[k].strip() for k in ("body_text", "text", "body", "content")
+                     if isinstance(item.get(k), str) and item[k].strip()), "")
+    latest = inbound[-1]
+    if str(latest.get("external_message_id") or "") != expected_id:
+        return ""
+    if not any(body(m) == message.strip() for m in inbound[:-1]):
+        return ""
+    text = body(latest)
+    return text if text and text != message.strip() else ""
+
+
 def _thread_already_answered(thread: Any) -> bool:
     if not isinstance(thread, dict):
         return False
@@ -2113,6 +2139,9 @@ def _thread_already_answered(thread: Any) -> bool:
             continue
         direction = str(item.get("direction") or "").lower()
         stamp = str(item.get("sent_at") or item.get("created_at") or "")
+        # Ingestion receipts are visible messages, but explicitly not answers.
+        if direction == "outbound" and item.get("counts_as_answer") is False:
+            continue
         if direction in {"inbound", "outbound"}:
             ordered.append((stamp, index, direction))
     ordered.sort(key=lambda row: (row[0], row[1]))
@@ -6531,6 +6560,15 @@ async def run(
                     state.facts["language"] = _language_hint(recovered)
                 if recovered:
                     break
+    latest_contracted = _newer_contracted_inbound(
+        thread, message, state.expected_last_inbound_message_id,
+    )
+    if latest_contracted:
+        message = latest_contracted
+        state.customer_message = message
+        state.facts["message_source"] = "latest_contracted_inbound"
+        state.facts["language_signal"] = message
+        state.facts["language"] = _language_hint(message)
     # A media webhook may be queued just before the customer's explanation
     # arrives. The brief's freshness receipt already points at that newer
     # inbound; compose from its text, not the obsolete attachment placeholder.
