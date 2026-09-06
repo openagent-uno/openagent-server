@@ -361,7 +361,7 @@ async def grade_one(agent: Any, event: dict[str, Any], item: dict[str, Any],
             # meaningless score in the table is worse than a gap.
             return None
         graded[name] = value
-    from src.core.reply_guard import claims_profile_change
-    if packet["product"].lower() in {"esound", "lyra"} and claims_profile_change(packet["reply"]):
+    from src.core.reply_guard import claims_profile_change, claims_human_identity
+    if packet["product"].lower() in {"esound", "lyra"} and (claims_profile_change(packet["reply"]) or claims_human_identity(packet["reply"])):
         graded["grounding"] = 0.0
     return graded

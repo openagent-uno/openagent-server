@@ -2168,11 +2168,10 @@ async def t_channel_reply_cap(_ctx: TestContext) -> None:
     from src.core.local_support_controller import _fit_reply, _reply_cap
 
     # Replio hard-trims past these, and a trim lands mid-sentence.
-    # The permanent 300-character rule binds everywhere; the store ceilings
-    # only matter when they are STRICTER than it.
+    # Reviews remain short; private guidance keeps room for the next action.
     assert _reply_cap("playstore_reviews") == 300
     assert _reply_cap("appstore_reviews") == 300
-    assert _reply_cap("email_imap") == 300
+    assert _reply_cap("email_imap") == 1200
 
     # Real prose: the trim lands on a sentence end, not mid-word.
     prose = (

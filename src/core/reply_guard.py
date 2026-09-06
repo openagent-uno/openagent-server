@@ -1146,3 +1146,15 @@ def claims_profile_change(text: Optional[str]) -> bool:
         r"\s+(?:\w+\s+){0,2}(?:chang\w*|updat\w*|merg\w*|cambi\w*|modific\w*|alter\w*|troc\w*|aggiorn\w*|unific\w*|änder\w*|fusion\w*)"
         r"[^.!?\n]{0,100}\b(?:e-?mail|correo|correio|profil\w*|account|cuenta|conta|compte|konto)\b",
         text, re.I))
+
+
+def claims_human_identity(text: str | None) -> bool:
+    """Reject an automated speaker impersonating a human support operator."""
+    return bool(re.search(
+        r"\b(?:i(?:['’]m| am) (?:a |an )?(?:real |human )?(?:person|human|human agent)|"
+        r"i(?:['’]m| am) not (?:a |an )?(?:robot|bot|automated assistant)|"
+        r"sono (?:una persona|un (?:operatore|essere umano))|non sono un (?:bot|robot)|"
+        r"soy (?:una persona|un humano)|no soy un (?:bot|robot)|"
+        r"sou (?:uma pessoa|um humano)|n[aã]o sou um (?:bot|rob[oô])|"
+        r"je suis (?:une personne|un humain)|ich bin (?:ein mensch|kein (?:bot|roboter)))\b",
+        text or "", re.I))
