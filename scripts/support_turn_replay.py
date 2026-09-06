@@ -43,6 +43,7 @@ class Case:
     channel: str = "email_imap"
     receipt_turns: tuple[int, ...] = ()
     contracted_latest: bool = False
+    required_reply: tuple[str, ...] = ()
 
 
 CASES = (
@@ -97,7 +98,8 @@ CASES = (
          must_not_call=("replio_threads_respond",), expected_outcome="business_request_human"),
     Case("audit-ad-frequency-review", "esound", (("inbound", "There are way too many ads. An ad every two songs is unbearable."),),
          "premium", "ads_feedback", forbidden_requests=("app_version", "device", "steps"),
-         expected_outcome="ads_policy_explained", channel="playstore_reviews"),
+         expected_outcome="ads_policy_explained", channel="playstore_reviews",
+         required_reply=("server", "referral", "video")),
     Case("audit-ad-overlay-bug", "esound", (("inbound", "After an ad finishes its overlay stays on the screen and its audio keeps playing over my music. Android 15, Samsung S21, version 5.2.4."),),
          "bug", "bug", forbidden_reply=("upgrade to premium",)),
     Case("audit-missing-logout-pt", "lyra", (
@@ -290,6 +292,9 @@ def score(case: Case, output: dict[str, Any], doubles: _Doubles) -> list[str]:
     for text in case.forbidden_reply:
         if text.casefold() in output.get("reply", "").casefold():
             failures.append("forbidden reply claim: " + text)
+    for text in case.required_reply:
+        if text.casefold() not in output.get("reply", "").casefold():
+            failures.append("missing useful answer content: " + text)
     if output["facts"].get("delivery_state") not in {"simulated", "not_attempted"}:
         failures.append("delivery not explicitly simulated/noop")
     for action in output["actions"]:

@@ -282,3 +282,39 @@ async def courteous_identity(_):
         assert "describe the exact" not in out["reply"] and "protect your data" in out["reply"],out
         assert "esound_identity_delete_account" not in d.names
         assert not reply_guard.claims_profile_change(out["reply"])
+
+
+@test("support_progress", "ad feedback retains the reason and every free route after the review cap")
+async def useful_ads_reply(_):
+    for product in ("esound", "lyra"):
+        for language in ("it", "en"):
+            for channel in ("email_imap", "playstore_reviews"):
+                state=c.SupportState("synthetic", "Too many ads", tenant=c._TENANTS[product],
+                    intent="premium", outcome="ads_policy_explained", channel=channel,
+                    facts={"language":language, "ads_feedback":True})
+                reply=c._fit_reply(c._fallback_reply(state),c._reply_cap(channel))
+                assert "server" in reply and "video" in reply and "Premium" in reply,reply
+                assert ("invit" in reply if language=="it" else "referral" in reply),reply
+                assert ("Creator" in reply)==(product=="lyra"),reply
+                assert not reply_guard.claims_completed_action(reply) and not state.actions
+
+
+@test("support_progress", "quoted ad malfunctions survive an opinion label without inventing evidence")
+async def mixed_ads(_):
+    text="Too many ads and ad audio overlaps the music."
+    payload={"kind":"ads_feedback","evidence":"Too many ads",
+             "reported":{"ads_concern":"Too many ads","ad_malfunction":"ad audio overlaps the music"}}
+    model=SimpleNamespace(generate=AsyncMock(return_value=SimpleNamespace(content=json.dumps(payload))))
+    state=c.SupportState("synthetic",text,intent="premium")
+    await c._read_reported_turn(SimpleNamespace(model=model),{},state,"unit")
+    assert state.intent=="bug" and state.reported_turn.kind=="bug" and state.facts["mixed_ads_complaint"]
+    assert not state.actions
+    payload['reported']['ad_malfunction']='an invented crash that was never reported'
+    parsed=t.read_reported_turn(payload,text)
+    assert 'ad_malfunction' not in parsed.reported
+    paid="I paid for Premium. Too many ads and ad audio overlaps the music."
+    state=c.SupportState("synthetic",paid,intent="premium")
+    payload['reported']['ad_malfunction']='ad audio overlaps the music'
+    model.generate.return_value=SimpleNamespace(content=json.dumps(payload))
+    await c._read_reported_turn(SimpleNamespace(model=model),{},state,"unit")
+    assert not state.facts.get('mixed_ads_complaint'),state.facts

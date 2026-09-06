@@ -1454,6 +1454,13 @@ async def _read_reported_turn(
         state.facts["turn_reader"] = "invalid_latest_evidence"
         state.intent = "request_review"
         return
+    # A secondary, quoted malfunction must not disappear behind the primary
+    # advertising-opinion label. It authorizes diagnosis, never an account action.
+    if assessment.kind == "ads_feedback" and assessment.reported.get("ad_malfunction"):
+        assessment = support_turn.ReportedTurn(
+            "bug", assessment.reported["ad_malfunction"],
+            assessment.reported, assessment.search_query,
+        )
     state.reported_turn = assessment
     state.facts["turn_reader"] = "grounded"
     # Other means no operational override, NOT that the thread is resolved.
@@ -1484,6 +1491,11 @@ async def _read_reported_turn(
         state.facts["payment_status_request"] = True
     if assessment.kind == "ads_feedback":
         state.facts["ads_feedback"] = True
+    ads_concern = assessment.reported.get("ads_concern", "")
+    if (assessment.kind == "bug" and ads_concern
+            and support_turn._fold(ads_concern) in support_turn._fold(state.customer_message)
+            and _is_ads_policy_complaint(state.customer_message)):
+        state.facts["mixed_ads_complaint"] = True
     if assessment.kind in {"guidance_question", "other"} and _is_ads_policy_complaint(state.customer_message):
         state.intent = "premium"
     if assessment.kind == "library_loss":
@@ -3860,7 +3872,57 @@ def _unverified_recovery_advice(reply: str) -> bool:
     ))
 
 
+def _ads_policy_reply(state: SupportState, italian: bool) -> str:
+    """The same useful exits for a policy question and a frequency complaint.
+
+    Keep short-channel text complete BEFORE the channel cap is applied: losing
+    the final sentences used to silently drop the free routes from reviews.
+    Product thresholds and reward durations remain customer-visible, not fixed.
+    """
+    lyra = state.tenant.key == "lyra"
+    if _is_review_channel(state.channel):
+        if italian:
+            return ("Capisco il fastidio. Gli annunci coprono i costi dei server. "
+                    "Puoi ottenere Premium gratis invitando amici"
+                    + (" o con Creator, se idoneo" if lyra else "")
+                    + ". Se l’app offre video premio, danno il periodo senza ads indicato. Anche Premium a pagamento rimuove gli annunci.")
+        return ("Sorry the ads are frustrating. They fund the servers that keep the app free. "
+                "Free options: referral Premium"
+                + (", Creator rewards if eligible" if lyra else "")
+                + ", or a reward video for the ad-free period shown, if offered in your app. Paid Premium also removes ads.")
+    if italian:
+        return ("Capisco quanto possano essere fastidiosi gli annunci mentre ascolti musica. "
+                "La pubblicità ci aiuta a coprire i costi dei server e a mantenere gratuita l’app. "
+                "Puoi ottenere Premium gratis invitando amici tramite il programma referral: "
+                "nell’app trovi le condizioni per maturare il premio. "
+                + ("Su Lyra c’è anche il programma Creator, se soddisfi i requisiti. " if lyra else "")
+                + "Se nell’app compare l’offerta video premio, puoi avviarla per ottenere il periodo senza annunci indicato: "
+                "un normale annuncio automatico non dà questo vantaggio. "
+                "Premium a pagamento rimane un’altra possibilità per togliere gli annunci.")
+    return ("I understand how frustrating ads can be while listening to music. "
+            "Advertising helps cover our server costs and keep the app free. "
+            "You can earn Premium for free by inviting friends through the referral program; "
+            "the app shows the conditions for earning the reward. "
+            + ("Lyra also has a Creator program if you meet its requirements. " if lyra else "")
+            + "If your app shows a reward-video offer, you can start it for the displayed ad-free period; "
+            "an ordinary automatic ad does not give that benefit. "
+            "Paid Premium is another option to remove ads.")
+
+
 def _fallback_reply(state: SupportState) -> str:
+    reply = _fallback_reply_base(state)
+    if state.intent == "bug" and state.facts.get("mixed_ads_complaint"):
+        italian = (state.facts.get("language") or _language_hint(state.customer_message)) == "it"
+        distinction = ("Il malfunzionamento che descrivi va verificato separatamente; "
+                       "pagare Premium non deve essere necessario per segnalarlo. " if italian else
+                       "The malfunction you describe needs checking separately; "
+                       "you do not need to pay for Premium to report it. ")
+        # Preserve the operational question/receipt first even on short channels.
+        return distinction + reply + "\n\n" + _ads_policy_reply(state, italian)
+    return reply
+
+
+def _fallback_reply_base(state: SupportState) -> str:
     # One shared language decision: a composed reply and this deterministic
     # fallback must never disagree about which language the customer wrote in.
     italian = (
@@ -3893,23 +3955,7 @@ def _fallback_reply(state: SupportState) -> str:
             "I could not verify the subscription status. This does not mean your Premium is expired or inactive."
         )
     if state.outcome == "ads_policy_explained":
-        if state.facts.get("ads_feedback"):
-            return (
-                "Capisco: la frequenza delle pubblicità sta interrompendo l’ascolto. La versione gratuita include pubblicità; Premium le rimuove."
-                if italian else
-                "The frequency of the ads is interrupting your listening. The free version includes ads; Premium removes them."
-            )
-        if state.tenant.key == "lyra":
-            return (
-                "Capisco che la pubblicità sia fastidiosa. Gratis puoi ottenere Premium con i referral; se nell’app vedi l’opzione video premio, puoi usarla per il periodo senza ads indicato. Per chi è idoneo c’è anche il percorso Creator. In alternativa, Premium rimuove gli ads."
-                if italian else
-                "I understand the ads are frustrating. Free options include earning Premium through referrals and, when your app shows the reward-video offer, using it for the displayed ad-free period. Eligible users can also use Lyra's Creator route. Otherwise, Premium removes ads."
-            )
-        return (
-            "Capisco che la pubblicità sia fastidiosa. Gratis puoi ottenere Premium invitando amici; se nell’app vedi l’opzione video premio, puoi usarla per il periodo senza ads indicato. In alternativa, Premium rimuove gli ads."
-            if italian else
-            "I understand the ads are frustrating. You can earn Premium for free by inviting friends and, when your app shows the reward-video offer, use it for the displayed ad-free period. Otherwise, Premium removes ads."
-        )
+        return _ads_policy_reply(state, italian)
     if state.outcome == "premium_active":
         family = state.facts.get("store_family") or _store_family(
             str(state.facts.get("store") or "")
@@ -8007,7 +8053,10 @@ async def run(
             base = reply
             if category in {"repeated_opening", "canned_opening"}:
                 base = re.sub(
-                    r"^(?:I understand the ads are frustrating|Capisco che la pubblicità sia fastidiosa)\.\s*",
+                    r"^(?:I understand the ads are frustrating|Capisco che la pubblicità sia fastidiosa|"
+                    r"I understand how frustrating ads can be while listening to music|"
+                    r"Capisco quanto possano essere fastidiosi gli annunci mentre ascolti musica|"
+                    r"Sorry the ads are frustrating|Capisco il fastidio)\.\s*",
                     "", base,
                 )
             retry_reply = base if base != reply else await _rephrase_from_receipt(

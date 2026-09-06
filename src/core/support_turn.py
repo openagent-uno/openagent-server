@@ -17,14 +17,15 @@ KINDS = frozenset({
     "other", "signup", "password_recovery", "catalog_offline", "library_loss", "referral_status", "status_check", "bug",
     "resolved_confirmation", "acknowledgement", "guidance_question", "praise", "support_channel", "human_request", "account_recovery", "account_change", "refund_request", "payment_status", "ads_feedback", "business_request", "unavailable_instruction",
 })
-FIELDS = frozenset({"app_version", "device", "os", "platform", "steps", "observed", "expected", "unavailable_instruction"})
+FIELDS = frozenset({"app_version", "device", "os", "platform", "steps", "observed", "expected", "unavailable_instruction", "ads_concern", "ad_malfunction"})
 
 READER_SYSTEM = """Read the customer's support conversation, not just topic words.
 Return JSON only:
 {"kind":"other|signup|password_recovery|catalog_offline|library_loss|referral_status|status_check|bug|resolved_confirmation|acknowledgement|guidance_question|praise|support_channel|human_request|account_recovery|account_change|refund_request|payment_status|ads_feedback|business_request|unavailable_instruction",
  "evidence":"exact customer quote supporting the kind",
  "reported":{"app_version":"exact quote","device":"exact quote","os":"exact quote",
- "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote","unavailable_instruction":"exact quote"}}
+ "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote","unavailable_instruction":"exact quote",
+ "ads_concern":"exact complaint about advertising","ad_malfunction":"exact concrete ad malfunction"}}
 unavailable_instruction means the latest customer correction that a button/menu we
 previously suggested is absent, or that our proposed step was already tried and failed.
 Do not set it for an ordinary new bug or a question asking how to perform a step.
@@ -68,6 +69,17 @@ Premium, payment or a CONDITIONAL refund ("fix the bug or I'll ask for a refund"
 is not this kind: preserve the main bug/request. Do not infer financial consent.
 ads_feedback means a complaint about ad frequency/length, without a concrete
 malfunction. Ad audio overlapping music, frozen controls or playback failures are bug.
+Read the WHOLE complaint before choosing ads_feedback: praise, a price objection,
+or frustration about new ads must not hide a malfunction later in the sentence.
+For mixed complaints use kind=bug, quote the failure in reported.ad_malfunction,
+and retain the advertising objection in reported.ads_concern. For example,
+'pubblicità durante le canzoni, audio accavallati' reports overlapping audio;
+it is not merely an opinion about frequency. Ordinary ad interruptions alone
+are not a malfunction. Omit ad_malfunction for negated, hypothetical, resolved,
+or older faults unrelated to the current request. Never invent either quote.
+ads_concern is an objection to the presence, price or frequency of advertising,
+not the mere mention of an ad in a technical bug report. For a pure ad bug,
+omit ads_concern: recommending Premium does not answer that request.
 business_request means a partnership, sales pitch or commercial proposal, not app support.
 signup means asking how to CREATE an account, not change credentials or recover one.
 An attempted signup that fails is bug, not instructions to open the signup screen.
