@@ -246,7 +246,7 @@ def requested_fields(reply: str) -> set[str]:
     classifier. The planner owns the allowed question independently of it.
     """
     requests = [s for s in re.split(r"(?<=[.!?])\s+|\n", reply) if re.search(
-        r"\?|\b(?:send|tell me|provide|which|what|invia|dimmi|envie|diga|qual|cu[aá]l|enviame)\b", s, re.I,
+        r"\?|^\s*(?:please\s+)?(?:which|what|qual|cu[aá]l|send|tell me|provide|invia|dimmi|envie|diga|enviame)\b|\b(?:please|per favore|por favor)\s+(?:send|provide|invia|envie)\b", s, re.I,
     )]
     patterns = {
         "app_version": r"\bversion\w*|vers[aã]o",
@@ -254,8 +254,14 @@ def requested_fields(reply: str) -> set[str]:
         "os": r"\boperating system|sistema operativ\w*|\bos\b",
         "steps": r"\bsteps\b|\bstep that (?:triggers|causes)\b|\b(?:which|what) step\b|passagg\w*|passo\w*|what you do|cosa fai",
     }
+    def field_text(field: str, sentence: str) -> str:
+        if field == "app_version":
+            # An OS version is a different missing field from the app version.
+            sentence = re.sub(r"\bvers(?:ion\w*|[aã]o)\s+\d+(?:[.-]\d+)*\b", "", sentence, flags=re.I)
+            return re.sub(r"\b(?:operating system|android|ios|ipados|os)\s+version\w*|\bvers(?:ion\w*|[aã]o)\s+(?:of\s+(?:the\s+)?|d[oe]\s+|del\s+|di\s+)?(?:sistema operativ\w*|sistema operacion\w*|operating system|android|ios|ipados|os)\b", "", sentence, flags=re.I)
+        return sentence
     return {field for field, pattern in patterns.items()
-            if any(re.search(pattern, sentence, re.I) for sentence in requests)}
+            if any(re.search(pattern, field_text(field, sentence), re.I) for sentence in requests)}
 
 
 def repeated_reply(reply: str, prior: list[str]) -> bool:

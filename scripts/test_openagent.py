@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import importlib
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -51,6 +52,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_support_context",
     "test_support_sept6",
     "test_support_progress",
+    "test_support_voice",
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
     "test_iroh_discovery",
@@ -814,6 +816,11 @@ def _discover_test_modules() -> list[str]:
 
 
 def main() -> int:
+    # Operational unit doubles predate the customer writer/reviewer protocol.
+    # Keep their deterministic planning contracts isolated; support_voice tests
+    # explicitly enable the production-default writer, and real-model replay
+    # always exercises it. No live model dependency enters this unit suite.
+    os.environ.setdefault("OPENAGENT_SUPPORT_HUMAN_VOICE", "0")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", default=str(Path.home() / "my-agent" / "openagent.yaml"),

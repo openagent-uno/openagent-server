@@ -268,6 +268,11 @@ class StdioModel:
 
 def score(case: Case, output: dict[str, Any], doubles: _Doubles) -> list[str]:
     failures = []
+    if "replio_threads_respond" not in case.must_not_call:
+        if (not output.get("reply") or
+                output.get("facts", {}).get("reply_source") != "model:human_voice_verified" or
+                "replio_threads_respond" not in doubles.names):
+            failures.append("expected a reviewed contextual reply to be delivered")
     if case.contracted_latest and output.get("facts", {}).get("message_source") != "latest_contracted_inbound":
         failures.append("queued text was not aligned with the verified latest inbound")
     if output["intent"] != case.intent:
@@ -293,7 +298,9 @@ def score(case: Case, output: dict[str, Any], doubles: _Doubles) -> list[str]:
         if text.casefold() in output.get("reply", "").casefold():
             failures.append("forbidden reply claim: " + text)
     for text in case.required_reply:
-        if text.casefold() not in output.get("reply", "").casefold():
+        equivalents = {"referral": ("referr", "inviting friends", "invite friends"),
+                       "server": ("server", "infrastructure", "running costs")}.get(text, (text.casefold(),))
+        if not any(term in output.get("reply", "").casefold() for term in equivalents):
             failures.append("missing useful answer content: " + text)
     if output["facts"].get("delivery_state") not in {"simulated", "not_attempted"}:
         failures.append("delivery not explicitly simulated/noop")
@@ -306,6 +313,7 @@ def score(case: Case, output: dict[str, Any], doubles: _Doubles) -> list[str]:
 
 async def replay(command: list[str], selected: list[Case], repeat: int) -> dict[str, Any]:
     os.environ.update({"OPENAGENT_FORCE_DRY_RUN": "1",
+                       "OPENAGENT_SUPPORT_HUMAN_VOICE": "1",
                        "OPENAGENT_ESOUND_SUPPORT_CONTROLLER_WRITES": "1",
                        "OPENAGENT_SUPPORT_TURN_READER": "1",
                        # The registered model is the only external dependency.

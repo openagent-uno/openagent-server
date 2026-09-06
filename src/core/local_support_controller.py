@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from src.core import reply_guard, support_attachments, support_context, support_semantics, support_turn, support_progress, support_guidance, tool_trace
+from src.core import reply_guard, support_attachments, support_context, support_semantics, support_turn, support_progress, support_guidance, support_voice, tool_trace
 from src.core.support_billing import billing_payload, explicit_premium
 from src.core.support_email import receipt_request, without_support_echo
 from src.core.dry_run import is_dry_run
@@ -211,6 +211,7 @@ class SupportState:
     policy_paths: list[str] = field(default_factory=list)
     human_reason: str = ""
     recent_exchange: list[dict[str, str]] = field(default_factory=list)
+    voice_deadline: float = 0.0
     # Everything this side already said on the thread, oldest first. Used to
     # refuse to send the same answer a second time in any language.
     prior_support_replies: list[str] = field(default_factory=list)
@@ -3883,29 +3884,31 @@ def _ads_policy_reply(state: SupportState, italian: bool) -> str:
     if _is_review_channel(state.channel):
         if italian:
             return ("Capisco il fastidio. Gli annunci coprono i costi dei server. "
-                    "Puoi ottenere Premium gratis invitando amici"
+                    "Premium gratis invitando amici"
                     + (" o con Creator, se idoneo" if lyra else "")
-                    + ". Se l’app offre video premio, danno il periodo senza ads indicato. Anche Premium a pagamento rimuove gli annunci.")
+                    + ". Nei Settaggi, se disponibile, un video premio dà 30 minuti senza ads; 2 video danno 60 minuti, cumulabili fino a 120 minuti. Gli annunci automatici non danno premi.")
         return ("Sorry the ads are frustrating. They fund the servers that keep the app free. "
                 "Free options: referral Premium"
                 + (", Creator rewards if eligible" if lyra else "")
-                + ", or a reward video for the ad-free period shown, if offered in your app. Paid Premium also removes ads.")
+                + ". In Settings, if offered, a reward video gives 30 ad-free minutes; 2 give 60. Time stacks up to 120 minutes; automatic ads give no reward.")
     if italian:
         return ("Capisco quanto possano essere fastidiosi gli annunci mentre ascolti musica. "
                 "La pubblicità ci aiuta a coprire i costi dei server e a mantenere gratuita l’app. "
                 "Puoi ottenere Premium gratis invitando amici tramite il programma referral: "
                 "nell’app trovi le condizioni per maturare il premio. "
                 + ("Su Lyra c’è anche il programma Creator, se soddisfi i requisiti. " if lyra else "")
-                + "Se nell’app compare l’offerta video premio, puoi avviarla per ottenere il periodo senza annunci indicato: "
-                "un normale annuncio automatico non dà questo vantaggio. "
+                + "Nei Settaggi, se la voce video premio è disponibile, puoi avviarla per ottenere 30 minuti senza annunci. "
+                "Puoi ripeterlo e il tempo si somma: 2 video danno 60 minuti, un’ora senza pubblicità, fino a un massimo cumulato di 120 minuti (2 ore). "
+                "Il normale annuncio automatico non dà questo vantaggio e il video premio dà tempo senza ads, non Premium. "
                 "Premium a pagamento rimane un’altra possibilità per togliere gli annunci.")
     return ("I understand how frustrating ads can be while listening to music. "
             "Advertising helps cover our server costs and keep the app free. "
             "You can earn Premium for free by inviting friends through the referral program; "
             "the app shows the conditions for earning the reward. "
             + ("Lyra also has a Creator program if you meet its requirements. " if lyra else "")
-            + "If your app shows a reward-video offer, you can start it for the displayed ad-free period; "
-            "an ordinary automatic ad does not give that benefit. "
+            + "In Settings, if the reward-video option is available, you can start it for 30 ad-free minutes. "
+            "You can repeat it and the time stacks: 2 videos give 60 minutes, one ad-free hour, up to a maximum accumulated window of 120 minutes (2 hours). "
+            "Ordinary automatic ads do not give this benefit; reward videos give ad-free time, not Premium. "
             "Paid Premium is another option to remove ads.")
 
 
@@ -4591,6 +4594,13 @@ _REPLY_CAP_HARD = 300
 
 
 def _reply_cap(channel: str) -> int:
+    if support_voice.enabled():
+        # Honour actual channel limits; a universal 300-character ceiling
+        # made useful explanations impossible even in long-form support.
+        key = str(channel or "").strip().lower()
+        if key in {"playstore_reviews", "playstore", "play_store"}:
+            return 350
+        return 900 if _is_review_channel(key) else 1800
     channel_cap = _CHANNEL_REPLY_CAP.get(str(channel or "").strip().lower(), 1_200)
     return min(channel_cap, _REPLY_CAP_HARD) if _is_review_channel(channel) else min(channel_cap, 1200)
 
@@ -4731,7 +4741,7 @@ def _introduces_claim(reply: str, base: str, state: SupportState) -> bool:
     """
     known = base.lower() + " " + json.dumps(state.facts, default=str).lower()
     for token in _ID_OR_NUMBER.findall(reply):
-        if token.lower() not in known:
+        if token.rstrip(".,;:!?").lower() not in known:
             return True
     return any(item.lower() not in known for item in _CONTACT.findall(reply))
 
@@ -4781,6 +4791,9 @@ async def _fallback_in_language(
     a guard fired. The rephrase pass adds no claim - it is the same sentence -
     so it is safe here in a way free composition is not.
     """
+    if support_voice.enabled():
+        state.facts["delivery_guard_reason"] = reason
+        return await _compose_human_reply(agent, event, state, session_id)
     base = _fallback_reply(state)
     state.facts["reply_source"] = f"deterministic:{reason}"
     language = str(state.facts.get("language") or "en")
@@ -4958,6 +4971,84 @@ async def _rephrase_from_receipt(
     return reply
 
 
+async def _compose_human_reply(agent: Any, event: dict[str, Any], state: SupportState, session_id: str) -> str:
+    brief = _fallback_reply(state)
+    if not brief:
+        return ""
+    model = getattr(agent, "model", None)
+    model_id = str(os.environ.get("OPENAGENT_SUPPORT_VOICE_MODEL") or event.get("model") or "").strip()
+    packet = support_voice.packet(state, brief, _reply_cap(state.channel))
+    state.facts["human_voice_model"] = model_id or "event_default"
+    state.facts.pop("human_voice_sha256", None)
+    state.facts["reply_source"] = "none:human_voice_pending"
+    token = set_tool_allowlist([])
+    try:
+        if not state.voice_deadline:
+            state.voice_deadline = asyncio.get_running_loop().time() + 120
+        async with asyncio.timeout_at(state.voice_deadline):
+            if model_id and callable(getattr(model, "build_override_model", None)):
+                model = model.build_override_model(model_id)
+            for attempt in range(3):
+                if model is None:
+                    break
+                with strict_local_only_scope(True), stateless_completion_scope(True):
+                    response = await _generate_support_model(
+                        model, messages=[{"role":"user", "content":json.dumps(packet, ensure_ascii=False, default=str)}],
+                        system=support_voice.WRITER_SYSTEM, session_id=f"{session_id}:support-voice-{attempt}",
+                        timeout_env="OPENAGENT_SUPPORT_VOICE_TIMEOUT_SECONDS", default_timeout="45",
+                    )
+                content = str(getattr(response, "content", "") or "").strip()
+                proposal = _extract_json(content)
+                # Plain prose avoids lossy JSON escaping for quoted UI labels.
+                # Accept the earlier JSON envelope for provider compatibility.
+                reply = str(proposal.get("reply") or "").strip() if isinstance(proposal, dict) else content
+                findings = []
+                if not reply or len(reply) > packet["max_characters"]:
+                    findings.append(f"This reply is {len(reply)} characters; the hard limit is {packet['max_characters']}. Cut at least {max(60, len(reply) - packet['target_characters'])} characters. Rewrite in one compact paragraph, preserving the facts; remove emotional asides, padding and generic closing questions.")
+                # Reported version/device numbers are legitimate acknowledgement
+                # material. The reviewer still requires receipts for account state.
+                numeric_context = brief + " " + json.dumps(state.recent_exchange, ensure_ascii=False, default=str)
+                if _introduces_claim(reply, numeric_context, state):
+                    findings.append("Remove numbers or contact details absent from operational_brief.")
+                if reply_guard.claims_human_identity(reply) or reply_guard.claims_profile_change(reply):
+                    findings.append("Do not invent human identity or profile changes.")
+                if reply_guard.promises_future_release(reply):
+                    findings.append("Do not promise a future release.")
+                if support_voice.unsupported_duration(reply, brief):
+                    findings.append("Remove unsupported permanent, lifetime or unlimited benefit claims; preserve the actual reward limits.")
+                if not findings:
+                    review_packet = {**packet, "proposed_reply": reply}
+                    with strict_local_only_scope(True), stateless_completion_scope(True):
+                        checked = await _generate_support_model(
+                            model, messages=[{"role":"user", "content":json.dumps(review_packet, ensure_ascii=False, default=str)}],
+                            system=support_voice.REVIEW_SYSTEM, session_id=f"{session_id}:support-voice-review-{attempt}",
+                            timeout_env="OPENAGENT_SUPPORT_VOICE_TIMEOUT_SECONDS", default_timeout="45",
+                        )
+                    verdict = _extract_json(getattr(checked, "content", "")) or {}
+                    content_ok = support_voice.covered(verdict, packet["required_points"], reply)
+                    guidance_ok = support_voice.guidance_supported(verdict, packet)
+                    if content_ok and guidance_ok:
+                        state.facts["reply_source"] = "model:human_voice_verified"
+                        state.facts["human_voice_sha256"] = hashlib.sha256(reply.encode()).hexdigest()
+                        state.facts["human_voice_attempts"] = attempt + 1
+                        return reply
+                    findings = verdict.get("findings") or ["Preserve the complete brief and answer this customer humanely."]
+                    if not guidance_ok:
+                        findings = list(findings) if isinstance(findings, list) else [str(findings)]
+                        findings.append("Product/device steps lack exact supporting source quotes. Remove unverified navigation, including searches in Settings and guessed buttons. Explain the term and the known limitation, or offer a non-UI alternative; do not guess a different menu path.")
+                packet["reviewer_findings"] = str(findings)[:1200]
+                packet["previous_attempt"] = reply
+    except Exception as exc:
+        # Never send the internal brief because a provider failed.
+        elog("support_controller.voice_failed", level="warning", error_type=type(exc).__name__)
+    finally:
+        reset_tool_allowlist(token)
+    state.facts["reply_source"] = "none:human_voice_review_required"
+    state.human_reason = "A helpful, factually faithful reply could not be verified after bounded writing attempts. Review the conversation; no canned fallback was sent."
+    state.facts["human_handoff_confirmed"] = await _queue_for_human(getattr(agent, "_mcp", None), state)
+    return ""
+
+
 async def _compose_local(
     agent: Any,
     event: dict[str, Any],
@@ -4973,6 +5064,8 @@ async def _compose_local(
         if not state.facts.get("human_handoff_confirmed"):
             state.facts["human_handoff_confirmed"] = await _queue_for_human(getattr(agent, "_mcp", None), state)
         return ""
+    if support_voice.enabled():
+        return await _compose_human_reply(agent, event, state, session_id)
     if state.decision == "ask_information" and state.facts.get("missing_evidence"):
         # The decision has already selected the missing evidence. Free prose
         # generation was inventing UI choices even with a complete operator
@@ -6437,6 +6530,11 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         "acknowledgement_no_reply_needed", "machine_mail",
         "praise_no_reply_needed",
     }:
+        return
+    if support_voice.enabled() and state.facts.get("human_voice_sha256") != hashlib.sha256(reply.encode()).hexdigest():
+        state.facts["reply_source"] = "none:unreviewed_reply_blocked"
+        state.human_reason = "The final text changed after voice review. Review before sending; an internal fallback must not reach the customer."
+        state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
         return
     if state.decision == "human":
         # The queue write already happened, before the reply was composed
@@ -8047,7 +8145,7 @@ async def run(
         retry_reply = await _compose_local(
             agent, event, state, f"{session_id}:{delivery_id}:guard-retry",
         )
-        if retry_reply.strip() == reply.strip():
+        if retry_reply.strip() == reply.strip() and not support_voice.enabled():
             # Fixed policy branches intentionally return the same words. A
             # retry must change them without inventing product behavior.
             base = reply
