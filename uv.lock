@@ -1708,7 +1708,7 @@ wheels = [
 
 [[package]]
 name = "openagent-framework"
-version = "0.20.51"
+version = "0.20.52"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
