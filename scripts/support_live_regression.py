@@ -13,9 +13,9 @@ from src.core.dry_run import dry_run_scope
 CASES=[
  {'id':'esound-find-version-ios','product':'esound','turns':[
  ('inbound','No puedo escuchar mis canciones, aparece un error.'),('outbound','¿Qué versión de la app tienes?'),
- ('inbound','¿Cómo puedo ver qué versión tengo?'),('inbound','iOS')], 'required':['versi','config|ajustes','acerca|informaci']},
+ ('inbound','¿Cómo puedo ver qué versión tengo?'),('inbound','iOS')], 'required':['versi','config|ajustes','acerca|informaci|about']},
  {'id':'lyra-integrations-google','product':'lyra','turns':[
- ('inbound','What does integrations do? I tried to add YouTube there and it just gives me a Google page.\n---\napp_version: 1.4.11\ndevice: Samsung A15\nos: Android 16')], 'required':['google','youtube'], 'forbidden':['full catalog','full catalogue']},
+ ('inbound','What does integrations do? I tried to add YouTube there and it just gives me a Google page.\n---\napp_version: 1.4.11\ndevice: Samsung A15\nos: Android 16')], 'required':['google','youtube'], 'forbidden':['full catalog','full catalogue','primary audio source']},
  {'id':'esound-login-help','product':'esound','turns':[('inbound','Quiero iniciar sesión')], 'required':['sesi|entrar|acced']},
  {'id':'lyra-ad-pause-request','product':'lyra','turns':[('inbound','When ads play, the song keeps going simultaneously with the ad. Could you stop the song when an ad starts and resume it once it finishes?')], 'required':['paus|stop','resum|again|after'], 'forbidden':['referral','Creator']},
  {'id':'lyra-ads-and-malfunction','product':'lyra','turns':[('inbound','Ho consigliato Lyra a tutti i miei amici. Ora ci sono troppe pubblicità, e la musica si sovrappone alla pubblicità: potete fermarla durante il video e farla ripartire alla fine?')], 'required':['30','server','pubblicit','ripart|ripren|paus'], 'forbidden':['sempre senza pubblicità']},
@@ -48,6 +48,21 @@ async def run(args):
      return {'external_task_id':'support-case-sim','linked':True,'simulated':True}
     tk.functions['replio_threads_mark_for_human']=SimpleNamespace(entrypoint=mark,parameters={'properties':{}})
     tk.functions['replio_thread_ensure_support_task']=SimpleNamespace(entrypoint=own,parameters={'properties':{}})
+   if args.guard_command_file and not case.get('block'):
+    guard_command=json.loads(Path(args.guard_command_file).read_text())
+    async def guarded_respond(**kw):
+     d._log('replio_threads_respond',**kw)
+     request={'reply':kw['body_text'],'product':case['product'],'turns':case['turns'],
+              'linked':bool(d._links),'escalated':'replio_threads_mark_for_human' in d.names,
+              'attachment_read':case.get('attachment') is not None,
+              'diagnostic':any('diagnostic' in name for name in d.names)}
+     p=await asyncio.create_subprocess_exec(*guard_command,stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)
+     out,err=await p.communicate(json.dumps(request).encode())
+     if p.returncode:raise RuntimeError('guard adapter failed: '+err.decode()[-120:])
+     receipt=json.loads(out)
+     if receipt.get('guard_verdict_reached') is not True:raise RuntimeError('real guard did not reach a verdict')
+     return receipt
+    tk.functions['replio_threads_respond']=SimpleNamespace(entrypoint=guarded_respond,parameters={'properties':{}})
    if case.get('block'):
     d._respond_results=[{'sent':False,'blocked':True,'retry_now':False,'category':'no_progress','reason':'Held for manual review.'}]*3
    model=StdioModel(command);started=time.monotonic();errors=[];output={}
@@ -57,7 +72,7 @@ async def run(args):
     output=json.loads(result.text)
     import re
     reply=output.get('reply','')
-    if not case.get('block') and (not reply or 'replio_threads_respond' not in d.names):errors.append('no delivered simulated reply')
+    if not case.get('block') and (not reply or output.get('facts',{}).get('delivery_state') != 'simulated'):errors.append('no delivered simulated reply')
     for term in case.get('required',[]):
      if not re.search(term,reply,re.I):errors.append('missing '+term)
     for term in case.get('forbidden',[]):
@@ -70,4 +85,4 @@ async def run(args):
    Path(args.output).write_text(json.dumps({'cases':len(rows),'passed':sum(not x['failures'] for x in rows),'business_io':'simulated only','rows':rows},ensure_ascii=False,indent=2))
  return sum(bool(x['failures']) for x in rows)
 if __name__=='__main__':
- p=argparse.ArgumentParser();p.add_argument('--model-command-file',required=True);p.add_argument('--docs-command-file',required=True);p.add_argument('--voice-model',required=True);p.add_argument('--output',required=True);p.add_argument('--repeat',type=int,default=1);p.add_argument('--case',action='append');args=p.parse_args();raise SystemExit(bool(asyncio.run(run(args))))
+ p=argparse.ArgumentParser();p.add_argument('--model-command-file',required=True);p.add_argument('--docs-command-file',required=True);p.add_argument('--voice-model',required=True);p.add_argument('--guard-command-file');p.add_argument('--output',required=True);p.add_argument('--repeat',type=int,default=1);p.add_argument('--case',action='append');args=p.parse_args();raise SystemExit(bool(asyncio.run(run(args))))

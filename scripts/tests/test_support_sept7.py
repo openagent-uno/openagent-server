@@ -23,6 +23,11 @@ async def envelopes(_):
     packet=v.packet(s,c._fallback_reply(s),1800)
     assert v.guidance_supported({'product_steps_present':True,'source_quotes':['In eSound open Settings,\nthen About, then Version.']},packet)
     assert not v.guidance_supported({'product_steps_present':True,'source_quotes':['In eSound open Settings, then Developer menu.']},packet)
+    assert g.contains_quote('Open https://example.test, then About.', 'Open `https://example.test`, then **About**.')
+    assert not g.contains_quote('Always free', '**Not** always free')
+    assert not g.contains_quote('30 minutes', '60 minutes')
+    packet['operational_brief']='The optional rewarded video in Settings grants 30 ad-free minutes.'
+    assert v.guidance_supported({'product_steps_present':True,'source_quotes':['The optional rewarded video in Settings grants 30 ad-free minutes.']},packet)
 
 
 @test('support_sept7', 'reclaimed escalation obtains and verifies ownership before retry, once per turn')

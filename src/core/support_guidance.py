@@ -38,8 +38,10 @@ def excerpts(result: Any) -> list[str]:
 
 
 def contains_quote(quote: str, source: str) -> bool:
-    """Whitespace wrapping is transport formatting, not different evidence."""
-    normalize = lambda text: re.sub(r'\s+', ' ', text).strip()
+    """Ignore wrapping and inline emphasis, never words or factual qualifiers."""
+    def normalize(text: str) -> str:
+        text = re.sub(r'(`+|\*{1,3})', '', text)
+        return re.sub(r'\s+', ' ', text).strip()
     return normalize(quote) in normalize(source)
 
 
