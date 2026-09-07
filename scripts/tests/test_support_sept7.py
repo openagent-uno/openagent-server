@@ -24,8 +24,9 @@ async def envelopes(_):
     assert v.guidance_supported({'product_steps_present':True,'source_quotes':['In eSound open Settings,\nthen About, then Version.']},packet)
     assert not v.guidance_supported({'product_steps_present':True,'source_quotes':['In eSound open Settings, then Developer menu.']},packet)
     assert g.contains_quote('Open https://example.test, then About.', 'Open `https://example.test`, then **About**.')
-    assert not g.contains_quote('Always free', '**Not** always free')
+    assert not g.contains_quote('It is always free', 'It is **not** always free')
     assert not g.contains_quote('30 minutes', '60 minutes')
+    assert g.contains_quote("un'ora senza pubblicità", 'Un’ora senza pubblicità')
     packet['operational_brief']='The optional rewarded video in Settings grants 30 ad-free minutes.'
     assert v.guidance_supported({'product_steps_present':True,'source_quotes':['The optional rewarded video in Settings grants 30 ad-free minutes.']},packet)
 
@@ -49,6 +50,18 @@ async def handoff(_):
         assert await c._queue_for_human(pool,s)
     assert calls==['mark','own','get','mark'],calls
     assert s.facts['human_owner_verified'] and s.linked_task_id=='case-123'
+
+
+@test('support_sept7', 'human voice keeps retrieved sources without a second draft becoming operational evidence')
+async def one_writer(_):
+    s=state();s.outcome='bug_needs_evidence'
+    documents={'items':[{'excerpt':'Expected playback pauses during a full-screen advertisement and resumes afterward. This does not prove a fix for the reported device.'}]}
+    s.facts['guidance_documents']=documents
+    model=VoiceModel([],[])
+    with patch.dict(os.environ,{v.ENV:'1'}):
+        assert not await c._try_documented_resolution(_Doubles().pool(),SimpleNamespace(model=model),{},s,'test')
+    assert s.facts['guidance_documents']==documents and not model.calls
+    assert not s.facts.get('documented_answer')
 
 
 @test('support_sept7', 'unverified support task cannot authorize a handoff or blind create retry')

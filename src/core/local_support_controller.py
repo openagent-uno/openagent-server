@@ -5824,6 +5824,11 @@ async def _try_documented_resolution(pool: Any, agent: Any, event: dict, state: 
     sources = support_guidance.excerpts(documents)
     if not sources:
         return False
+    if support_voice.enabled():
+        # The final writer/reviewer already consumes these sources. A second
+        # draft here became an authoritative brief, reintroducing questions
+        # the customer had answered and duplicating reward requirements.
+        return False
     model = getattr(agent, "model", None)
     if model is None:
         return False

@@ -41,7 +41,8 @@ def contains_quote(quote: str, source: str) -> bool:
     """Ignore wrapping and inline emphasis, never words or factual qualifiers."""
     def normalize(text: str) -> str:
         text = re.sub(r'(`+|\*{1,3})', '', text)
-        return re.sub(r'\s+', ' ', text).strip()
+        text = text.translate(str.maketrans({'’': "'", '‘': "'", '“': '"', '”': '"'}))
+        return re.sub(r'\s+', ' ', text).strip().casefold()
     return normalize(quote) in normalize(source)
 
 
