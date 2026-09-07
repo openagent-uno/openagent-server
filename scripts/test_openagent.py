@@ -53,6 +53,7 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_support_sept6",
     "test_support_progress",
     "test_support_voice",
+    "test_support_sept7",
     # 1. Lightweight / pure-unit (no fixtures needed)
     "test_imports",
     "test_iroh_discovery",

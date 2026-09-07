@@ -368,6 +368,12 @@ def _start_lease_heartbeat(db: Any, delivery_id: str) -> Optional[asyncio.Task]:
     return asyncio.create_task(_beat())
 
 
+
+def _retained_output(text: str) -> str:
+    from src.core.support_delivery_receipts import retain_event_output
+    return retain_event_output(text, MAX_EVENT_OUTPUT_CHARS)
+
+
 async def _stop_lease_heartbeat(task: Optional[asyncio.Task]) -> None:
     """Cancel and await the heartbeat task (called in dispatch's finally)."""
     if task is None:
@@ -574,7 +580,7 @@ async def dispatch_event(
         await db.update_event_delivery(
             delivery_id,
             status=final_status,
-            output=(result.get("output") or "")[:2000],
+            output=_retained_output(result.get("output") or ""),
             finished_at=_now(),
             # ``error`` incluso: un terminale `failed` che non ha alzato deve
             # comunque lasciare il MOTIVO nella colonna, come fa il ramo che alza.
@@ -801,6 +807,6 @@ async def _dispatch_prompt(*, agent, db, event, payload, delivery_id, source, on
     return {
         "status": "failed" if failed else "success",
         "session_id": result.session_id,
-        "output": (result.text or "")[:MAX_EVENT_OUTPUT_CHARS],
+        "output": _retained_output(result.text or ""),
         **({"error": failure_detail[:2000]} if failed else {}),
     }

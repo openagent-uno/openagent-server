@@ -1,8 +1,37 @@
 """Compact operational receipts without customer text or credentials."""
 from __future__ import annotations
 import re
+import json
 from typing import Any
 from src.core.support_turn import receipt_objects, delivery_state
+
+
+def retain_event_output(text: str, limit: int = 4000) -> str:
+    """Retain a valid operational result instead of cutting JSON mid-receipt."""
+    if len(text) <= limit:
+        return text
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text[:limit]
+    if not isinstance(data, dict) or data.get('controller') != 'esound-local-v1':
+        return text[:limit]
+    facts = data.get('facts') or {}
+    kept = {k: data.get(k) for k in ('thread_id', 'controller', 'intent', 'decision', 'outcome', 'reply')}
+    kept['facts'] = {k: facts[k] for k in (
+        'reply_source', 'delivery_state', 'human_voice_model', 'human_voice_attempts',
+        'human_voice_error', 'human_voice_rejections', 'human_handoff_confirmed',
+        'delivery_handoff_confirmed', 'human_owner_required', 'human_owner_verified',
+        'human_handoff_error', 'disposition_confirmed', 'language') if k in facts}
+    kept['delivery'] = summarize(data.get('actions') or [])
+    kept['detail_omitted'] = True
+    result = json.dumps(kept, ensure_ascii=False, separators=(',', ':'))
+    if len(result) > limit:
+        # Unusually large text remains visibly partial, never malformed JSON.
+        kept['reply'] = str(kept.get('reply') or '')[:max(0, len(str(kept.get('reply') or '')) - (len(result)-limit) - 80)]
+        kept['reply_truncated'] = True
+        result = json.dumps(kept, ensure_ascii=False, separators=(',', ':'))
+    return result
 
 # These are labels, never excerpts from the provider's message. Classification
 # is a diagnostic hint; it does not authorize retries or change delivery state.

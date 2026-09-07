@@ -1371,7 +1371,7 @@ async def _read_reported_turn(
     Only non-destructive support routes can be refined here. Money, deletion,
     legal and explicit confirmations retain their independent authority gates.
     """
-    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change", "acknowledgement", "praise", "ios_availability", "refund", "business_request"}:
+    if state.intent not in {"general", "premium", "offline", "bug", "feature_request", "account_change", "acknowledgement", "praise", "ios_availability", "refund", "business_request", "attachment_only"}:
         return
     if state.intent == "acknowledgement" and support_progress.courtesy_only(state.customer_message):
         state.facts["turn_reader"] = "pure_courtesy"
@@ -1402,6 +1402,7 @@ async def _read_reported_turn(
         "latest_message": state.customer_message[-4000:],
         "prior_support": state.prior_support_replies[-3:],
         "recent_exchange": state.recent_exchange,
+        "attachment_observation": state.attachment_observation[:4000],
     }
     token = set_tool_allowlist([])
     try:
@@ -1538,6 +1539,7 @@ async def _language_with_model(agent: Any, event: dict, signal: str, session_id:
 
 
 def _attachment_text(result: Any) -> str:
+    result = _clickup_payload(result)
     if isinstance(result, str):
         return result.strip()
     if isinstance(result, dict):
@@ -1644,7 +1646,7 @@ async def _inspect_support_attachments(
         if len(images) > 6:
             incomplete = True
         model = getattr(agent, "model", None)
-        model_id = str(event.get("vision_model") or os.environ.get("OPENAGENT_SUPPORT_VISION_MODEL") or event.get("model") or "")
+        model_id = str(event.get("vision_model") or os.environ.get("OPENAGENT_SUPPORT_VISION_MODEL") or os.environ.get("OPENAGENT_SUPPORT_VOICE_MODEL") or event.get("model") or "")
         token = set_tool_allowlist([])
         try:
             if model_id and callable(getattr(model, "build_override_model", None)):
@@ -1705,6 +1707,12 @@ async def _route_attachment(pool: Any, state: SupportState) -> None:
         return
     state.decision = "ask_information"
     if placeholder:
+        if any(support_attachments.requested_transcription(reply) for reply in state.prior_support_replies):
+            state.decision = "human"
+            state.outcome = "attachment_partial_review"
+            state.human_reason = "Attachment content could not be retrieved after an earlier transcription request. Inspect the existing files and conversation; do not ask the customer to resend or transcribe them again."
+            state.instructions.append("The customer already tried to supply the evidence. Do not repeat the transcription request or claim the attachment was read.")
+            return
         state.outcome = "attachment_unreadable"
         state.instructions.append(
             "Say the attachment content was not available; ask for the key details in text. Never describe the image."
@@ -5032,6 +5040,13 @@ async def _compose_human_reply(agent: Any, event: dict[str, Any], state: Support
                         state.facts["human_voice_sha256"] = hashlib.sha256(reply.encode()).hexdigest()
                         state.facts["human_voice_attempts"] = attempt + 1
                         return reply
+                    state.facts["human_voice_rejections"] = [k for k in (
+                        'facts_supported', 'required_content_preserved', 'answers_customer',
+                        'humane', 'language_correct') if verdict.get(k) is not True]
+                    if not content_ok:
+                        state.facts["human_voice_rejections"].append('point_coverage')
+                    if not guidance_ok:
+                        state.facts["human_voice_rejections"].append('source_coverage')
                     findings = verdict.get("findings") or ["Preserve the complete brief and answer this customer humanely."]
                     if not guidance_ok:
                         findings = list(findings) if isinstance(findings, list) else [str(findings)]
@@ -5041,6 +5056,7 @@ async def _compose_human_reply(agent: Any, event: dict[str, Any], state: Support
     except Exception as exc:
         # Never send the internal brief because a provider failed.
         elog("support_controller.voice_failed", level="warning", error_type=type(exc).__name__)
+        state.facts['human_voice_error'] = type(exc).__name__
     finally:
         reset_tool_allowlist(token)
     state.facts["reply_source"] = "none:human_voice_review_required"
@@ -5804,6 +5820,7 @@ async def _try_documented_resolution(pool: Any, agent: Any, event: dict, state: 
     if documents is None:
         _tool, documents = await _call_first(pool, "replio", ("replio_docs_search", "docs_search"),
             {"query": _documentation_query(state), "product": state.tenant.key, "limit": 4}, required=False)
+    state.facts['guidance_documents'] = documents if _succeeded(documents) else []
     sources = support_guidance.excerpts(documents)
     if not sources:
         return False
@@ -6482,6 +6499,25 @@ async def _queue_for_human(pool: Any, state: SupportState) -> bool:
         {"thread_id": state.thread_id, "reason": state.human_reason},
         "human_handoff",
     )
+    if not handed:
+        receipt = state.actions[-1].get('receipt', {})
+        if 'human-lane-timeout' in json.dumps(receipt, default=str):
+            state.facts['human_owner_required'] = True
+            owned = await _record_action(state, pool, 'replio',
+                ('replio_thread_ensure_support_task', 'thread_ensure_support_task'),
+                {'thread_id': state.thread_id, 'reason': state.human_reason}, 'support_case_task')
+            if owned:
+                result = _clickup_payload(state.actions[-1].get('receipt'))
+                task_id = str(result.get('external_task_id') or '') if isinstance(result, dict) else ''
+                verified = bool(task_id) and await _verify_replio_task_link(pool, state, task_id)
+                state.facts['human_owner_verified'] = verified
+                if verified:
+                    state.linked_task_id = task_id
+                    handed = await _record_action(state, pool, 'replio',
+                        ('replio_threads_mark_for_human', 'threads_mark_for_human'),
+                        {'thread_id': state.thread_id, 'reason': state.human_reason}, 'human_handoff')
+            if not handed:
+                state.facts['human_handoff_error'] = 'owner_not_verified'
     return bool(handed)
 
 
@@ -6889,6 +6925,8 @@ async def run(
         state.intent = "support_review"
         state.outcome = "support_review_no_reply"
         state.decision = "noop"
+        state.human_reason = "The held reply still requires review. Read the customer's outstanding question and existing draft; keep the hold until a responsible operator resolves it."
+        state.facts['human_handoff_confirmed'] = await _queue_for_human(pool, state)
     elif "automated-notice" in _thread_tags(thread) or _machine_sender(thread, payload) or _is_machine_mail(message, state.subject):
         state.intent = "machine_mail"
         state.outcome = "machine_mail"
@@ -8107,7 +8145,7 @@ async def run(
             state.outcome = "general_needs_detail"
             state.instructions.append("Ask a precise clarification; do not invent a product behavior or task.")
 
-    if state.outcome in {"guidance_unavailable_human", "bug_no_convincing_match", "bug_no_grounded_match", "bug_needs_evidence", "guidance_answer"} and not state.facts.get("pending_playlist_link_question"):
+    if state.outcome in {"guidance_unavailable_human", "bug_no_convincing_match", "bug_no_grounded_match", "bug_needs_evidence", "guidance_answer"} and not state.facts.get("pending_playlist_link_question") and not (support_voice.enabled() and state.outcome == 'guidance_answer'):
         await _try_documented_resolution(pool, agent, event, state, session_id)
 
     if state.decision == "human" and state.outcome != "legal_silence":
@@ -8173,14 +8211,9 @@ async def run(
     if state.facts["delivery_state"] in {"blocked", "held", "failed", "unknown"}:
         # An uncertain transport result must never be retried blindly. Keep
         # the case visible without saying the proposed reply reached anyone.
-        handed = await _record_action(
-            state, pool, "replio",
-            ("replio_threads_mark_for_human", "threads_mark_for_human"),
-            {"thread_id": state.thread_id,
-             "reason": "Support delivery not verified: " + state.facts["delivery_state"]
-                       + ". Review the held draft and receipts before resending."},
-            "delivery_handoff",
-        )
+        state.human_reason = ("Support delivery not verified: " + state.facts["delivery_state"]
+                              + ". Review the held draft and receipts before resending.")
+        handed = await _queue_for_human(pool, state)
         state.facts["delivery_handoff_confirmed"] = handed
     elog("support_controller.action_summary", thread_id=state.thread_id,
          actions=[{"kind": a.get("kind"), "success": bool(a.get("success"))} for a in state.actions],

@@ -45,3 +45,25 @@ ordinary definitions can explain unfamiliar terms without claiming app-specific
 capture or navigation behaviour. Reported versions can be acknowledged as context;
 they never establish account or payment state. Prose is written directly rather
 than embedded in JSON, avoiding broken escaping around quoted UI labels.
+
+Post-deployment regressions also cover direct requested behaviour, MCP-wrapped
+source text and attachments, and repeated attachment follow-ups. Wrapped source
+whitespace is normalized for quote matching, while invented quotations still fail.
+Guidance uses the same writer/reviewer directly rather than spending a separate
+pair of model calls before writing it. Its product references remain available
+when an attempted documented bug resolution was not sufficient.
+
+A reclaimed human handoff requires a linked task. On that explicit rejection the
+controller calls Replio's idempotent `thread_ensure_support_task`, verifies the
+persisted thread link, and retries the handoff once. Existing review holds remain
+in place; they can gain ownership without sending another bot message. Unknown
+creation outcomes are not retried blindly. A task is not proof a person has read
+it or that the customer problem is resolved.
+
+Event history retains valid compact JSON with the delivery result, hold category,
+writer failures and ownership outcome even when raw tool receipts exceed the
+history budget. Technical event success remains distinct from sent/blocked/held.
+
+Run `scripts/support_live_regression.py` with model and docs command files for the
+sanitized September 7 multi-turn corpus. Business operations are simulated;
+qualify the produced replies separately through the real Replio guards.

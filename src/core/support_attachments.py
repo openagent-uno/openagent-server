@@ -3,9 +3,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import re
 from typing import Any
 
 from src.stream.media import Image
+
+
+def requested_transcription(text: str) -> bool:
+    """Recognise our earlier request, not a claim that the file is unreadable."""
+    return bool(re.search(
+        r'\b(?:paste|type|write|transcribe|incoll\w*|trascr\w*|riscr\w*|pega\w*|escrib\w*|copi\w*)\b'
+        r'[^.!?\n]{0,100}\b(?:text|testo|texto|details|dettagli|mensaje|messaggio)\b', text, re.I))
 
 
 def images_from_receipt(receipt: Any, *, max_images: int = 6, max_bytes: int = 12_000_000) -> tuple[list[Image], bool]:

@@ -25,7 +25,11 @@ Return JSON only:
  "evidence":"exact customer quote supporting the kind",
  "reported":{"app_version":"exact quote","device":"exact quote","os":"exact quote",
  "platform":"exact quote","steps":"exact quote","observed":"exact quote","expected":"exact quote","unavailable_instruction":"exact quote",
- "ads_concern":"exact complaint about advertising","ad_malfunction":"exact concrete ad malfunction"}}
+"ads_concern":"exact complaint about advertising","ad_malfunction":"exact concrete ad malfunction"}}
+ads_concern is a SEPARATE complaint about ad frequency, cost, intrusiveness or
+wanting fewer ads. Do not populate it just because a technical bug involves an
+ad (for example music overlapping the ad). A pause/resume request is desired
+playback behaviour: put its exact words in expected and address that request.
 unavailable_instruction means the latest customer correction that a button/menu we
 previously suggested is absent, or that our proposed step was already tried and failed.
 Do not set it for an ordinary new bug or a question asking how to perform a step.
@@ -36,6 +40,10 @@ inside a quote, even if the resulting summary means the same thing.
 Read latest_message in the ordered recent_exchange, including the question that
 support asked immediately before it. A version, device, OS or store supplied in
 answer continues the customer's pending request; it is not a new feature question.
+An attachment-only latest message also continues that request. Use the preceding
+customer text to recover what they need (for example installation instructions),
+and cite that customer text. A readable link preview or thumbs-up is not a new
+request to describe an attachment and does not prove the issue was resolved.
 Extract those reported fields as exact customer quotes, including short answers.
 For a diagnostic follow-up cite the customer's malfunction, not just the version.
 Support's question supplies context only; it cannot establish a fault the customer

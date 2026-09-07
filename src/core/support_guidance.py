@@ -2,16 +2,31 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Any
 from src.core import reply_guard
 
 
 def excerpts(result: Any) -> list[str]:
     """Only document body fields; a title/path is not supporting evidence."""
+    if isinstance(result, str):
+        try:
+            return excerpts(json.loads(result))
+        except (ValueError, TypeError):
+            return []
     if isinstance(result, list):
         return [s for row in result for s in excerpts(row)][:6]
     if not isinstance(result, dict):
         return []
+    if result.get('isError') or result.get('ok') is False:
+        return []
+    for key in ('structuredContent', 'structured_content'):
+        if key in result:
+            return excerpts(result[key])
+    if isinstance(result.get('content'), list):
+        return excerpts(result['content'])
+    if result.get('type') == 'text':
+        return excerpts(result.get('text'))
     for key in ("results", "documents", "items", "data"):
         if isinstance(result.get(key), list):
             return excerpts(result[key])
@@ -20,6 +35,12 @@ def excerpts(result: Any) -> list[str]:
         if isinstance(text, str) and len(text.strip()) >= 80:
             return [text[:5000]]
     return []
+
+
+def contains_quote(quote: str, source: str) -> bool:
+    """Whitespace wrapping is transport formatting, not different evidence."""
+    normalize = lambda text: re.sub(r'\s+', ' ', text).strip()
+    return normalize(quote) in normalize(source)
 
 
 def validated_answer(packet: Any, sources: list[str]) -> str:
