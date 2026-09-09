@@ -119,6 +119,10 @@ permission `view`, `admin` (collaborate), or null (remove). A revoke wakes
 observers and interrupts a writer that no longer has access. These management
 routes are disabled when an embedding host supplies its own authorizer.
 
+Member updates advance the resource and every currently valid grant in one
+transaction. Adding, changing or removing one member preserves other members'
+access and active turns; obsolete ACL generations are never revived or listed.
+
 ## Host policy boundary
 
 By default the gateway uses its canonical session/resource ACLs and certificate

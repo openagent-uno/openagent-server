@@ -345,6 +345,48 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 200)
 
+    async def test_member_changes_preserve_other_grants_without_reviving_stale_ones(self):
+        url = self.server.make_url("/api/collaboration/chat/members")
+        conn = await self.db._ensure_connected()
+        await conn.execute("UPDATE sessions_v2 SET acl_version=2 WHERE id='chat'")
+        await conn.execute("UPDATE resource_acl SET acl_version=2 WHERE resource_id='chat'")
+        await conn.execute(
+            "INSERT INTO resource_acl (tenant_id,resource_type,resource_id,principal_type,principal_id,"
+            "permission,acl_version,granted_by_principal_id,granted_at_ms) VALUES(?, 'session','chat','user','stale','admin',1,'user:alice',?)",
+            (self.tenant, int(time.time() * 1000)),
+        )
+        await conn.commit()
+        self.finish.set()
+        for index, permission in enumerate(("admin", "view", "view", None, None, "admin")):
+            with self.subTest(permission=permission, index=index):
+                response = await self.http.put(
+                    url, json={"handle": "charlie", "permission": permission}
+                )
+                self.assertEqual(response.status, 200)
+                data = await response.json()
+                members = {m["handle"]: m["permission"] for m in data["members"]}
+                self.assertEqual(members.get("bob"), "admin")
+                self.assertEqual(members.get("charlie"), permission)
+                self.assertNotIn("stale", members)
+                self.assertEqual((await self.send("bob", f"bob-{index}", "/help"))[0], 200)
+                self.assertEqual((await self.send("stale", f"stale-{index}", "/help"))[0], 403)
+                self.assertEqual(
+                    (await self.send("charlie", f"charlie-{index}", "/help"))[0],
+                    200 if permission == "admin" else 403,
+                )
+
+    async def test_adding_member_does_not_interrupt_another_members_turn(self):
+        first = asyncio.create_task(self.send("bob", "unrelated-grant"))
+        await asyncio.wait_for(self.started.get(), 3)
+        response = await self.http.put(
+            self.server.make_url("/api/collaboration/chat/members"),
+            json={"handle": "charlie", "permission": "admin"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertFalse(self.gateway.agent.cancel_current.is_set())
+        self.finish.set()
+        self.assertEqual((await asyncio.wait_for(first, 3))[0], 200)
+
     async def test_durable_commands_remain_after_replay_expiry(self):
         self.assertEqual((await self.send("alice", "compact", "/compact"))[0], 200)
         self.service.hub.sessions.clear()

@@ -67,6 +67,14 @@ async def handle_members(request):
                 "DELETE FROM resource_acl WHERE tenant_id=? AND resource_type='session' AND resource_id=? AND principal_type='user' AND principal_id IN (?,?)",
                 (access.tenant_id, sid, handle, "user:" + handle),
             )
+            # Advance all still-valid grants atomically with the resource.
+            # Updating one member must neither revoke the others nor revive
+            # historical grants invalidated by a previous ACL generation.
+            await conn.execute(
+                "UPDATE resource_acl SET acl_version=acl_version+1 "
+                "WHERE tenant_id=? AND resource_type='session' AND resource_id=? AND acl_version=?",
+                (access.tenant_id, sid, row["acl_version"]),
+            )
             if permission:
                 await conn.execute(
                     "INSERT INTO resource_acl (tenant_id,resource_type,resource_id,principal_type,principal_id,permission,acl_version,granted_by_principal_id,granted_at_ms) "
@@ -87,7 +95,8 @@ async def handle_members(request):
             await conn.commit()
         members = await (
             await conn.execute(
-                "SELECT principal_id AS handle, permission FROM resource_acl WHERE tenant_id=? AND resource_type='session' AND resource_id=? AND principal_type='user' ORDER BY principal_id",
+                "SELECT principal_id AS handle, permission FROM resource_acl WHERE tenant_id=? AND resource_type='session' AND resource_id=? AND principal_type='user' "
+                "AND acl_version=(SELECT acl_version FROM sessions_v2 WHERE id=resource_id) ORDER BY principal_id",
                 (access.tenant_id, sid),
             )
         ).fetchall()
