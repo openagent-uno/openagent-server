@@ -146,6 +146,10 @@ class SharedAgentHub:
             turn["truncated"] = len(value) > 131072 or turn.get("truncated", False)
             if frame.get("model"):
                 message["model"] = frame["model"]
+            if kind == "response":
+                for field in ("attachments", "parts"):
+                    if frame.get(field) and len(json.dumps(frame[field])) <= 262144:
+                        message[field] = frame[field]
         elif kind == "status":
             # Tool status is a JSON envelope in OpenAgent; plain statuses are
             # separate from transcript messages (no fabricated tool results).

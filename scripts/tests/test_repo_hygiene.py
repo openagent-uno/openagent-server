@@ -205,6 +205,13 @@ _REGISTRATION_EXCEPTIONS: frozenset[str] = frozenset({
     # ``openagent-computer-control`` binary on the host (macOS
     # Accessibility prompt on first run). Not hermetic, not in CI.
     "test_computer_control_native",
+    # Runs under ``python -m unittest scripts.tests.test_collaboration`` as its
+    # own CI step (tests.yml and release.yml), not through the ``@test``
+    # registry: it is a ``unittest.IsolatedAsyncioTestCase`` suite that stands
+    # up a real aiohttp server per test. Registering it here would import the
+    # module without running a single one of its cases, which is exactly the
+    # silent-dead-coverage failure this guard exists to prevent.
+    "test_collaboration",
 })
 
 

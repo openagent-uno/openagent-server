@@ -6,6 +6,11 @@ requiring a particular host, organization model, identity provider or connector
 catalog. It is an optional gateway API, not a replacement for the existing
 audio/video or client-machine capability protocol.
 
+OpenAgent App 0.18 and CLI 0.17 discover it with `GET /api/collaboration`
+(`version: 1`) and use it for ordinary text and session commands by default.
+Only 404/405 selects the older native transport; authorization and temporary
+server errors must not silently select a different writer.
+
 ## Observe
 
 Open `GET /ws/collaboration` through the same certificate-authenticated transport
@@ -23,6 +28,7 @@ independent presence lease, including two tabs using the same account.
 - `shared_state`: `session_id`, monotonic `revision`, and up to eight `turns`.
   Replace the prior snapshot; never append its text as a delta. Turn `runId`
   identifies the submitted `request_id`, not the provider's persisted run ID.
+  Optional `providerRunId` links the replay to the canonical session run.
   Messages contain the authenticated author's handle/display and current text.
 - `shared_presence`: authorized people with `userId`, `name`, and `target`.
   Same-person/same-target leases are deduplicated. Applications can resolve
@@ -61,6 +67,8 @@ Commands are messages (`/compact`, `/model runtime:id`, `/model auto`, `/context
 `/status`, `/queue`, `/help`, `/usage`, `/stop`). They execute under the same turn lock;
 model selection validates native ACLs, enabled models and providers. Command
 results are broadcast and recorded as `command/result` in the session journal.
+`GET /api/collaboration/{session_id}/commands` returns the most recent 64
+command results with stable turn IDs, after checking the current session ACL.
 Host administration commands are not part of this session API.
 
 ```http
@@ -87,9 +95,29 @@ are retained; capacity returns 429 rather than allocating an unbounded queue.
 An idle legacy session can switch to this transport. A running legacy turn must
 finish first (409). While the shared runtime owns the session, legacy stream,
 chat, model-pin and delete mutations are rejected rather than running a second
-writer. Shared runtimes detach after their request-retention window; observation
-does not hold them open. Attachments, audio/video and client-local tools continue
-using their existing protocol; this endpoint deliberately accepts text only.
+writer. An idle shared runtime can hand back to a native stream immediately;
+observation does not hold it open. Audio/video remain on the native transport.
+Wait for an active native turn to finish before changing transport.
+
+An optional `attachments` array accepts up to 32 public uploaded artifact refs.
+The native artifact ACL is checked for the authenticated author; local paths
+cannot be submitted remotely. `client_instance_id` selects an exact capability
+host already registered by that verified device. It cannot select another
+device, and is never persisted as a preference for future automated turns.
+
+A refused attachment answers before the turn is dispatched: 404 when the
+reference is unknown or not readable by this author, 413 when it exceeds the
+inbound limit, 503 when stored bytes fail their integrity check, and 400 for
+any other rejected reference. None of these confirm that a given artifact id
+exists — an opaque id is not a bearer token.
+
+## Native sharing management
+
+`GET /api/collaboration/{session_id}/members` returns owner, can_manage and
+current grants. Only the native owner may PUT `{handle, permission}` with
+permission `view`, `admin` (collaborate), or null (remove). A revoke wakes
+observers and interrupts a writer that no longer has access. These management
+routes are disabled when an embedding host supplies its own authorizer.
 
 ## Host policy boundary
 

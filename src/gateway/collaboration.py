@@ -61,6 +61,79 @@ class Collaboration:
     def owns(self, sid):
         return sid in self.runtimes
 
+    async def handle_info(self, request):
+        return web.json_response(
+            {"version": 1, "attachments": True, "client_capabilities": True}
+        )
+
+    async def handle_commands(self, request):
+        sid = request.match_info["session_id"]
+        target = {"kind": "session", "id": sid}
+        try:
+            access = await authorize(request, [target])
+            if target not in access["allowed"]:
+                raise PermissionError()
+            conn = await self.gateway.agent.memory_db._ensure_connected()
+            rows = await (
+                await conn.execute(
+                    "SELECT seq, ts_ms, data FROM session_events WHERE session_id=? AND type='command/result' ORDER BY seq DESC LIMIT 64",
+                    (sid,),
+                )
+            ).fetchall()
+            commands = []
+            for row in reversed(rows):
+                data = json.loads(row["data"])
+                commands.append(
+                    {
+                        "id": data.get("turn_id") or f"command:{row['seq']}",
+                        "runId": data.get("request_id"),
+                        "active": False,
+                        "startedAt": row["ts_ms"] / 1000,
+                        "messages": [
+                            {
+                                "id": "input",
+                                "role": "user",
+                                "text": data.get("command", ""),
+                                "timestamp": row["ts_ms"] / 1000,
+                                "author": data.get("author"),
+                            },
+                            {
+                                "id": "response",
+                                "role": "assistant",
+                                "text": data.get("text", ""),
+                                "timestamp": row["ts_ms"] / 1000,
+                            },
+                        ],
+                    }
+                )
+            access = await authorize(request, [target])
+            if target not in access["allowed"]:
+                raise PermissionError()
+            return web.json_response({"turns": commands})
+        except PermissionError:
+            return web.json_response({"error": "Session unavailable"}, status=403)
+
+    async def release_idle(self, sid):
+        """Allow an idle text session to move back to its native media transport."""
+        async with self.registry_lock:
+            runtime = self.runtimes.get(sid)
+            if runtime is None:
+                return True
+            if (
+                runtime.active
+                or runtime.session.has_active_turn()
+                or runtime.session._detached_turns
+            ):
+                return False
+            if any(
+                key[0] == sid and not entry[1].done()
+                for key, entry in self.requests.items()
+            ):
+                return False
+            await runtime.session.close()
+            self.runtimes.pop(sid, None)
+            return True
+
     async def revoke_device(self, device_id):
         self.hub.wake()
         for runtime in list(self.runtimes.values()):
@@ -216,7 +289,9 @@ class Collaboration:
             else "Model: " + (result.get("runtime_id") or "Auto")
         )
 
-    async def _run(self, request, sid, text, request_id, delivery):
+    async def _run(
+        self, request, sid, text, request_id, delivery, attachments=(), instance_id=None
+    ):
         from src.core.on_behalf_context import (
             OnBehalfIdentity,
             install_on_behalf_identity,
@@ -249,6 +324,18 @@ class Collaboration:
                 "display": access["name"],
                 "handle": principal.handle,
             }
+            normalized_attachments = []
+            if attachments:
+                from src.memory.artifacts import normalize_inbound_attachments
+
+                normalized_attachments = await normalize_inbound_attachments(
+                    self.gateway.agent.memory_db,
+                    attachments,
+                    session_id=sid,
+                    principal=principal,
+                    allow_local_paths=False,
+                )
+                await self._check(request, sid)
             if not self.hub.begin(sid, text, author, request_id):
                 raise BusyError("Live replay capacity reached")
             live = self.hub.sessions[sid]["turns"][-1]
@@ -258,11 +345,70 @@ class Collaboration:
                 "command": command is not None,
                 "interrupted": False,
                 "device_id": request.get("device_cert").device_pubkey_hex,
+                "request": request,
             }
             runtime.active = state
             # Set only inside the turn lock, before push_in. The StreamSession
             # snapshots this immutable principal into each dispatched runner.
             runtime.session.on_behalf_identity = principal
+            from src.core.execution_origin import (
+                TrustedIngressIdentity,
+                TrustedTurnContext,
+            )
+
+            ingress = TrustedIngressIdentity(
+                device_id=request.get("client_id"),
+                connection_id="shared:" + request_id,
+                client_instance_id=instance_id,
+                turn_context=TrustedTurnContext(
+                    on_behalf_identity=principal,
+                    client_kind="shared-chat",
+                    client_capabilities=(
+                        ("attachments", True),
+                        ("ordered_parts", True),
+                        ("inline_ui", True),
+                        ("custom_ui_version", 1),
+                    ),
+                ),
+            )
+            registry = getattr(self.gateway, "capabilities", None)
+            origin = (
+                registry.origin_for(request.get("client_id"), instance_id)
+                if registry
+                else None
+            )
+            if attachments:
+                live["messages"][0]["attachments"] = list(attachments)
+            memory_db = getattr(self.gateway.agent, "memory_db", None)
+            try:
+                prior_runs = (
+                    await memory_db.list_session_runs(sid, limit=1)
+                    if not command and memory_db
+                    else []
+                )
+            except Exception:
+                prior_runs = []
+            prior_run_id = prior_runs[0].get("run_id") if prior_runs else None
+            state["prior_run_id"] = prior_run_id
+
+            async def identify_run():
+                # Resolve once per run without delaying the synchronous token tee.
+                for _ in range(100):
+                    await asyncio.sleep(0.1)
+                    try:
+                        runs = await memory_db.list_session_runs(sid, limit=1)
+                        if runs and runs[0].get("run_id") != prior_run_id:
+                            live["providerRunId"] = f"run:{sid}:{runs[0]['run_id']}"
+                            self.hub.changed(self.hub.sessions[sid])
+                            return
+                    except Exception:
+                        return
+
+            projection = (
+                asyncio.create_task(identify_run())
+                if not command and memory_db
+                else None
+            )
             identity_token = install_on_behalf_identity(
                 runtime.session.on_behalf_identity
             )
@@ -312,7 +458,13 @@ class Collaboration:
                         )
                     await runtime.session._journal(
                         "command/result",
-                        {"command": text, "author": author, "text": collector.text},
+                        {
+                            "command": text,
+                            "author": author,
+                            "text": collector.text,
+                            "request_id": request_id,
+                            "turn_id": live["id"],
+                        },
                     )
                     self.hub.publish(
                         {"type": "response", "session_id": sid, "text": collector.text}
@@ -326,7 +478,11 @@ class Collaboration:
                         "session_id": sid,
                     }
                 reply = await BatchedChannel(runtime.session).run_one_shot(
-                    text, author=author
+                    text,
+                    author=author,
+                    attachments=list(normalized_attachments),
+                    execution_origin=origin,
+                    ingress_identity=ingress,
                 )
                 return {
                     "response": reply.text,
@@ -352,6 +508,17 @@ class Collaboration:
                 }
             finally:
                 reset_on_behalf_identity(identity_token)
+                if projection:
+                    projection.cancel()
+                    await asyncio.gather(projection, return_exceptions=True)
+                if not command and memory_db:
+                    try:
+                        runs = await memory_db.list_session_runs(sid, limit=1)
+                        if runs and runs[0].get("run_id") != prior_run_id:
+                            live["providerRunId"] = f"run:{sid}:{runs[0]['run_id']}"
+                            self.hub.changed(self.hub.sessions[sid])
+                    except Exception:
+                        pass  # projection failures cannot retain the execution lock
                 if live["active"]:
                     self.hub.publish({"type": "turn_complete", "session_id": sid})
                 runtime.active = None
@@ -360,6 +527,13 @@ class Collaboration:
     async def handle_chat(self, request):
         if self.closed:
             return web.json_response({"error": "The gateway is stopping"}, status=503)
+        from src.memory.artifacts import (
+            ArtifactError,
+            ArtifactIntegrityError,
+            ArtifactNotFound,
+            AttachmentTooLarge,
+        )
+
         try:
             body = await request.json()
             if not isinstance(body, dict) or set(body) - {
@@ -367,6 +541,8 @@ class Collaboration:
                 "message",
                 "request_id",
                 "delivery",
+                "attachments",
+                "client_instance_id",
             }:
                 raise ValueError()
             sid, text, request_id = (
@@ -379,7 +555,32 @@ class Collaboration:
                 for v in (sid, request_id)
             ):
                 raise ValueError()
-            if not isinstance(text, str) or not text.strip() or len(text) > 131072:
+            attachments = body.get("attachments") or []
+            if not isinstance(attachments, list) or len(attachments) > 32:
+                raise ValueError()
+            # Only public content-addressed references cross the shared API.
+            # Resolution and authorization remain in the native stream runner.
+            from src.memory.artifacts import public_attachment_ref
+
+            if any(
+                not isinstance(a, dict)
+                or not isinstance(a.get("artifact_id"), str)
+                or len(json.dumps(a)) > 8192
+                for a in attachments
+            ):
+                raise ValueError()
+            attachments = [public_attachment_ref(a) for a in attachments]
+            instance_id = body.get("client_instance_id")
+            if instance_id is not None and (
+                not isinstance(instance_id, str)
+                or not IDENTIFIER.fullmatch(instance_id)
+            ):
+                raise ValueError()
+            if (
+                not isinstance(text, str)
+                or (not text.strip() and not attachments)
+                or len(text) > 131072
+            ):
                 raise ValueError()
             delivery = body.get("delivery", "queue")
             if delivery not in ("queue", "steer"):
@@ -397,7 +598,13 @@ class Collaboration:
         except Exception:
             return web.json_response({"error": "Session unavailable"}, status=403)
         key = (sid, request_id)
-        fingerprint = (access["userId"], text, delivery)
+        fingerprint = (
+            access["userId"],
+            text,
+            delivery,
+            json.dumps(attachments, sort_keys=True),
+            instance_id,
+        )
         # No await between deduplication and task insertion.
         entry = self.requests.get(key)
         if entry and entry[0] != fingerprint:
@@ -408,7 +615,15 @@ class Collaboration:
                     {"error": "Too many pending turns"}, status=429
                 )
             task = asyncio.create_task(
-                self._run(request, sid, text.strip(), request_id, delivery),
+                self._run(
+                    request,
+                    sid,
+                    text.strip() or "[Attachments]",
+                    request_id,
+                    delivery,
+                    attachments,
+                    instance_id,
+                ),
                 context=contextvars.Context(),
             )
 
@@ -439,6 +654,21 @@ class Collaboration:
             return web.json_response({"error": "Session unavailable"}, status=403)
         except BusyError as exc:
             return web.json_response({"error": str(exc)}, status=409)
+        # Attachment refusals are client errors, not gateway faults. The
+        # message never names the offending id or path: an opaque artifact id
+        # is not a bearer token and must not become an existence oracle.
+        except ArtifactNotFound:
+            return web.json_response(
+                {"error": "Attachment is not available"}, status=404
+            )
+        except ArtifactIntegrityError:
+            return web.json_response(
+                {"error": "Attachment bytes failed integrity checks"}, status=503
+            )
+        except AttachmentTooLarge:
+            return web.json_response({"error": "Attachment is too large"}, status=413)
+        except ArtifactError:
+            return web.json_response({"error": "Attachment rejected"}, status=400)
         except asyncio.CancelledError:
             if entry[1].cancelled():
                 return web.json_response(

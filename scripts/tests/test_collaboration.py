@@ -46,6 +46,7 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         self.started = asyncio.Queue()
         self.finish = asyncio.Event()
         self.seen = []
+        self.attachments = []
         parent = self
 
         class Agent:
@@ -54,6 +55,7 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
             async def run_stream(self, **kwargs):
                 self.cancel_current = asyncio.Event()
                 parent.seen.append((kwargs["author"], current_on_behalf_identity()))
+                parent.attachments.append(kwargs.get("attachments"))
                 yield {"kind": "delta", "text": kwargs["message"] + " partial"}
                 parent.started.put_nowait(kwargs["message"])
                 waits = [
@@ -90,6 +92,9 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
             _handle_command=command,
         )
         self.service = self.gateway._collaboration = Collaboration(self.gateway)
+        self.gateway.broadcast_resource = AsyncMock(
+            side_effect=lambda *args: self.service.hub.resource(*args)
+        )
         self.addAsyncCleanup(self.service.close)
         # The deterministic model emits wire events, not canonical provider
         # runs. Avoid waiting for a projection that this fixture never writes;
@@ -124,6 +129,14 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         app.router.add_get("/ws/collaboration", self.service.hub.handle)
         app.router.add_post("/api/collaboration/turns", self.service.handle_chat)
         app.router.add_post("/api/collaboration/stop", self.service.handle_stop)
+        app.router.add_get("/api/collaboration", self.service.handle_info)
+        app.router.add_get(
+            "/api/collaboration/{session_id}/commands", self.service.handle_commands
+        )
+        from src.gateway.collaboration_members import handle_members
+
+        app.router.add_get("/api/collaboration/{session_id}/members", handle_members)
+        app.router.add_put("/api/collaboration/{session_id}/members", handle_members)
         self.server = TestServer(app)
         await self.server.start_server()
         self.addAsyncCleanup(self.server.close)
@@ -182,6 +195,192 @@ class CollaborationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(response.release)
         return response.status, await response.json()
+
+    async def test_attachment_refs_use_authenticated_artifact_acl(self):
+        from src.core.on_behalf_context import OnBehalfIdentity
+        from src.memory.artifacts import (
+            normalize_inbound_attachments,
+            public_attachment_ref,
+        )
+
+        source = Path(self.directory.name) / "attachment.txt"
+        source.write_text("shared artifact")
+        principal = OnBehalfIdentity.from_certificate(
+            self.request().get("device_cert"), auth_kind="device_cert"
+        )
+        ref = (
+            await normalize_inbound_attachments(
+                self.db,
+                [{"path": str(source), "filename": source.name}],
+                session_id="",
+                principal=principal,
+                allow_local_paths=True,
+            )
+        )[0]
+
+        async def send_ref(user, request_id):
+            return await self.http.post(
+                self.server.make_url("/api/collaboration/turns"),
+                headers={"Test-User": user},
+                json={
+                    "session_id": "chat",
+                    "request_id": request_id,
+                    "message": "read attachment",
+                    "attachments": [public_attachment_ref(ref)],
+                },
+            )
+
+        # Access to the conversation does not grant another user's private upload.
+        denied = await send_ref("bob", "private-ref")
+        # A refused attachment is a client error, not a gateway fault, and the
+        # body must not confirm that the artifact id exists.
+        self.assertEqual(denied.status, 404)
+        self.assertNotIn(ref["artifact_id"], await denied.text())
+        self.assertEqual(self.seen, [])
+        self.finish.set()
+        accepted = await send_ref("alice", "owned-ref")
+        self.assertEqual(accepted.status, 200, await accepted.text())
+        self.assertEqual(self.attachments[-1][0]["artifact_id"], ref["artifact_id"])
+        public = self.service.hub.sessions["chat"]["turns"][-1]["messages"][0][
+            "attachments"
+        ][0]
+        self.assertNotIn("path", public)
+
+    async def test_unknown_attachment_is_refused_without_dispatch(self):
+        response = await self.http.post(
+            self.server.make_url("/api/collaboration/turns"),
+            json={
+                "session_id": "chat",
+                "request_id": "ghost",
+                "message": "read",
+                "attachments": [{"artifact_id": "artifact-that-does-not-exist"}],
+            },
+        )
+        self.addAsyncCleanup(response.release)
+        # 404 rather than a generic 500: the turn never reached the runner and
+        # the caller can distinguish a bad reference from a gateway failure.
+        self.assertEqual(response.status, 404)
+        self.assertEqual(self.seen, [])
+        self.assertEqual(self.service.hub.sessions.get("chat", {}).get("turns", []), [])
+
+    async def test_revoked_member_reconnect_never_replays_cached_transcript(self):
+        bob = await self.connect("bob")
+        self.service.hub.begin("chat", "Confidential prompt")
+        state = await self.receive(bob, "shared_state")
+        self.assertEqual(
+            state["turns"][-1]["messages"][0]["text"], "Confidential prompt"
+        )
+        conn = await self.db._ensure_connected()
+        await conn.execute("DELETE FROM resource_acl WHERE principal_id='bob'")
+        await conn.commit()
+        self.service.hub.wake()
+        await self.receive(bob, "shared_revoked")
+        await bob.close()
+        # A fresh socket must re-authorize from the database, not from replay
+        # state the hub still holds for the remaining members.
+        again = await self.http.ws_connect(
+            self.server.make_url("/ws/collaboration"), headers={"Test-User": "bob"}
+        )
+        self.addAsyncCleanup(again.close)
+        self.assertTrue((await again.receive_json())["shared"])
+        await again.send_json(
+            {
+                "type": "observe",
+                "sessions": ["chat"],
+                "focus": {"kind": "session", "id": "chat"},
+            }
+        )
+        async with asyncio.timeout(3):
+            while True:
+                frame = await again.receive_json()
+                self.assertNotEqual(frame["type"], "shared_state")
+                if frame["type"] == "shared_revoked":
+                    break
+        self.assertEqual(
+            (
+                await self.http.get(
+                    self.server.make_url("/api/collaboration/chat/commands"),
+                    headers={"Test-User": "bob"},
+                )
+            ).status,
+            403,
+        )
+
+    async def test_idle_handoff_refuses_while_another_turn_is_queued(self):
+        first = asyncio.create_task(self.send("alice", "first"))
+        await asyncio.wait_for(self.started.get(), 3)
+        second = asyncio.create_task(self.send("bob", "second"))
+        async with asyncio.timeout(3):
+            while ("chat", "second") not in self.service.requests:
+                await asyncio.sleep(0.01)
+        # The queued turn has no runner yet, so `active` is unset; releasing
+        # here would hand the session to a second writer mid-queue.
+        self.assertFalse(await self.service.release_idle("chat"))
+        self.finish.set()
+        self.assertEqual((await first)[0], 200)
+        self.assertEqual((await second)[0], 200)
+        self.assertTrue(await self.service.release_idle("chat"))
+
+    async def test_owner_sharing_and_immediate_revoke_stop(self):
+        url = self.server.make_url("/api/collaboration/chat/members")
+        response = await self.http.put(
+            url,
+            headers={"Test-User": "bob"},
+            json={"handle": "mallory", "permission": "admin"},
+        )
+        self.assertEqual(response.status, 403)
+        first = asyncio.create_task(self.send("bob", "member-run"))
+        await asyncio.wait_for(self.started.get(), 3)
+        response = await self.http.put(url, json={"handle": "bob", "permission": None})
+        self.assertEqual(response.status, 200)
+        self.assertIn((await asyncio.wait_for(first, 3))[0], (200, 403))
+        self.assertEqual((await self.send("bob", "denied"))[0], 403)
+        response = await self.http.put(
+            url, json={"handle": "bob", "permission": "view"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await self.send("bob", "view-only"))[0], 403)
+        response = await self.http.put(
+            url, json={"handle": "bob", "permission": "admin"}
+        )
+        self.assertEqual(response.status, 200)
+
+    async def test_durable_commands_remain_after_replay_expiry(self):
+        self.assertEqual((await self.send("alice", "compact", "/compact"))[0], 200)
+        self.service.hub.sessions.clear()
+        response = await self.http.get(
+            self.server.make_url("/api/collaboration/chat/commands")
+        )
+        data = await response.json()
+        self.assertEqual(data["turns"][0]["messages"][0]["text"], "/compact")
+        self.assertEqual(data["turns"][0]["messages"][0]["author"]["handle"], "alice")
+        self.assertEqual(
+            data["turns"][0]["messages"][1]["text"], "Compacted conversation."
+        )
+        response = await self.http.get(
+            self.server.make_url("/api/collaboration/chat/commands"),
+            headers={"Test-User": "mallory"},
+        )
+        self.assertEqual(response.status, 403)
+
+    async def test_idle_handoff_never_detaches_running_turn(self):
+        first = asyncio.create_task(self.send("alice", "handoff"))
+        await asyncio.wait_for(self.started.get(), 3)
+        self.assertFalse(await self.service.release_idle("chat"))
+        self.finish.set()
+        self.assertEqual((await first)[0], 200)
+        self.assertTrue(await self.service.release_idle("chat"))
+        self.assertFalse(self.service.owns("chat"))
+
+    async def test_shared_input_rejects_local_paths_and_invalid_instances(self):
+        for extra in (
+            {"attachments": [{"path": "/etc/passwd"}]},
+            {"client_instance_id": "../device"},
+        ):
+            response = await self.service.handle_chat(
+                self.request(message="x", request_id="invalid", **extra)
+            )
+            self.assertEqual(response.status, 400)
 
     async def test_two_users_replay_presence_and_steering_keep_authors(self):
         alice, bob = await self.connect(), await self.connect("bob")

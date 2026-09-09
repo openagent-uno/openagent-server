@@ -1340,6 +1340,11 @@ class Gateway:
         """Register the gateway WebSocket endpoint and REST API routes."""
         from .collaboration import service as collaboration_service
         collaboration = collaboration_service(self)
+        app.router.add_get("/api/collaboration", collaboration.handle_info)
+        app.router.add_get("/api/collaboration/{session_id}/commands", collaboration.handle_commands)
+        from .collaboration_members import handle_members
+        app.router.add_get("/api/collaboration/{session_id}/members", handle_members)
+        app.router.add_put("/api/collaboration/{session_id}/members", handle_members)
         app.router.add_get("/ws/collaboration", collaboration.hub.handle)
         app.router.add_post("/api/collaboration/turns", collaboration.handle_chat)
         app.router.add_post("/api/collaboration/stop", collaboration.handle_stop)
@@ -2974,7 +2979,7 @@ class Gateway:
 
         session_id = (frame.get("session_id") or "default").strip() or "default"
         collaboration = getattr(self, "_collaboration", None)
-        if collaboration is not None and collaboration.owns(session_id):
+        if collaboration is not None and collaboration.owns(session_id) and not await collaboration.release_idle(session_id):
             await self._safe_ws_send_json(ws, {"type": P.ERROR, "session_id": session_id,
                 "text": "This session uses the shared collaboration API."})
             return

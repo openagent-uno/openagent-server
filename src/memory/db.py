@@ -6465,6 +6465,7 @@ class MemoryDB:
     # rule has to exist before the first consumer does, not after it has
     # already guessed.
     JOURNAL_KNOWN_TYPES: frozenset[str] = frozenset({
+        "command/result",
         "user/message", "assistant/message", "tool/status",
         "turn/end", "error", "compaction",
     })

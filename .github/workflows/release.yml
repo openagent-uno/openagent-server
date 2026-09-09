@@ -66,6 +66,8 @@ jobs:
           uv pip install -e .
       - name: Run end-to-end suite
         run: bash scripts/test_openagent.sh
+      - name: Verify shared session isolation and replay
+        run: .venv/bin/python -m unittest scripts.tests.test_collaboration -q
 
   computer-control-binary:
     needs: verify-tag
