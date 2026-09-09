@@ -287,6 +287,10 @@ async def handle_delete(request):
     )
     if problem is not None:
         return problem
+    from src.gateway.collaboration import guard_mutation
+    guarded = guard_mutation(request, session_id)
+    if guarded is not None:
+        return guarded
 
     row = await db.get_session(session_id)
     if row is None:
@@ -1013,6 +1017,10 @@ async def handle_pin(request):
     )
     if problem is not None:
         return problem
+    from src.gateway.collaboration import guard_mutation
+    guarded = guard_mutation(request, session_id)
+    if guarded is not None:
+        return guarded
     body = await request.json() if request.can_read_body else {}
     runtime_id = str(body.get("runtime_id") or "").strip()
     if not runtime_id:
@@ -1068,6 +1076,10 @@ async def handle_unpin(request):
     )
     if problem is not None:
         return problem
+    from src.gateway.collaboration import guard_mutation
+    guarded = guard_mutation(request, session_id)
+    if guarded is not None:
+        return guarded
     await db.unpin_session_model(session_id)
     return web.json_response({
         "session_id": session_id,

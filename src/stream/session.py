@@ -205,6 +205,8 @@ class StreamSession:
         # after verifying the device certificate.  In-process operational
         # search fails closed when it is absent (ACP/local system runs).
         self.on_behalf_identity = on_behalf_identity
+        # Synchronous, transport-neutral observer; it must never perform I/O.
+        self.on_event = None
         self.client_kind = client_kind
         self.client_capabilities: dict[str, Any] = dict(client_capabilities or {})
         # Set only by the gateway from a verified internal bridge certificate;
@@ -764,6 +766,12 @@ class StreamSession:
             ingress_identity = self._current_turn_ingress
         if ingress_identity is not None:
             self._outbound_ingresses[id(evt)] = ingress_identity
+        observer = getattr(self, "on_event", None)
+        if observer is not None:
+            try:
+                observer(evt)
+            except Exception:
+                logger.exception("stream observer failed")
         self.outbound.put_nowait(evt)
         # Journal AFTER the frame is queued, never before: the client's copy
         # must not wait on a disk write, and a journal that is behind by

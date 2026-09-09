@@ -61,6 +61,10 @@ async def _get_or_create_session(
 
     key = (client_id, session_id)
     async with _sessions_registry_lock:
+        collaboration = getattr(gateway, "_collaboration", None)
+        if collaboration is not None and collaboration.owns(session_id):
+            from src.gateway.collaboration import BusyError
+            raise BusyError("This session uses the shared collaboration API")
         entry = _sessions.get(key)
         if entry is None:
             session = StreamSession(
@@ -171,6 +175,10 @@ async def handle_chat(request: web.Request) -> web.Response:
     else:
         session_id = raw_sid or "default"
 
+    collaboration = getattr(gateway, "_collaboration", None)
+    if collaboration is not None and collaboration.owns(session_id):
+        return web.json_response({"error": "This session uses the shared collaboration API"}, status=409)
+
     # ── Get or create StreamSession ──────────────────────────────────────────
     from src.core.on_behalf_context import OnBehalfIdentity
 
@@ -185,11 +193,15 @@ async def handle_chat(request: web.Request) -> web.Response:
         # operational-search tool will fail closed for this turn.
         on_behalf_identity = None
 
-    session, turn_lock = await _get_or_create_session(
-        gateway, client_id, session_id,
-        handle=user_handle,
-        on_behalf_identity=on_behalf_identity,
-    )
+    from src.gateway.collaboration import BusyError
+    try:
+        session, turn_lock = await _get_or_create_session(
+            gateway, client_id, session_id,
+            handle=user_handle,
+            on_behalf_identity=on_behalf_identity,
+        )
+    except BusyError as exc:
+        return web.json_response({"error": str(exc)}, status=409)
 
     # If a previous (long-running) turn is still in flight for this session, a
     # peer resume must NOT push a new message — that barges in and cancels the
@@ -230,6 +242,8 @@ async def handle_chat(request: web.Request) -> web.Response:
 
     # ── Run one turn (serialised per session) ────────────────────────────────
     async with turn_lock:
+        if collaboration is not None and collaboration.owns(session_id):
+            return web.json_response({"error": "This session uses the shared collaboration API"}, status=409)
         channel = BatchedChannel(session)
         try:
             reply = await asyncio.wait_for(

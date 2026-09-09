@@ -319,6 +319,10 @@ class Gateway:
             reason="device revoked",
             revocation_epoch=revocation_epoch,
         )]
+        collaboration = getattr(self, "_collaboration", None)
+        if collaboration is not None:
+            collaboration.hub.wake()
+            cleanup.append(collaboration.revoke_device(device_id))
         # A durable session may simultaneously be open from devices A and B.
         # Revoke only ingress-owned work from A; cancelling the holder/session
         # wholesale would wrongly terminate B's independent turn or burst.
@@ -447,6 +451,9 @@ class Gateway:
         }
         if id is not None:
             payload["id"] = id
+        collaboration = getattr(self, "_collaboration", None)
+        if collaboration is not None:
+            collaboration.hub.resource(resource, action, id)
         await self.broadcast(payload)
 
     @staticmethod
@@ -464,6 +471,9 @@ class Gateway:
         """Start/replace the replay tail for a newly-dispatched user turn."""
         if not session_id or frame.get("type") != P.TEXT_FINAL_IN:
             return
+        collaboration = getattr(self, "_collaboration", None)
+        if collaboration is not None:
+            collaboration.hub.begin(session_id, frame.get("text", ""), frame.get("author"))
         replay = self._live_replays.get(session_id)
         if replay is None:
             replay = _LiveReplay(session_id=session_id, owner=owner)
@@ -480,6 +490,9 @@ class Gateway:
         """
         if not session_id or frame.get("type") not in _LIVE_REPLAY_FRAME_TYPES:
             return
+        collaboration = getattr(self, "_collaboration", None)
+        if collaboration is not None:
+            collaboration.hub.publish(frame)
         replay = self._live_replays.get(session_id)
         if replay is None:
             # Do not resurrect a completed chat turn from terminal/passive
@@ -1260,6 +1273,9 @@ class Gateway:
             except Exception as e:  # noqa: BLE001
                 logger.debug("cluster tcp site stop failed: %s", e)
             self._cluster_tcp_site = None
+        collaboration = getattr(self, "_collaboration", None)
+        if collaboration is not None:
+            await collaboration.close()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
@@ -1322,6 +1338,11 @@ class Gateway:
 
     def _register_routes(self, app) -> None:
         """Register the gateway WebSocket endpoint and REST API routes."""
+        from .collaboration import service as collaboration_service
+        collaboration = collaboration_service(self)
+        app.router.add_get("/ws/collaboration", collaboration.hub.handle)
+        app.router.add_post("/api/collaboration/turns", collaboration.handle_chat)
+        app.router.add_post("/api/collaboration/stop", collaboration.handle_stop)
         app.router.add_get("/ws", self._handle_ws)
         app.router.add_get("/ws/capabilities", self._handle_capabilities_ws)
         app.router.add_post("/api/upload", self._handle_upload)
@@ -2270,6 +2291,11 @@ class Gateway:
                         name=cmd_name,
                         session_id=cmd_sid,
                     )
+                    collaboration = getattr(self, "_collaboration", None)
+                    if collaboration is not None and collaboration.owns(cmd_sid):
+                        await self._safe_ws_send_json(ws, {"type": P.ERROR, "session_id": cmd_sid,
+                            "text": "Send session commands through the shared collaboration API."})
+                        continue
                     await self._handle_command(
                         ws, client_id, cmd_name, cmd_sid,
                         handle=cert.handle,
@@ -2947,6 +2973,11 @@ class Gateway:
             return
 
         session_id = (frame.get("session_id") or "default").strip() or "default"
+        collaboration = getattr(self, "_collaboration", None)
+        if collaboration is not None and collaboration.owns(session_id):
+            await self._safe_ws_send_json(ws, {"type": P.ERROR, "session_id": session_id,
+                "text": "This session uses the shared collaboration API."})
+            return
         sid = self.sessions.get_or_create_session(
             client_id, session_id, handle=handle,
         )
@@ -3114,7 +3145,10 @@ class Gateway:
             return
 
         if isinstance(evt, TextFinal):
-            self._record_live_input(sid, event_to_wire(evt), owner=owner)
+            if not trusted_bridge:
+                from dataclasses import replace
+                from src.core.identity_context import human_author
+                evt = replace(evt, author=human_author(handle, display=handle, device_id=client_id))
 
         if holder is None:
             language: str | None = None
@@ -3158,6 +3192,11 @@ class Gateway:
             await session.start()
             if not _auth_epoch_current():
                 await session.close()
+                return
+            if collaboration is not None and collaboration.owns(sid):
+                await session.close()
+                await self._safe_ws_send_json(ws, {"type": P.ERROR, "session_id": sid,
+                    "text": "This session uses the shared collaboration API."})
                 return
             channel = RealtimeChannel(
                 session,
@@ -3217,6 +3256,8 @@ class Gateway:
             )
             return  # session already created above; SessionOpen is metadata-only
 
+        if isinstance(evt, TextFinal):
+            self._record_live_input(sid, event_to_wire(evt), owner=owner)
         await holder.session.push_in(
             evt,
             execution_origin=execution_origin,

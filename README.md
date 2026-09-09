@@ -113,6 +113,8 @@ OpenAgent/
 └── assets/             # Shared branding assets
 ```
 
+Gateway integration: [shared sessions, steering, replay and presence](docs/collaboration.md).
+
 ## License
 
 MIT

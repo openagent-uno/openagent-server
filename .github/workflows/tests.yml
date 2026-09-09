@@ -34,6 +34,9 @@ jobs:
           uv venv
           uv pip install -e .
 
+      - name: Run hermetic collaboration contracts
+        run: uv run python -m unittest scripts.tests.test_collaboration -v
+
       - name: Run end-to-end suite
         run: bash scripts/test_openagent.sh
 

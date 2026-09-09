@@ -239,6 +239,7 @@ class BatchedChannel:
         *,
         attachments: list[dict] | None = None,
         source: str = "user_typed",
+        author: dict | None = None,
     ) -> BatchedReply:
         """Push one user message and drain the outbound stream once."""
         # Discard any frames a prior turn left un-drained (e.g. one that
@@ -261,6 +262,7 @@ class BatchedChannel:
             text=text,
             source=source,  # type: ignore[arg-type]
             attachments=tuple(attachments or ()),
+            author=author,
         )
         await self._session.push_in(msg)
 
