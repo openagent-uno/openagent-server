@@ -573,9 +573,14 @@ async def _mark_tool_call_context_repair_failed(
         if existing is None or str(existing[0]) == "complete":
             return
         now_ms = int(time.time() * 1000)
+        # Clamp every stamp against the one already on the row. The ledger
+        # CHECKs require completed_at_ms >= started_at_ms and updated_at_ms >=
+        # created_at_ms, and a host clock can step backwards between the two
+        # writes: without this, one NTP correction wedges the migration until
+        # real time catches up, the failure bookkeeping included.
         await conn.execute(
-            "UPDATE schema_migrations SET status='failed', completed_at_ms=?, "
-            "error_class=?, updated_at_ms=? WHERE migration_id=?",
+            "UPDATE schema_migrations SET status='failed', completed_at_ms=MAX(?, started_at_ms), "
+            "error_class=?, updated_at_ms=MAX(?, created_at_ms) WHERE migration_id=?",
             (
                 now_ms,
                 type(exc).__name__[:200],
@@ -629,7 +634,7 @@ async def _ensure_tool_call_context_repair(
         await conn.execute(
             "UPDATE schema_migrations SET status='running', "
             "started_at_ms=COALESCE(started_at_ms, ?), completed_at_ms=NULL, "
-            "app_version=?, runner_id=?, error_class=NULL, updated_at_ms=? "
+            "app_version=?, runner_id=?, error_class=NULL, updated_at_ms=MAX(?, created_at_ms) "
             "WHERE migration_id=? AND status!='complete'",
             (
                 now_ms,
@@ -646,8 +651,8 @@ async def _ensure_tool_call_context_repair(
         await _verify_tool_call_context_repair(conn)
         completed_at_ms = int(time.time() * 1000)
         await conn.execute(
-            "UPDATE schema_migrations SET status='complete', completed_at_ms=?, "
-            "error_class=NULL, updated_at_ms=? "
+            "UPDATE schema_migrations SET status='complete', completed_at_ms=MAX(?, started_at_ms), "
+            "error_class=NULL, updated_at_ms=MAX(?, created_at_ms) "
             "WHERE migration_id=? AND status!='complete'",
             (
                 completed_at_ms,
@@ -711,7 +716,7 @@ async def _begin_or_resume_migration(
         await conn.execute(
             "UPDATE schema_migrations SET status='running', "
             "started_at_ms=COALESCE(started_at_ms, ?), completed_at_ms=NULL, "
-            "app_version=?, runner_id=?, error_class=NULL, updated_at_ms=? "
+            "app_version=?, runner_id=?, error_class=NULL, updated_at_ms=MAX(?, created_at_ms) "
             "WHERE migration_id=? AND status!='complete'",
             (now_ms, app_version, f"pid:{os.getpid()}", now_ms, MIGRATION_ID),
         )
@@ -805,8 +810,8 @@ async def _complete_migration(
             to_phase="shadow",
         )
     await conn.execute(
-        "UPDATE schema_migrations SET status='complete', completed_at_ms=?, "
-        "error_class=NULL, updated_at_ms=? "
+        "UPDATE schema_migrations SET status='complete', completed_at_ms=MAX(?, started_at_ms), "
+        "error_class=NULL, updated_at_ms=MAX(?, created_at_ms) "
         "WHERE migration_id=? AND status!='complete'",
         (now_ms, now_ms, MIGRATION_ID),
     )
@@ -832,8 +837,8 @@ async def _mark_migration_failed(
             return
         now_ms = int(time.time() * 1000)
         await conn.execute(
-            "UPDATE schema_migrations SET status='failed', completed_at_ms=?, "
-            "error_class=?, updated_at_ms=? WHERE migration_id=?",
+            "UPDATE schema_migrations SET status='failed', completed_at_ms=MAX(?, started_at_ms), "
+            "error_class=?, updated_at_ms=MAX(?, created_at_ms) WHERE migration_id=?",
             (now_ms, type(exc).__name__[:200], now_ms, MIGRATION_ID),
         )
         await conn.commit()

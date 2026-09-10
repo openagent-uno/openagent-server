@@ -260,6 +260,51 @@ async def t_custom_view_migration_rollback(ctx: TestContext) -> None:
             await db.close()
 
 
+@test("custom_views", "a backwards wall clock cannot wedge the migration ledger")
+async def t_custom_view_migration_backwards_clock(ctx: TestContext) -> None:
+    """One backwards clock step used to wedge ``connect()`` permanently.
+
+    The ledger CHECKs demand ``completed_at_ms >= started_at_ms`` and
+    ``updated_at_ms >= created_at_ms``, but every UPDATE read the wall clock
+    again. When the host corrected time backwards after the ``running`` row
+    was written, the completion UPDATE raised IntegrityError -- and so did
+    the failure bookkeeping in the handler, so the row stayed ``running``
+    and every later startup hit the same wall until real time caught up.
+    Observed twice in one CI-equivalent run on a clock-syncing VM.
+    """
+    import src.custom_views.migration as migration
+
+    with tempfile.TemporaryDirectory(prefix="oa-ui-schema-clock-") as raw:
+        root = Path(raw)
+        db = await _db(root)
+        try:
+            conn = await db._ensure_connected()
+            # The ledger as it looks after a 5 s backwards step: written in
+            # what is now the future, still marked running.
+            ahead_ms = int(time.time() * 1000) + 5_000
+            await conn.execute(
+                "UPDATE schema_migrations SET status='running', completed_at_ms=NULL, "
+                "started_at_ms=?, created_at_ms=?, updated_at_ms=? WHERE migration_id=?",
+                (ahead_ms, ahead_ms, ahead_ms, migration.MIGRATION_ID),
+            )
+            await conn.commit()
+
+            assert await migration.ensure_custom_views_storage(conn, app_version="test")
+
+            row = await (
+                await conn.execute(
+                    "SELECT status, started_at_ms, completed_at_ms, created_at_ms, "
+                    "updated_at_ms FROM schema_migrations WHERE migration_id=?",
+                    (migration.MIGRATION_ID,),
+                )
+            ).fetchone()
+            assert row is not None and row["status"] == "complete"
+            assert row["completed_at_ms"] >= row["started_at_ms"]
+            assert row["updated_at_ms"] >= row["created_at_ms"]
+        finally:
+            await db.close()
+
+
 @test("custom_views", "repository pins revisions, enforces ACL, and bounds append data")
 async def t_custom_view_repository(ctx: TestContext) -> None:
     from src.custom_views.repository import CustomViewNotFound, CustomViewRepository

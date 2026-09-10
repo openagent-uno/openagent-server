@@ -102,10 +102,15 @@ async def ensure_artifact_acl_storage(conn: Any, *, app_version: str) -> bool:
             ),
         )
     else:
+        # Clamp every stamp against the one already on the row. The ledger
+        # CHECKs require completed_at_ms >= started_at_ms and updated_at_ms >=
+        # created_at_ms, and a host clock can step backwards between the two
+        # writes: without this, one NTP correction wedges the migration until
+        # real time catches up, the failure bookkeeping included.
         await conn.execute(
             "UPDATE schema_migrations SET status='running', "
             "started_at_ms=COALESCE(started_at_ms, ?), completed_at_ms=NULL, "
-            "app_version=?, runner_id=?, error_class=NULL, updated_at_ms=? "
+            "app_version=?, runner_id=?, error_class=NULL, updated_at_ms=MAX(?, created_at_ms) "
             "WHERE migration_id=? AND status<>'complete'",
             (now_ms, app_version, runner_id, now_ms, MIGRATION_ID),
         )
@@ -115,8 +120,8 @@ async def ensure_artifact_acl_storage(conn: Any, *, app_version: str) -> bool:
         await _verify(conn)
         done_ms = int(time.time() * 1000)
         await conn.execute(
-            "UPDATE schema_migrations SET status='complete', completed_at_ms=?, "
-            "error_class=NULL, updated_at_ms=? WHERE migration_id=? AND status<>'complete'",
+            "UPDATE schema_migrations SET status='complete', completed_at_ms=MAX(?, started_at_ms), "
+            "error_class=NULL, updated_at_ms=MAX(?, created_at_ms) WHERE migration_id=? AND status<>'complete'",
             (done_ms, done_ms, MIGRATION_ID),
         )
         await conn.commit()
@@ -126,8 +131,8 @@ async def ensure_artifact_acl_storage(conn: Any, *, app_version: str) -> bool:
         failed_ms = int(time.time() * 1000)
         try:
             await conn.execute(
-                "UPDATE schema_migrations SET status='failed', completed_at_ms=?, "
-                "error_class=?, updated_at_ms=? WHERE migration_id=? AND status<>'complete'",
+                "UPDATE schema_migrations SET status='failed', completed_at_ms=MAX(?, started_at_ms), "
+                "error_class=?, updated_at_ms=MAX(?, created_at_ms) WHERE migration_id=? AND status<>'complete'",
                 (failed_ms, type(exc).__name__[:200], failed_ms, MIGRATION_ID),
             )
             await conn.commit()
