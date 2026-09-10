@@ -43,6 +43,46 @@ _sessions: dict[tuple[str, str], tuple[Any, asyncio.Lock]] = {}
 _sessions_registry_lock = asyncio.Lock()
 
 
+async def _record_session_owner(gateway, session_id: str, client_id: str, handle: str | None) -> None:
+    """Record who owns this session, the way the WebSocket gateway does.
+
+    ``SessionManager._persist_session`` stamps ``metadata.client_id`` on every
+    session it creates; this path never did. A session driven over REST was
+    therefore written with no owner at all — invisible in ``list_all_sessions``
+    (which filters on exactly that field) and, since the normalized resource
+    rows arrived, projected as ``quarantined``, which ``resource_is_visible``
+    refuses unconditionally. Every per-session route then answers 404 for a
+    session that plainly exists, and no API can repair it: claiming a session
+    is itself gated on the session being visible.
+
+    The owner is the authenticated handle, so the listing is the same on all of
+    that user's devices; ``client_id`` (the device key) stays in metadata for
+    per-device routing. An existing owner is never transferred — a reconnect,
+    or another device attaching to a shared id, must not take the row over.
+
+    Awaited before the caller runs its turn: the runtime rewrites ``metadata``
+    from its own session object when it persists, so a stamp it has not read
+    yet would be dropped.
+    """
+    db = getattr(getattr(gateway, "agent", None), "memory_db", None)
+    if db is None:
+        return
+    try:
+        row = await db.get_session(session_id)
+        if row is not None and str(row.get("client_id") or "").strip():
+            return
+        await db.upsert_session(
+            session_id,
+            client_id=(handle or "").strip() or client_id,
+            device_id=client_id,
+        )
+    except Exception:
+        logger.warning(
+            "chat: could not record the owner of session %s", session_id,
+            exc_info=True,
+        )
+
+
 async def _get_or_create_session(
     gateway,
     client_id: str,
@@ -85,6 +125,7 @@ async def _get_or_create_session(
             await session.start()
             lock = asyncio.Lock()
             _sessions[key] = (session, lock)
+            await _record_session_owner(gateway, session_id, client_id, handle)
             logger.debug("chat: created session %s/%s", client_id, session_id)
             return session, lock
         # Refresh the short-lived authorization subject from this verified

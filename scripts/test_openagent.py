@@ -65,6 +65,12 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_rest_accounts",
     "test_rest_session_pin",
     "test_session_patch_owner",
+    # Ownership is reachability: an ownerless row is hidden from the listing
+    # and quarantined by the projection, so it 404s on every per-session
+    # route. Covers the three ways one lost its owner — the REST chat path
+    # never stamping it, a runtime turn erasing it, and rows older than the
+    # stamp — and the claim that brings those back.
+    "test_session_owner_recovery",
     "test_tool_search_repeat_miss",
     "test_sqlite_busy_timeout",
     "test_runtime_db_lifecycle",

@@ -1163,6 +1163,7 @@ class MemoryDB:
         # cert handle), so the runtime can read its history + persist new
         # runs again. See ``upsert_session`` and ``RUNTIME_SESSION_USER_ID``.
         await self._migrate_reclaim_session_owners()
+        await self._migrate_claim_ownerless_sessions()
         await self._conn.commit()
         # Additive only: takes a verified SQLite backup before the first v2
         # DDL, installs the downgrade journal, and enters shadow.  Legacy
@@ -1294,6 +1295,67 @@ class MemoryDB:
             # SCHEMA_SQL CREATE TABLE just above created it but on
             # legacy paths the migration order may surprise us. Quiet
             # no-op is the right behaviour here.
+            pass
+
+    async def _migrate_claim_ownerless_sessions(self) -> None:
+        """One-shot UPDATE: give the deployment's owner every ownerless session.
+
+        Ownership lives in ``metadata.client_id``. Rows written before the
+        gateway stamped one — and any row written by a path that still does
+        not — carry no owner, and an ownerless row is invisible twice over:
+        ``list_all_sessions`` filters on that exact field, and the normalized
+        projection files the row as ``quarantined``, which the resource check
+        refuses unconditionally. Since the canonical rows arrived that means
+        every per-session route answers 404 for a chat that is plainly on
+        disk, and no endpoint can repair it, because claiming a session is
+        itself gated on the session being visible.
+
+        The owner adopted here is the deployment's primary owner — the
+        earliest active network user, the same identity automation sessions
+        already inherit. Nothing is claimed on a handle-less deployment, and
+        nothing is claimed once a second person can sign in: leaving a row
+        hidden is safer than handing one member's chat to another.
+        Idempotent; safe on every connect.
+        """
+        assert self._conn is not None
+        if await self._network_has_several_users(self._conn):
+            # More than one person signs in here, and the row records nobody:
+            # adopting it for the earliest of them would hand one member's
+            # chat to another. Leaving it hidden is the safe half of that
+            # trade, and every session written from now on carries its owner.
+            return
+        owner = await self._deployment_owner_handle(self._conn)
+        if not owner:
+            return
+        try:
+            # ``json_extract(metadata, '$')`` normalizes both shapes this
+            # column has held: a JSON object, and the double-encoded JSON
+            # string legacy writers produced.
+            await self._conn.execute(
+                "UPDATE sessions SET metadata = json_set("
+                "COALESCE(json(json_extract(metadata, '$')), json('{}')), "
+                "'$.client_id', ?) "
+                "WHERE (metadata IS NULL OR json_valid(metadata)) AND COALESCE("
+                "json_extract(json_extract(metadata, '$'), '$.client_id'), '') = ''",
+                (owner,),
+            )
+        except Exception:
+            return  # ``sessions`` absent on a brand-new database.
+        principal = owner if owner.startswith(("user:", "agent:")) else f"user:{owner}"
+        try:
+            # The canonical rows were projected from the ownerless metadata, so
+            # they are quarantined already. Repair the two authorization
+            # columns in place rather than reprojecting every transcript at
+            # startup; the next write to a row refreshes the rest of it.
+            await self._conn.execute(
+                "UPDATE sessions_v2 SET owner_principal_id=?, visibility='private' "
+                "WHERE owner_principal_id IS NULL AND visibility='quarantined' "
+                "AND deleted_at_ms IS NULL",
+                (principal,),
+            )
+        except Exception:
+            # Normalized storage is installed later in this same connect; a
+            # first migration projects the rows from the metadata just fixed.
             pass
 
     async def _migrate_legacy_agno_sessions_to_sessions(self) -> None:
@@ -6174,6 +6236,17 @@ class MemoryDB:
         coordinator-less deployment (the rows then stay sidebar-hidden, which
         is the correct fallback rather than leaking to a wrong user)."""
         conn = await self._ensure_connected()
+        return await self._deployment_owner_handle(conn) or None
+
+    async def _deployment_owner_handle(self, conn) -> str:
+        """The deployment's owner handle, or ``""`` when it has none.
+
+        One lookup for every caller that needs an identity to attribute
+        server-side work to: automation child sessions, and the ownerless
+        session claim below. Takes the connection explicitly because that
+        claim runs mid-``connect``, where re-entering ``_ensure_connected``
+        would checkpoint the WAL in the middle of the migration sequence.
+        """
         try:
             cursor = await conn.execute(
                 "SELECT handle FROM network_users WHERE status = 'active' "
@@ -6181,8 +6254,20 @@ class MemoryDB:
             )
             row = await cursor.fetchone()
         except Exception:
-            return None
-        return row[0] if row else None
+            return ""
+        return str(row[0]).strip() if row and row[0] else ""
+
+    async def _network_has_several_users(self, conn) -> bool:
+        """Whether more than one person could own an unattributed row."""
+        try:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM network_users "
+                "WHERE status = 'active' LIMIT 2)"
+            )
+            row = await cursor.fetchone()
+        except Exception:
+            return False
+        return bool(row) and int(row[0]) > 1
 
     async def _pubkeys_for_handle(self, handle: str) -> set[str]:
         """Return every device pubkey (lowercase hex) bound to ``handle``.

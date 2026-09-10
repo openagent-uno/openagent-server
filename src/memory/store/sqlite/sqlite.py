@@ -1132,7 +1132,16 @@ class SqliteDb(BaseDb):
                             summary=serialized_session.get("summary"),
                             agent_data=serialized_session.get("agent_data"),
                             session_data=serialized_session.get("session_data"),
-                            metadata=serialized_session.get("metadata"),
+                            # Never erase metadata this write did not author. The
+                            # gateway owns this column (owner handle, title, model,
+                            # child linkage) and a runtime session object that never
+                            # read it serializes ``None`` here — which used to wipe
+                            # the owner on the next turn, leaving a row that
+                            # ``list_all_sessions`` cannot see and the normalized
+                            # projection files as quarantined.
+                            metadata=func.coalesce(
+                                stmt.excluded.metadata, table.c.metadata,
+                            ),
                             updated_at=int(time.time()),
                         ),
                         where=(table.c.user_id == serialized_session.get("user_id")) | (table.c.user_id.is_(None)),
@@ -1178,7 +1187,16 @@ class SqliteDb(BaseDb):
                             runs=serialized_session.get("runs"),
                             team_data=serialized_session.get("team_data"),
                             session_data=serialized_session.get("session_data"),
-                            metadata=serialized_session.get("metadata"),
+                            # Never erase metadata this write did not author. The
+                            # gateway owns this column (owner handle, title, model,
+                            # child linkage) and a runtime session object that never
+                            # read it serializes ``None`` here — which used to wipe
+                            # the owner on the next turn, leaving a row that
+                            # ``list_all_sessions`` cannot see and the normalized
+                            # projection files as quarantined.
+                            metadata=func.coalesce(
+                                stmt.excluded.metadata, table.c.metadata,
+                            ),
                             updated_at=int(time.time()),
                         ),
                         where=(table.c.user_id == serialized_session.get("user_id")) | (table.c.user_id.is_(None)),
@@ -1223,7 +1241,16 @@ class SqliteDb(BaseDb):
                             runs=serialized_session.get("runs"),
                             workflow_data=serialized_session.get("workflow_data"),
                             session_data=serialized_session.get("session_data"),
-                            metadata=serialized_session.get("metadata"),
+                            # Never erase metadata this write did not author. The
+                            # gateway owns this column (owner handle, title, model,
+                            # child linkage) and a runtime session object that never
+                            # read it serializes ``None`` here — which used to wipe
+                            # the owner on the next turn, leaving a row that
+                            # ``list_all_sessions`` cannot see and the normalized
+                            # projection files as quarantined.
+                            metadata=func.coalesce(
+                                stmt.excluded.metadata, table.c.metadata,
+                            ),
                             updated_at=int(time.time()),
                         ),
                         where=(table.c.user_id == serialized_session.get("user_id")) | (table.c.user_id.is_(None)),
