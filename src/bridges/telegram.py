@@ -253,6 +253,17 @@ class TelegramBridge(BaseBridge):
         # ``channels.telegram.streaming: true``.
         self._streaming_enabled = bool(streaming)
         self.allowed_users = set(allowed_users) if allowed_users else None
+        if self.allowed_users is None:
+            # Documented behaviour (``allowed_users: []`` means open), but the
+            # consequence is easy to miss: this doorway reaches the same agent
+            # as every other one, shell and vault included, so anyone who
+            # finds the bot gets it. Say so once at startup rather than
+            # letting an empty list read as "not configured yet".
+            logger.warning(
+                "Telegram bridge has no allowed_users: every Telegram user "
+                "who finds this bot can use the agent. Set "
+                "channels.telegram.allowed_users to restrict it.",
+            )
         self._app = None
         # Highest update_id we've seen from Telegram. Used during shutdown
         # to directly ACK the offset so a queued ``/restart`` cannot

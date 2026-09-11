@@ -126,6 +126,14 @@ class SlackBridge(BaseBridge):
         self.allowed_users = (
             set(str(u) for u in allowed_users) if allowed_users else None
         )
+        if self.allowed_users is None:
+            # See the same note in the Telegram bridge: open is a documented
+            # choice, but it must be a visible one.
+            logger.warning(
+                "Slack bridge has no allowed_users: every user who can reach "
+                "this app can use the agent. Set channels.slack.allowed_users "
+                "to restrict it.",
+            )
         self.listen_channels = (
             set(str(c) for c in listen_channels) if listen_channels else None
         )
