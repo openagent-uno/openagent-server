@@ -1840,16 +1840,14 @@ class StreamTurnRunner:
                             # set ``stream_error`` and the turn would close as
                             # ``completed`` with the exception text published
                             # as ordinary model output — indistinguishable, to
-                            # every client, from an answer. Use the error
-                            # vocabulary the protocol already defines.
+                            # every client, from an answer. Recording the
+                            # failure here is all this branch does; the single
+                            # ``OutError`` is published with the other terminal
+                            # frames below, so both failure paths — this one
+                            # and a generator that actually raised — emit the
+                            # same event in the same place.
                             from src.core.public_errors import RunTurnError
                             detail = str(event.get("text") or "").strip()
-                            await publish(OutError(
-                                session_id=session_id,
-                                seq=sess.next_seq(),
-                                ts_ms=now_ms(),
-                                text=detail,
-                            ))
                             stream_error = RunTurnError(
                                 str(event.get("error_detail") or detail),
                                 code=str(event.get("error_code") or "generic"),
@@ -2152,6 +2150,20 @@ class StreamTurnRunner:
                 parts=tuple(content_parts),
                 model=meta.get("model"),
             ))
+            # One ``OutError`` per failed turn, wherever the failure came
+            # from: a generator that raised sets ``stream_error`` directly,
+            # one that reported an errored ``done`` frame sets it above, and
+            # both land here. Published next to the other terminal frames so
+            # a client reads the failure in the same place every time, and
+            # suppressed on a barge-in for the same reason ``OutTextFinal``
+            # and ``TurnComplete`` are — the follow-up turn owns the screen.
+            if stream_error is not None and not sess._suppress_runner_completion:
+                await publish(OutError(
+                    session_id=session_id,
+                    seq=sess.next_seq(),
+                    ts_ms=now_ms(),
+                    text=str(stream_error),
+                ))
             # How it ended, not just that it did. All three facts are already
             # in hand here — they were simply dropped on the floor, leaving the
             # client to infer "answered" from an empty frame and "died" from
