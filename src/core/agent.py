@@ -1526,7 +1526,15 @@ class Agent:
             return False, -1
 
         reloaded = False
-        if mcps_updated > getattr(self, "_mcps_last_updated", 0.0):
+        # ``registry_status`` reports ``MAX(updated_at)`` per table, which is
+        # not monotonic: deleting the most recently touched row lowers it.
+        # A ``>`` comparison therefore misses every deletion â€” remove an MCP
+        # and its tools stay in the model's context (Â§6 promises the
+        # opposite), remove a model and the router keeps routing to it â€” and
+        # a host clock that steps backwards wedges the probe for good.
+        # Compare against the value last observed instead, so a change in
+        # either direction reloads exactly once.
+        if mcps_updated != getattr(self, "_mcps_last_updated", 0.0):
             self._mcps_last_updated = mcps_updated
             try:
                 await self._mcp.reload()
@@ -1536,7 +1544,7 @@ class Agent:
             except Exception as exc:  # noqa: BLE001
                 elog("mcps.reload_error", level="warning", error=str(exc))
 
-        providers_changed = providers_updated > getattr(self, "_providers_last_updated", 0.0)
+        providers_changed = providers_updated != getattr(self, "_providers_last_updated", 0.0)
         if providers_changed:
             self._providers_last_updated = providers_updated
             try:
@@ -1550,11 +1558,12 @@ class Agent:
         # routing because NativeProvider's api_key lookup goes through
         # ``providers_config``; models affect it because the classifier
         # picks from the materialised models list.
-        models_changed = models_updated > getattr(self, "_models_last_updated", 0.0)
+        models_changed = models_updated != getattr(self, "_models_last_updated", 0.0)
         if models_changed or providers_changed:
-            self._models_last_updated = max(
-                models_updated, getattr(self, "_models_last_updated", 0.0) or 0.0
-            )
+            # Record what was observed, not a high-water mark: ``max`` could
+            # only ever ratchet up, so once a delete lowered the table's
+            # ``MAX(updated_at)`` the catalog stayed stale until restart.
+            self._models_last_updated = models_updated
             if models_changed and not providers_changed:
                 # Providers hydrate already ran above; re-run only when
                 # models alone changed so the materialised catalog is fresh.

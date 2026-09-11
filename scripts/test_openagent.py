@@ -307,6 +307,9 @@ _TEST_MODULES: tuple[str, ...] = (
     # Bootstrap MCP-row seeding: regression for the missing-vault bug.
     "test_bootstrap",
     "test_db_models",
+    # ``MAX(updated_at)`` goes DOWN on a delete, so the hot-reload probe
+    # cannot compare with ``>``.
+    "test_registry_reload",
     # Regression: MemoryDB._parse_metadata must always return a dict (mixout
     # crash 2026-05-12, sessions row with literal 'null' metadata).
     "test_db_metadata_parse",
