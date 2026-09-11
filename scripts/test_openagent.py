@@ -64,6 +64,9 @@ _TEST_MODULES: tuple[str, ...] = (
     "test_semantic_oversized",
     "test_rest_accounts",
     "test_rest_session_pin",
+    # A failed turn used to reach clients shaped like an answer; these pin
+    # the classification the ``done`` frame now carries.
+    "test_public_errors",
     "test_session_patch_owner",
     # Ownership is reachability: an ownerless row is hidden from the listing
     # and quarantined by the projection, so it 404s on every per-session

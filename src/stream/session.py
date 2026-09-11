@@ -1834,6 +1834,27 @@ class StreamTurnRunner:
                         if speaker is not None:
                             await text_q.put("\n")
                     elif kind == "done":
+                        if event.get("errored"):
+                            # ``Agent.run_stream`` catches the failure and
+                            # reports it here rather than raising, so nothing
+                            # set ``stream_error`` and the turn would close as
+                            # ``completed`` with the exception text published
+                            # as ordinary model output — indistinguishable, to
+                            # every client, from an answer. Use the error
+                            # vocabulary the protocol already defines.
+                            from src.core.public_errors import RunTurnError
+                            detail = str(event.get("text") or "").strip()
+                            await publish(OutError(
+                                session_id=session_id,
+                                seq=sess.next_seq(),
+                                ts_ms=now_ms(),
+                                text=detail,
+                            ))
+                            stream_error = RunTurnError(
+                                str(event.get("error_detail") or detail),
+                                code=str(event.get("error_code") or "generic"),
+                            )
+                            break
                         if event.get("text") and not accumulated:
                             tail = event["text"]
                             accumulated.append(tail)

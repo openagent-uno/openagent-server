@@ -614,3 +614,66 @@ async def t_burst_no_freeze_on_swallowed_cancel(_ctx: TestContext) -> None:
         )
     finally:
         await sess.close()
+
+
+@test("agent_run_stream", "a failed turn is marked as an error, not delivered as an answer")
+async def t_failed_turn_is_marked_errored(_ctx: TestContext) -> None:
+    """``run_stream`` catches every failure and reports it as a ``done``
+    frame. That frame used to be shaped exactly like a successful one —
+    ``{"kind": "done", "text": ...}`` — so ``StreamSession`` republished
+    the exception text as ``OutTextDelta`` and closed the turn
+    ``completed``: the app, the CLI and every bridge recorded the failure
+    as the model's reply, and only a client that string-matched the
+    warning sign could tell. The frame must say so in data.
+
+    The diagnostic itself stays in ``text``: a self-hosted agent is
+    expected to diagnose itself from what it actually saw. ``error_public``
+    is the constant a host shows instead when provider detail must not
+    reach the person in the chat."""
+    model = _MidStreamTypeErrorModel(yield_count=1)
+    agent = _make_agent(model)
+
+    events = await _drive(agent, "hi", session_id="sess-errored")
+    done = [e for e in events if e.get("kind") == "done"]
+
+    assert len(done) == 1, f"expected exactly one done frame, got {len(done)}"
+    frame = done[0]
+
+    assert frame.get("errored") is True, (
+        "a failed turn must be distinguishable from an answer without "
+        f"parsing its prose: {frame!r}"
+    )
+    assert frame.get("error_code") == "generic", (
+        f"an unrecognised failure classifies as generic: {frame.get('error_code')!r}"
+    )
+    assert "TypeError" in str(frame.get("error_detail") or ""), (
+        f"the detail must name the real exception: {frame.get('error_detail')!r}"
+    )
+    assert "TypeError" in str(frame.get("text") or ""), (
+        "the human-readable text keeps the diagnostic for self-hosted "
+        f"debugging: {frame.get('text')!r}"
+    )
+
+    public = str(frame.get("error_public") or "")
+    assert public and "TypeError" not in public, (
+        f"error_public must carry no provider diagnostic: {public!r}"
+    )
+
+
+@test("agent_run_stream", "a successful turn carries no error marker")
+async def t_successful_turn_is_not_marked_errored(_ctx: TestContext) -> None:
+    """The guard's other half: marking failures is only useful if a
+    healthy turn stays unmarked, or every consumer learns to ignore it."""
+    model = _FakeModel(deltas=["all ", "good"])
+    agent = _make_agent(model)
+
+    events = await _drive(agent, "hi", session_id="sess-ok")
+    done = [e for e in events if e.get("kind") == "done"]
+
+    assert len(done) == 1, f"expected exactly one done frame, got {len(done)}"
+    assert not done[0].get("errored"), (
+        f"a successful turn must not be flagged as an error: {done[0]!r}"
+    )
+    assert "error_code" not in done[0], (
+        f"a successful turn carries no error code: {done[0]!r}"
+    )

@@ -1528,9 +1528,9 @@ class Agent:
         reloaded = False
         # ``registry_status`` reports ``MAX(updated_at)`` per table, which is
         # not monotonic: deleting the most recently touched row lowers it.
-        # A ``>`` comparison therefore misses every deletion â€” remove an MCP
-        # and its tools stay in the model's context (Â§6 promises the
-        # opposite), remove a model and the router keeps routing to it â€” and
+        # A ``>`` comparison therefore misses every deletion — remove an MCP
+        # and its tools stay in the model's context (§6 promises the
+        # opposite), remove a model and the router keeps routing to it — and
         # a host clock that steps backwards wedges the probe for good.
         # Compare against the value last observed instead, so a change in
         # either direction reloads exactly once.
@@ -2154,7 +2154,24 @@ class Agent:
                 error_type=type(e).__name__,
                 error=str(e) or repr(e),
             )
-            yield {"kind": "done", "text": _format_run_error(e)}
+            # A failed turn is not an assistant reply. This frame used to be
+            # shaped exactly like a successful one, so ``StreamSession``
+            # republished the exception text as ``OutTextDelta`` and closed
+            # the turn ``completed`` — the app, the CLI and every bridge
+            # recorded the failure as the model's answer, and only a client
+            # that string-matched the warning sign could tell. The marker,
+            # the stable code and the diagnostic-free message let the stream
+            # layer reach for ``OutError`` / ``TURN_END_ERROR`` instead.
+            from src.core.public_errors import classify_run_error
+            failure = classify_run_error(e)
+            yield {
+                "kind": "done",
+                "text": _format_run_error(e),
+                "errored": True,
+                "error_code": failure.code,
+                "error_public": failure.public_message,
+                "error_detail": f"{type(e).__name__}: {str(e) or repr(e)}"[:500],
+            }
 
     async def _run_inner_stream(
         self,
