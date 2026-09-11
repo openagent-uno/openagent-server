@@ -326,7 +326,16 @@ BUILTIN_MCP_SPECS: dict[str, dict[str, Any]] = {
         "command": ["node", "dist/index.js"],
         "build": ["npm", "run", "build"],
         "install": ["npm", "install"],
-        "env": {"NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+        # No TLS override. This spec used to force
+        # ``NODE_TLS_REJECT_UNAUTHORIZED=0``, which disables certificate
+        # verification for *every* HTTPS request the Node process makes —
+        # search queries and page fetches alike — so anything on the path
+        # could substitute the content the agent then reasons over, and the
+        # agent had no way to tell. An operator who genuinely must reach a
+        # host with an untrusted certificate sets the variable on their own
+        # web-search MCP row (``resolve_builtin_entry`` merges a row's env
+        # over the spec's), which keeps the exception explicit, per-install
+        # and visible in the MCP manager instead of silently on for everyone.
         "description": (
             "search the live web and fetch page contents. Use whenever "
             "the answer depends on current information you may not have"
