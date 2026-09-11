@@ -1025,16 +1025,16 @@ async def handle_pin(request):
     runtime_id = str(body.get("runtime_id") or "").strip()
     if not runtime_id:
         return web.json_response({"error": "runtime_id is required"}, status=400)
-    # Look the model up BY RUNTIME_ID. ``get_model`` takes the surrogate
-    # row id and casts it with ``int()``, so passing a runtime_id here made
-    # every pin a 500 ("invalid literal for int()") — this endpoint had
-    # never succeeded, which is why no client called it. ``runtime_id`` is
-    # not a column: it is derived per row, so the enriched listing is the
-    # only place it can be matched.
-    model = next(
-        (m for m in await db.list_models_enriched() if m.get("runtime_id") == runtime_id),
-        None,
-    )
+    # Look the model up BY RUNTIME_ID. ``get_model`` takes the surrogate row
+    # id and casts it with ``int()``, so passing a runtime_id there made
+    # every pin a 500 ("invalid literal for int()"). ``runtime_id`` is not a
+    # column — it is derived per row — but it decomposes into the indexed
+    # (provider_name, framework, model) triple, which is what
+    # ``get_model_by_runtime_id`` selects on; it returns the same enriched
+    # shape (``provider_enabled`` included) as the listing, so the checks
+    # below are unchanged. Reading one row beats materialising the whole
+    # catalogue and scanning it in Python on every pin.
+    model = await db.get_model_by_runtime_id(runtime_id)
     if model is None:
         return web.json_response(
             {"error": f"model {runtime_id!r} is not registered"},

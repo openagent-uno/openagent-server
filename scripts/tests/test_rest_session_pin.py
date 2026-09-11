@@ -8,8 +8,12 @@ succeeded, which is why no client called it and why the desktop app kept its
 model choice in device-local state instead.
 
 The fake DB below reproduces exactly that distinction — ``get_model`` casts,
-``list_models_enriched`` carries the derived ``runtime_id`` — so reverting to
-the old lookup fails here rather than in front of a user.
+while ``get_model_by_runtime_id`` and ``list_models_enriched`` speak the
+derived ``runtime_id`` — so reverting to the old lookup fails here rather
+than in front of a user. The handler reads the single indexed row rather
+than materialising the whole catalogue and scanning it; both return the
+same enriched shape, so the ``enabled`` / ``provider_enabled`` refusals
+below are unaffected by which one it calls.
 """
 from __future__ import annotations
 
@@ -40,6 +44,14 @@ class _FakeDB:
 
     async def list_models_enriched(self, **_):
         return _ROWS
+
+    async def get_model_by_runtime_id(self, runtime_id):
+        # Mirrors the real method: selects the one enriched row whose
+        # (provider_name, framework, model) triple spells this runtime_id,
+        # and returns the same shape ``list_models_enriched`` yields — so
+        # the handler's ``enabled`` / ``provider_enabled`` checks still see
+        # what they expect.
+        return next((r for r in _ROWS if r["runtime_id"] == runtime_id), None)
 
     async def pin_session_model(self, session_id, runtime_id):
         self.pinned[session_id] = runtime_id
