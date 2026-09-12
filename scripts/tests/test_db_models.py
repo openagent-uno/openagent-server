@@ -165,6 +165,38 @@ async def t_runtime_id_lookup(ctx: TestContext) -> None:
         await db.close()
 
 
+@test("db_models", "runtime lookup matches the catalog identity for qualified model names")
+async def t_qualified_runtime_id_lookup(ctx: TestContext) -> None:
+    from src.memory.db import MemoryDB
+
+    db = MemoryDB(str(ctx.db_path))
+    await db.connect()
+    try:
+        provider_id = await db.upsert_provider(name="custom", framework="api-based")
+        for stored_model, runtime_id in [
+            ("custom:model:high", "custom:model:high"),
+            ("custom:vendor/model", "custom:vendor/model"),
+            ("custom/model-slash", "custom:model-slash"),
+        ]:
+            model_id = await db.upsert_model(provider_id=provider_id, model=stored_model)
+            row = await db.get_model_by_runtime_id(runtime_id)
+            assert row is not None, runtime_id
+            assert row["id"] == model_id, row
+            assert row["runtime_id"] == runtime_id, row
+        legacy_id = await db.upsert_model(provider_id=provider_id, model="model:high", enabled=False)
+        row = await db.get_model_by_runtime_id("custom:model:high")
+        assert row is not None and row["enabled"] and row["id"] != legacy_id, row
+        assert await db.get_model_by_runtime_id("other:model:high") is None
+        assert (await db.get_model(legacy_id))["enabled"] is False
+        await db.set_model_enabled(row["id"], False)
+        assert (await db.get_model_by_runtime_id("custom:model:high"))["enabled"] is False
+        await db.set_provider_enabled(provider_id, False)
+        assert (await db.get_model_by_runtime_id("custom:model:high"))["provider_enabled"] is False
+        await db.delete_provider(provider_id)
+    finally:
+        await db.close()
+
+
 @test("db_models", "upsert_model rejects orphan provider_id")
 async def t_reject_orphan(ctx: TestContext) -> None:
     from src.memory.db import MemoryDB

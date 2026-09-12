@@ -5831,14 +5831,19 @@ class MemoryDB:
             return None
         framework = framework_of(runtime_id)
         provider_name, model = split_runtime_id(runtime_id)
+        canonical_id = f"{provider_name}:{model}"
         conn = await self._ensure_connected()
         cursor = await conn.execute(
             f"{self._ENRICHED_MODEL_SELECT} "
-            "WHERE p.name = ? AND p.framework = ? AND m.model = ?",
-            (provider_name, framework, model),
+            "WHERE p.name = ? AND p.framework = ? AND m.model IN (?, ?, ?) "
+            "ORDER BY CASE WHEN m.model = ? THEN 0 ELSE 1 END, m.id",
+            (provider_name, framework, model, canonical_id, f"{provider_name}/{model}", model),
         )
-        row = await cursor.fetchone()
-        return self._shape_enriched(row) if row else None
+        for row in await cursor.fetchall():
+            enriched = self._shape_enriched(row)
+            if enriched["runtime_id"] == canonical_id:
+                return enriched
+        return None
 
     async def upsert_model(
         self,

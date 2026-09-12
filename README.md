@@ -115,6 +115,11 @@ OpenAgent/
 
 Gateway integration: [shared sessions, steering, replay and presence](docs/collaboration.md).
 
+Session model lookup accepts the same provider-qualified identities exposed by
+the catalog, including vendor IDs with colons or slashes. A differently shaped
+legacy row cannot shadow a qualified model, and disabled models/providers remain
+disabled when resolving a pin.
+
 ## License
 
 MIT
