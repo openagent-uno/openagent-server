@@ -2678,7 +2678,7 @@ async def t_legal_corpus_layers(_ctx: TestContext) -> None:
         thread = {"tags": list(entry.get("tags", [])), "messages": messages}
         history = "\n".join(m["body_text"] for m in messages)
         decided = (
-            "legal" in lsc._thread_tags(thread)
+            "legal-notice" in lsc._thread_tags(thread)
             or lsc._requires_legal_silence(entry["body"], subject, thread)
             or bool(lsc._LEGAL_SILENCE.search(history))
         )

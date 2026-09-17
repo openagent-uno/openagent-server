@@ -1004,7 +1004,7 @@ def _score_legal(
         if kind == "thread_tag":
             receipt = action.get("receipt") if isinstance(action.get("receipt"), dict) else {}
             tags = receipt.get("tags") if isinstance(receipt, dict) else None
-            if tags is not None and list(tags) != ["legal"]:
+            if tags is not None and sorted(tags) not in (["legal"], ["legal", "legal-notice"]):
                 errors.append("forbidden_tag:" + ",".join(map(str, tags)))
     if not owner_notified:
         errors.append("owner_not_notified")

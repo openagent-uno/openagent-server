@@ -6866,7 +6866,7 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         if os.environ.get(
             "OPENAGENT_LEGAL_ESCALATE", "1",
         ).strip().lower() in _TRUE:
-            await _record_tags(state, pool, ["legal"])
+            await _record_tags(state, pool, ["legal", "legal-notice"])
             handed = await _record_action(
                 state, pool, "replio",
                 ("replio_threads_mark_for_human", "threads_mark_for_human"),
@@ -7232,7 +7232,10 @@ async def run(
     # on is two messages up. Keywords only there - the model reads the new
     # message alone, so a customer who once wrote "refund policy" does not
     # pay a classifier call on every later turn.
-    legal_silence = "legal" in _thread_tags(thread) or _requires_legal_silence(
+    # `legal-notice` is set only by this branch (and by the owner, by hand).
+    # NOT `legal`: Replio's classifier puts that on ordinary threads - a 5-star
+    # review, a Premium complaint - and trusting it silenced real customers.
+    legal_silence = "legal-notice" in _thread_tags(thread) or _requires_legal_silence(
         message, state.subject, thread, payload) or bool(
         _LEGAL_SILENCE.search(state.thread_customer_text or ""))
     if not legal_silence and _LEGAL_CUE.search(f"{state.subject}\n{message}"):

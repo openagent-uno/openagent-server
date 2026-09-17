@@ -116,7 +116,7 @@ LEGAL: tuple[dict[str, Any], ...] = (
         "id": "tagged-legal-thread-innocuous-message", "expect": "silence", "signal": "tag",
         "source": "synthetic", "product": "esound", "channel": "email_imap", "lang": "en",
         "subject": "Re: follow up", "author_handle": "jordan.m1987@gmail.com",
-        "tags": ["legal"],
+        "tags": ["legal-notice"],
         "body": "Hi, just checking you got my last email. Have a nice day!",
     },
     {
@@ -139,7 +139,9 @@ LEGAL: tuple[dict[str, Any], ...] = (
         "id": "rights-holder-followup-tagged", "expect": "silence", "signal": "tag",
         "source": "real", "product": "lyra", "channel": "email_imap", "lang": "en",
         "subject": "WCM x Lyra Music", "author_handle": "licensing.manager@publisher-music.example",
-        "tags": ["business", "copyright", "legal", "needs-human"],
+        # The first letter was silenced by the bot, which leaves `legal-notice`
+        # behind; Replio's own `legal` tag is not trusted (it lands on ordinary threads).
+        "tags": ["business", "copyright", "legal", "legal-notice", "needs-human"],
         "body": "Just following up on this, it would be helpful if you could come back to me so we can discuss next steps",
     },
     # ---- Platforms ---------------------------------------------------------------------------
