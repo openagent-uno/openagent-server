@@ -6828,6 +6828,18 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
 
     if state.outcome == "other_brand_out_of_scope":
         return
+    if state.decision == "human":
+        # Handed to a person means handed over, and nothing goes to the
+        # customer. The reply composed for this branch is only ever a holding
+        # message ("a colleague is taking this over, no need to write again"),
+        # and no colleague is there when it lands: on 17-Sep-2026 Samsung's QA
+        # team sent eSound an issue report the controller could not read, got
+        # that sentence two minutes later, and nobody followed up. The message
+        # promises presence that does not exist and tells the customer to stop
+        # writing. The queue alone keeps the thread in front of a person.
+        state.facts["reply_source"] = "none:human_queue_no_holding_reply"
+        state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
+        return
     if not reply or state.outcome in {
         "already_answered", "no_content", "undeliverable",
         "acknowledgement_no_reply_needed", "machine_mail",
@@ -6838,30 +6850,6 @@ async def _apply_lifecycle(pool: Any, state: SupportState, reply: str) -> None:
         state.facts["reply_source"] = "none:unreviewed_reply_blocked"
         state.human_reason = "The final text changed after voice review. Review before sending; an internal fallback must not reach the customer."
         state.facts["human_handoff_confirmed"] = await _queue_for_human(pool, state)
-        return
-    if state.decision == "human":
-        # The queue write already happened, before the reply was composed
-        # (see _queue_for_human). The customer still gets an answer in the
-        # same turn: "VIETATO lasciare un inbound cliente senza risposta E
-        # con waiting_for_team=true" - the human queue is not a substitute
-        # for a reply.
-        handed = await _queue_for_human(pool, state)
-        await _record_action(
-            state, pool, "replio", ("replio_threads_respond", "threads_respond"),
-            _reply_args(state, reply), "customer_reply",
-        )
-        if handed:
-            # An outbound message clears ``waiting_for_team`` (Replio
-            # ``insert_outbound_message``; only its social auto-ack passes
-            # ``keep_waiting_for_team``). Queueing before the reply is what
-            # makes the handoff sentence pass Replio's F9 guard - which reads
-            # the flag at send time - so the flag has to be put back
-            # afterwards or the case silently leaves the human queue.
-            await _record_action(
-                state, pool, "replio", ("replio_threads_mark_for_human", "threads_mark_for_human"),
-                {"thread_id": state.thread_id, "reason": state.human_reason},
-                "human_handoff_restore",
-            )
         return
 
     if drafts_enabled() and os.environ.get(

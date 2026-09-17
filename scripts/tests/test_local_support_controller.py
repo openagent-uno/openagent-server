@@ -3257,10 +3257,12 @@ async def t_inferred_money_label_is_served(_ctx: TestContext) -> None:
     assert "billing_dispute" in sem.INTENT_EXEMPLARS
 
 
-@test("local_support_controller", "the queue is written before the reply promises it")
-async def t_handoff_precedes_reply(_ctx: TestContext) -> None:
-    """Replio's F9 guard reads waiting_for_team at SEND time, and an outbound
-    message clears it. So the order is: queue, reply, re-queue."""
+@test("local_support_controller", "a handoff queues the thread and sends the customer nothing")
+async def t_handoff_sends_no_holding_reply(_ctx: TestContext) -> None:
+    """17-Sep-2026: Samsung's QA team got "someone from the team will follow
+    up, no need to write in again" two minutes after the controller parked
+    their report, and nobody followed up. A handoff is the queue, not a
+    holding message."""
     from src.core import local_support_controller as lsc
 
     previous = os.environ.get(lsc._WRITES_ENV)
@@ -3276,19 +3278,11 @@ async def t_handoff_precedes_reply(_ctx: TestContext) -> None:
             session_id="s", delivery_id="d",
         )).text)
         assert output["decision"] == "human", output
-        names = doubles.names
-        handoff = names.index("replio_threads_mark_for_human")
-        respond = names.index("replio_threads_respond")
-        assert handoff < respond, names
-        # ...and the flag is put back after the send that cleared it: an
-        # outbound message clears waiting_for_team, so the LAST write on the
-        # thread has to be the one that queues it again.
-        requeues = [
-            index for index, name in enumerate(names)
-            if name == "replio_threads_mark_for_human"
-        ]
-        assert requeues and requeues[-1] > respond, names
+        assert "replio_threads_mark_for_human" in doubles.names, doubles.names
         assert doubles.args_for("replio_threads_mark_for_human")[-1]["reason"]
+        assert "replio_threads_respond" not in doubles.names, doubles.names
+        assert "replio_threads_draft" not in doubles.names, doubles.names
+        assert output["facts"]["human_handoff_confirmed"] is True, output["facts"]
     finally:
         if previous is None:
             os.environ.pop(lsc._WRITES_ENV, None)
@@ -3338,9 +3332,9 @@ async def t_repeat_is_escalated(_ctx: TestContext) -> None:
         assert output["outcome"] == "repeated_advice_human", output["outcome"]
         assert output["decision"] == "human", output["decision"]
         assert "replio_threads_mark_for_human" in doubles.names, doubles.names
-        sent = doubles.args_for("replio_threads_respond")
-        assert sent, doubles.names
-        assert "melden sie sich an" not in sent[-1]["body_text"].lower(), sent[-1]
+        # Escalated means silent: neither the repeated advice nor a holding
+        # message goes out.
+        assert not doubles.args_for("replio_threads_respond"), doubles.names
     finally:
         sem.matches_previous = original_matches
         sem.signal_present = original_signal
