@@ -44,6 +44,16 @@ class OperationalCase:
     product: str = ""
     channel: str = "email"
     author_name: str = ""
+    # What Replio knows about the thread beyond the message body. When any of
+    # these is set the replio simulator serves a brief in Replio's real shape
+    # (nested `thread`, inbound messages carrying author handles).
+    subject: str = ""
+    author_handle: str = ""
+    thread_tags: tuple[str, ...] = ()
+    history: tuple[dict[str, Any], ...] = ()
+    # Legal-silence contract: "silence" asserts the whole no-reply envelope,
+    # "handle" asserts the thread was NOT silenced, "observe" records only.
+    legal: str = ""
 
 
 # A `decision="human"` case asserts TWO things, and the second one is the point:
@@ -869,6 +879,139 @@ CASES = (
     ),
 )
 
+try:  # imported as scripts.local_support_operational_dryrun by the unit tests
+    from scripts import support_legal_corpus
+except ImportError:  # run as a script from scripts/
+    import support_legal_corpus  # type: ignore[no-redef]
+
+
+def legal_case(entry: dict[str, Any]) -> OperationalCase:
+    """One support_legal_corpus entry as a controller case."""
+    thread = f"sim-lg-{entry['id']}"
+    silence = entry["expect"] == "silence"
+    return OperationalCase(
+        id=f"legal:{entry['id']}",
+        customer=f"Thread {thread}: {entry['body']}",
+        decision="noop" if silence else "",
+        product=entry.get("product") or "esound",
+        channel=entry.get("channel") or "email_imap",
+        author_name=entry.get("author_name") or "",
+        author_handle=entry.get("author_handle") or "",
+        subject=entry.get("subject") or "",
+        thread_tags=tuple(entry.get("tags") or ()),
+        history=tuple(entry.get("history") or ()),
+        language=entry.get("lang") or "en",
+        skip_policy_route=True,
+        legal=entry["expect"],
+    )
+
+
+def legal_cases(entries: Any = None) -> list[OperationalCase]:
+    return [legal_case(entry) for entry in (entries or support_legal_corpus.ALL)]
+
+
+# One of each shape in the default matrix; the whole corpus runs with
+# --legal-corpus. The 17-Sep-2026 letter's own follow-up, the letter with
+# only weak cues, a keyword-free rights-holder follow-up, and a customer
+# whose "IT HAS TO BE ILLEGAL!" is praise.
+CASES = CASES + tuple(
+    legal_case(entry) for entry in support_legal_corpus.ALL
+    if entry["id"] in {
+        "legal-sender-short-followup-no-keywords",
+        "youtube-letter-weak-cues-only-generic-sender",
+        "rights-holder-followup-history-only",
+        "review-has-to-be-illegal-praise-real",
+    }
+)
+
+
+def _thread_fixture(case: OperationalCase, thread_id: str, body: str) -> dict[str, Any] | None:
+    """The brief Replio would return for this case, or None for the defaults."""
+    if not (case.subject or case.author_handle or case.thread_tags or case.history):
+        return None
+    messages = [dict(item) for item in case.history]
+    for index, item in enumerate(messages):
+        item.setdefault("direction", "inbound")
+        item.setdefault("sent_at", f"2026-09-1{min(index, 5)}T08:00:00Z")
+        if item["direction"] == "inbound":
+            item.setdefault("author_handle", case.author_handle or None)
+            item.setdefault("author_name", case.author_name or None)
+    messages.append({
+        "direction": "inbound", "body_text": body,
+        "author_handle": case.author_handle or None,
+        "author_name": case.author_name or None,
+        "sent_at": "2026-09-17T02:12:52Z",
+    })
+    return {
+        "thread": {
+            "id": thread_id, "subject": case.subject or None, "status": "open",
+            "waiting_for_team": False, "product": case.product or "esound",
+            "channel_kind": case.channel, "tags": list(case.thread_tags),
+            "last_inbound_author_name": case.author_name or None,
+            "last_inbound_author_handle": case.author_handle or None,
+            "message_count": len(messages),
+        },
+        "messages": messages,
+    }
+
+
+# Everything a legal-silence turn may do: tell the owner, tag the thread
+# `legal`, queue it for a person. Any other write is a violation, and so is
+# any reply or draft however polite.
+_LEGAL_ALLOWED_ACTIONS = {"owner_notified", "thread_tag", "human_handoff"}
+_LEGAL_FORBIDDEN_TOOLS = (
+    "threads_respond", "threads_draft", "discard_draft", "threads_patch",
+    "tags_remove", "thread_link_task", "create_task", "ensure_support_task",
+    "attach_to_task", "learning_add", "clickup_", "billingbear_",
+    "esound_admin_", "lyra_admin_", "esound_identity", "delete_account",
+    "enable_diagnostics",
+)
+
+
+def _score_legal(
+    case: OperationalCase, payload: dict[str, Any] | None, rows: list[tuple[str, str]],
+) -> list[str]:
+    if case.legal == "observe":
+        return []
+    if payload is None:
+        return ["invalid_json"]
+    names = [str(name or "").lower() for name, _excerpt in rows]
+    actions = [a for a in payload.get("actions") or [] if isinstance(a, dict)]
+    owner_notified = any(
+        a.get("kind") == "owner_notified" and a.get("success") for a in actions
+    )
+    outcome = str(payload.get("outcome") or "")
+    errors: list[str] = []
+    if case.legal == "handle":
+        if outcome == "legal_silence":
+            errors.append("false_positive_legal_silence")
+        if owner_notified or any("send_telegram" in n for n in names):
+            errors.append("owner_notified_for_ordinary_customer")
+        return errors
+    if outcome != "legal_silence":
+        errors.append(f"not_silenced:{outcome or 'none'}")
+    if str(payload.get("decision") or "") != "noop":
+        errors.append("wrong_decision:" + str(payload.get("decision")))
+    if str(payload.get("reply") or "").strip():
+        errors.append("reply_composed")
+    for tool in _LEGAL_FORBIDDEN_TOOLS:
+        if any(tool in name for name in names):
+            errors.append("forbidden_tool:" + tool)
+    for action in actions:
+        kind = str(action.get("kind") or "")
+        if kind not in _LEGAL_ALLOWED_ACTIONS:
+            errors.append("forbidden_action:" + kind)
+        if kind == "thread_tag":
+            receipt = action.get("receipt") if isinstance(action.get("receipt"), dict) else {}
+            tags = receipt.get("tags") if isinstance(receipt, dict) else None
+            if tags is not None and list(tags) != ["legal"]:
+                errors.append("forbidden_tag:" + ",".join(map(str, tags)))
+    if not owner_notified:
+        errors.append("owner_not_notified")
+    if not any(a.get("kind") == "human_handoff" and a.get("success") for a in actions):
+        errors.append("not_queued_for_human")
+    return errors
+
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     match = re.search(r"```json\s*(.*?)```", text or "", re.I | re.S)
@@ -1020,6 +1163,8 @@ SAMPLING_PROFILES: dict[str, dict[str, Any] | None] = {
 
 def _clone_and_patch_db(
     source: Path, destination: Path, sampling: str = "bench",
+    thread_fixtures: Path | None = None,
+    provider_urls: dict[str, str] | None = None,
 ) -> None:
     src = sqlite3.connect(str(source))
     dst = sqlite3.connect(str(destination))
@@ -1031,6 +1176,9 @@ def _clone_and_patch_db(
             "billingbear", "replio", "clickup", "messaging",
             "esound-admin", "lyra-admin", "esound-identity",
         ):
+            command = [sys.executable, str(simulator), name]
+            if name == "replio" and thread_fixtures is not None:
+                command += ["--threads", str(thread_fixtures)]
             dst.execute(
                 """
                 INSERT INTO mcps(name,kind,builtin_name,command,args_json,url,env_json,
@@ -1042,7 +1190,7 @@ def _clone_and_patch_db(
                   oauth=0,enabled=1,source='operational-benchmark',updated_at=excluded.updated_at
                 """,
                 (name, "custom", None,
-                 json.dumps([sys.executable, str(simulator), name]),
+                 json.dumps(command),
                  "[]", None, "{}", "{}", 0, 1,
                 "operational-benchmark", now, now),
             )
@@ -1089,6 +1237,13 @@ def _clone_and_patch_db(
                 "UPDATE models SET provider_id=?, enabled=1, updated_at=? "
                 "WHERE model='qwen3-moe-local'",
                 (provider_id, now),
+            )
+        # A throwaway clone may point a provider at a reachable endpoint (a
+        # port-forward to the real proxy): the model is real, the DB is not.
+        for provider_name, base_url in (provider_urls or {}).items():
+            dst.execute(
+                "UPDATE providers SET base_url=?, enabled=1, updated_at=? WHERE name=?",
+                (base_url, now, provider_name),
             )
         profile = SAMPLING_PROFILES.get(sampling, SAMPLING_PROFILES["bench"])
         if profile is not None:
@@ -1217,6 +1372,16 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             product=args.product,
             channel=args.corpus_channel,
         )
+    if getattr(args, "legal_corpus", False):
+        entries = list(support_legal_corpus.ALL)
+        for extra in getattr(args, "legal_corpus_file", None) or []:
+            entries += json.loads(Path(extra).expanduser().read_text())
+        wanted = set(getattr(args, "legal_expect", None) or [])
+        selected = [
+            case for case in legal_cases(entries)
+            if (not wanted or case.legal in wanted)
+            and (not args.case or case.id in args.case or case.id.split(":", 1)[1] in args.case)
+        ]
     if args.product and not args.from_corpus:
         # A tenant's policy notes live in ITS vault, so a run must pair the
         # cases of one brand with that brand's agent copy.
@@ -1231,9 +1396,24 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         (agent_dir / "memories").symlink_to(source_agent / "memories", target_is_directory=True)
         if (source_agent / "skills").exists():
             (agent_dir / "skills").symlink_to(source_agent / "skills", target_is_directory=True)
+        fixtures: dict[str, Any] = {}
+        for case in selected:
+            match = re.search(r"\bThread\s+([^:]+):", case.customer)
+            thread_id = match.group(1) if match else case.id
+            body_text = case.customer[match.end():].strip() if match else case.customer
+            brief = _thread_fixture(case, thread_id, body_text)
+            if brief is not None:
+                fixtures[thread_id] = brief
+        fixtures_path = agent_dir / "replio-threads.json"
+        fixtures_path.write_text(json.dumps(fixtures, ensure_ascii=False))
+        provider_urls = dict(
+            item.split("=", 1) for item in (getattr(args, "provider_url", None) or [])
+        )
         _clone_and_patch_db(
             base_agent / "openagent.db", agent_dir / "openagent.db",
             sampling=getattr(args, "sampling", "bench"),
+            thread_fixtures=fixtures_path,
+            provider_urls=provider_urls,
         )
         paths.set_agent_dir(agent_dir)
         config = yaml.safe_load((source_agent / "openagent.yaml").read_text())
@@ -1254,6 +1434,45 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
         agent = _build_agent(config)
+        # Measure the legal classifier where it runs: every call it makes, how
+        # long it took and what it answered, keyed by the run's session id.
+        from src.core import local_support_controller as _controller
+
+        legal_calls: dict[str, list[dict[str, Any]]] = {}
+        original_generate = _controller._generate_support_model
+
+        async def _timed_generate(model: Any, **kwargs: Any) -> Any:
+            session = str(kwargs.get("session_id") or "")
+            if not session.endswith(":support-legal"):
+                return await original_generate(model, **kwargs)
+            # Same lane and budget as _generate_support_model, split so the
+            # report separates queueing behind other support calls (gate)
+            # from the model call the timeout actually bounds.
+            record: dict[str, Any] = {}
+            legal_calls.setdefault(session[: -len(":support-legal")], []).append(record)
+            queued = time.monotonic()
+            async with _controller._SUPPORT_MODEL_GATE:
+                record["gate_seconds"] = round(time.monotonic() - queued, 3)
+                started_call = time.monotonic()
+                try:
+                    response = await asyncio.wait_for(
+                        model.generate(
+                            messages=kwargs["messages"], system=kwargs["system"],
+                            session_id=session,
+                        ),
+                        timeout=max(1.0, float(os.environ.get(
+                            kwargs["timeout_env"], kwargs.get("default_timeout", "12"),
+                        ))),
+                    )
+                    record["raw"] = str(getattr(response, "content", ""))[:200]
+                    return response
+                except BaseException as exc:
+                    record["error"] = f"{type(exc).__name__}:{exc}"[:200]
+                    raise
+                finally:
+                    record["seconds"] = round(time.monotonic() - started_call, 3)
+
+        _controller._generate_support_model = _timed_generate
         try:
             await agent.initialize()
             # Sequential by default so a run is reproducible; --concurrency N
@@ -1298,6 +1517,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                                                     "payload": {
                                                         "thread_id": thread_id,
                                                         "channel_kind": case.channel,
+                                                        # Replio's thread_event_payload
+                                                        # carries sender, subject and tags
+                                                        # at this level, not in `message`.
+                                                        **({"subject": case.subject} if case.subject else {}),
+                                                        **({"author_handle": case.author_handle} if case.author_handle else {}),
+                                                        **({"tags": list(case.thread_tags)} if case.thread_tags else {}),
                                                         "author_name": case.author_name,
                                                         "product": case.product or "esound",
                                                         "message": {
@@ -1333,6 +1558,13 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                         if not args.controller:
                             trace_rows = list(tool_trace.peek(sid) or [])
                         passed, errors, payload = _score(case, output, trace_rows)
+                        if case.legal:
+                            # The legal corpus asserts the silence contract only:
+                            # what an ordinary customer is answered is measured by
+                            # the rest of the matrix.
+                            payload = _extract_json(output)
+                            errors = _score_legal(case, payload, trace_rows)
+                            passed = not errors
                         reply_source = str(
                             ((payload or {}).get("facts") or {}).get("reply_source") or ""
                         )
@@ -1355,6 +1587,9 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
                                 else agent.last_response_meta(sid).get("model")
                             ),
                             "reply_source": reply_source,
+                            "legal": case.legal,
+                            "outcome": (payload or {}).get("outcome"),
+                            "legal_model_calls": legal_calls.get(sid, []),
                             "output": output, "payload": payload,
                             "tool_trace": trace_rows,
                         })
@@ -1367,6 +1602,7 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             await asyncio.gather(*jobs)
             wall_seconds = time.monotonic() - wall_started
         finally:
+            _controller._generate_support_model = original_generate
             await agent.shutdown()
 
     passed = sum(row["passed"] for row in rows)
@@ -1383,6 +1619,43 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "cases": [asdict(case) for case in selected],
         "runs": rows,
+    }
+
+
+def _legal_summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-case pass/fail across repeats and the classifier's latency."""
+    legal_runs = [row for row in runs if row.get("legal")]
+    if not legal_runs:
+        return {}
+    by_case: dict[str, dict[str, Any]] = {}
+    for row in sorted(legal_runs, key=lambda r: (r["case"], r["repetition"])):
+        entry = by_case.setdefault(row["case"], {
+            "expect": row["legal"], "results": [], "outcomes": [], "errors": [],
+        })
+        entry["results"].append("pass" if row["passed"] else "FAIL")
+        entry["outcomes"].append(row.get("outcome"))
+        entry["errors"].append(row.get("errors"))
+    latencies = sorted(
+        call["seconds"] for row in legal_runs
+        for call in row.get("legal_model_calls") or [] if "seconds" in call
+    )
+    errors = sum(
+        1 for row in legal_runs for call in row.get("legal_model_calls") or []
+        if call.get("error")
+    )
+
+    def pct(q: float) -> float | None:
+        if not latencies:
+            return None
+        return latencies[min(len(latencies) - 1, int(q * len(latencies)))]
+
+    return {
+        "cases": by_case,
+        "classifier_calls": len(latencies),
+        "classifier_errors": errors,
+        "classifier_seconds": {
+            "p50": pct(0.5), "p90": pct(0.9), "max": latencies[-1] if latencies else None,
+        },
     }
 
 
@@ -1419,19 +1692,42 @@ def main() -> int:
         help="Sampling profile: bench (0.7), prod (the model row), greedy (0.0)",
     )
     parser.add_argument(
+        "--legal-corpus", action="store_true",
+        help="Run the legal-silence corpus (scripts/support_legal_corpus.py)",
+    )
+    parser.add_argument(
+        "--legal-corpus-file", action="append",
+        help="Extra corpus entries (JSON list, same shape), e.g. sanitized real threads",
+    )
+    parser.add_argument(
+        "--legal-expect", action="append", choices=("silence", "handle", "observe"),
+        help="Keep only corpus entries with this expectation",
+    )
+    parser.add_argument(
+        "--provider-url", action="append",
+        help="NAME=URL: point a provider of the throwaway DB clone elsewhere",
+    )
+    parser.add_argument(
         "--controller", action="store_true",
         help="Run the deterministic local-only controller instead of the free agent loop",
     )
     args = parser.parse_args()
     if args.repeat < 1 or args.repeat > 10:
         parser.error("--repeat must be between 1 and 10")
-    report = asyncio.run(_run(args))
+    # Not asyncio.run: its teardown joins the default executor, and a worker
+    # thread left behind by the agent (seen with the embedding runtime) keeps
+    # the process alive forever after the report is complete.
+    loop = asyncio.new_event_loop()
+    report = loop.run_until_complete(_run(args))
     report["sampling"] = args.sampling
+    report["legal_summary"] = _legal_summary(report["runs"])
     rendered = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).expanduser().resolve().write_text(rendered + "\n")
     print(rendered)
-    return 0 if report["summary"]["failed"] == 0 else 1
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0 if report["summary"]["failed"] == 0 else 1)
 
 
 if __name__ == "__main__":

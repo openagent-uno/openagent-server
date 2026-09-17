@@ -9,6 +9,7 @@ real subscription or support thread.
 """
 from __future__ import annotations
 
+import json
 import sys
 from typing import Any
 
@@ -26,6 +27,16 @@ if ROLE not in {
     )
 
 mcp = FastMCP(ROLE)
+
+# Optional per-run thread fixtures: `replio --threads <file.json>` maps a
+# thread id to the exact brief Replio would return (nested `thread`, messages
+# with author handles, tags). Cases that need a sender, a subject, a tag or a
+# prior history use it; every other thread keeps the hardcoded shapes below.
+_FIXTURES: dict[str, Any] = {}
+if "--threads" in sys.argv[2:]:
+    _path = sys.argv[sys.argv.index("--threads") + 1]
+    with open(_path, encoding="utf-8") as _handle:
+        _FIXTURES = json.load(_handle)
 
 
 if ROLE == "billingbear":
@@ -335,6 +346,8 @@ if ROLE == "replio":
     @mcp.tool()
     async def threads_get(thread_id: str) -> dict[str, Any]:
         """Read a simulated support thread."""
+        if thread_id in _FIXTURES:
+            return json.loads(json.dumps(_FIXTURES[thread_id]))
         result = {
             "ok": True,
             "id": thread_id,
