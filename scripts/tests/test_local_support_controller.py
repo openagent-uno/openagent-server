@@ -2540,6 +2540,39 @@ async def t_legal_silence(_ctx: TestContext) -> None:
     )
     assert lsc._requires_legal_silence(youtube, "YouTube Terms of Service Violation") is True
     assert lsc._requires_legal_silence("hello", "YouTube Terms of Service Violation") is True
+    # Stronger words fire on their own.
+    for text in ("your app violates our policies", "this is an infringement notice",
+                 "the service is illegal in our territory", "violazione dei termini"):
+        assert lsc._requires_legal_silence(text) is True, text
+    # Weak cues do not decide alone: a model reads the message.
+    assert lsc._LEGAL_CUE.search("Please comply with our Terms within 7 days")
+    assert not lsc._LEGAL_CUE.search("right now the app crashes")
+
+    class _Resp:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class _Agent:
+        model = object()
+
+    original = lsc._generate_support_model
+    try:
+        async def says_legal(*_a: Any, **_k: Any) -> Any:
+            return _Resp('{"legal": true}')
+        async def says_ordinary(*_a: Any, **_k: Any) -> Any:
+            return _Resp('{"legal": false}')
+        async def unreachable(*_a: Any, **_k: Any) -> Any:
+            raise RuntimeError("gateway down")
+        lsc._generate_support_model = says_legal
+        assert await lsc._legal_with_model(_Agent(), {}, "comply with our terms", "s") is True
+        lsc._generate_support_model = says_ordinary
+        assert await lsc._legal_with_model(_Agent(), {}, "what is your refund policy?", "s") is False
+        # Fails closed: no verdict on a message with legal cues means silence.
+        lsc._generate_support_model = unreachable
+        assert await lsc._legal_with_model(_Agent(), {}, "comply with our terms", "s") is True
+    finally:
+        lsc._generate_support_model = original
+
     # The sender alone is enough, whatever the wording.
     legal_thread = {"messages": [{"direction": "inbound",
                                   "author_handle": "legal-youtube+0jz@google.com",
