@@ -1080,8 +1080,19 @@ def _legal_sender(thread: Any, payload: Any = None) -> bool:
     return False
 
 
+def _legal_text(text: str) -> str:
+    """The words a person wrote, without the form/review trailer.
+
+    The trailer names the device, and device codenames collide with the label
+    list: "device: Redmi merlin (Redmi Note 9)" matched `merlin`, "device: Sony
+    BRAVIA_VU1" matched `sony`. Both real Play reviews ("give five stars", "the
+    QR code didn't work") were silenced and tagged legal on that alone.
+    """
+    return _FORM_FIELD.sub("", str(text or ""))
+
+
 def _requires_legal_silence(text: str, subject: str = "", thread: Any = None, payload: Any = None) -> bool:
-    return bool(_LEGAL_SILENCE.search(f"{subject}\n{text}")) or _legal_sender(thread, payload)
+    return bool(_LEGAL_SILENCE.search(_legal_text(f"{subject}\n{text}"))) or _legal_sender(thread, payload)
 
 
 # Support codes as they reach us: "WC014", "wc037", "error WC 014".
@@ -6543,7 +6554,7 @@ async def _notify_owner_legal(pool: Any, state: SupportState) -> None:
     trigger. No analysis and no recommendation - the owner answers these
     directly.
     """
-    match = _LEGAL_SILENCE.search(f"{state.subject}\n{state.customer_message}")
+    match = _LEGAL_SILENCE.search(_legal_text(f"{state.subject}\n{state.customer_message}"))
     body = {
         "source": state.channel or "replio",
         "thread_id": state.thread_id,
@@ -7237,10 +7248,10 @@ async def run(
     # review, a Premium complaint - and trusting it silenced real customers.
     legal_silence = "legal-notice" in _thread_tags(thread) or _requires_legal_silence(
         message, state.subject, thread, payload) or bool(
-        _LEGAL_SILENCE.search(state.thread_customer_text or ""))
-    if not legal_silence and _LEGAL_CUE.search(f"{state.subject}\n{message}"):
+        _LEGAL_SILENCE.search(_legal_text(state.thread_customer_text or "")))
+    if not legal_silence and _LEGAL_CUE.search(_legal_text(f"{state.subject}\n{message}")):
         legal_silence = await _legal_with_model(
-            agent, event, f"Subject: {state.subject}\n\n{message}", session_id)
+            agent, event, f"Subject: {state.subject}\n\n{_legal_text(message)}", session_id)
         state.facts["legal_model_checked"] = True
     if legal_silence:
         # Silence overrides every other instruction, including answering an

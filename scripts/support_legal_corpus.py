@@ -589,6 +589,13 @@ HANDLE: tuple[dict[str, Any], ...] = (
     {"id": "ethics-question-real", "expect": "handle", "signal": "none", "source": "real",
      "product": "lyra", "channel": "email_imap", "lang": "en", "subject": "Ethics",
      "body": "Hello,\nI wanted to ask if you guys would say you're a more ethical alternative to apps like spotify? Are you against things such as the illegal occupation of Palestine?"},
+    # Real Play reviews whose device trailer carries a label name as a codename.
+    {"id": "device-codename-merlin-review-real", "expect": "handle", "signal": "none", "source": "real",
+     "product": "esound", "channel": "playstore_reviews", "lang": "en",
+     "body": "\U0001F44D give five stars\n\n---\napp_version: 5.2.6\napp_version_code: 834\nos: Android 12\ndevice: Redmi merlin (Redmi Note 9)\nreviewer_language: en"},
+    {"id": "device-codename-sony-tv-review-real", "expect": "handle", "signal": "none", "source": "real",
+     "product": "esound", "channel": "playstore_reviews", "lang": "en",
+     "body": "it is a very bad app because when I scanned the QR code it didn't work\n\n---\napp_version: 4.16.17\nos: Android 11\ndevice: Sony BRAVIA_VU1 (BRAVIA_VU)\ndevice_class: FORM_FACTOR_TV\nreviewer_language: en"},
     # Policy-ambiguous: the hard rule silences anything that "mentions" copyright,
     # yet this is a listener describing a playback error. Recorded, not scored.
     {"id": "song-copyright-issue-review-real", "expect": "observe", "signal": "none", "source": "real",

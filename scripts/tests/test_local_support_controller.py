@@ -2546,6 +2546,17 @@ async def t_legal_silence(_ctx: TestContext) -> None:
         assert lsc._requires_legal_silence(text) is True, text
     # "illegal" and a bare "violates" are also how customers talk, so alone
     # they only send the message to the classifier (which fails closed).
+    # Device codenames in the review trailer are not labels (real, 12-Sep and
+    # 29-Aug-2026: both reviews were silenced and tagged legal).
+    for review in (
+        "👍 give five stars\n\n---\napp_version: 5.2.6\nos: Android 12\n"
+        "device: Redmi merlin (Redmi Note 9)\nreviewer_language: en",
+        "it is a very bad app because when I scanned the QR code it didn't work\n\n---\n"
+        "device: Sony BRAVIA_VU1 (BRAVIA_VU)\ndevice_class: FORM_FACTOR_TV",
+    ):
+        assert lsc._requires_legal_silence(review) is False, review
+    assert lsc._requires_legal_silence(
+        "Sony Music requires removal of these recordings\n---\ndevice: Pixel 8") is True
     for text in ("the service is illegal in our territory",
                  "IT HAS TO BE ILLEGAL! This app is amazing",
                  "the app violates my patience lol ads everywhere"):
@@ -2680,9 +2691,9 @@ async def t_legal_corpus_layers(_ctx: TestContext) -> None:
         decided = (
             "legal-notice" in lsc._thread_tags(thread)
             or lsc._requires_legal_silence(entry["body"], subject, thread)
-            or bool(lsc._LEGAL_SILENCE.search(history))
+            or bool(lsc._LEGAL_SILENCE.search(lsc._legal_text(history)))
         )
-        cue = bool(lsc._LEGAL_CUE.search(f"{subject}\n{entry['body']}"))
+        cue = bool(lsc._LEGAL_CUE.search(lsc._legal_text(f"{subject}\n{entry['body']}")))
         if entry["expect"] == "silence":
             assert decided or cue, ("never reaches a decision", entry["id"])
             if entry["signal"] in {"strong", "sender", "tag", "history"}:
