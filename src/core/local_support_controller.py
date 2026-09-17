@@ -901,7 +901,17 @@ _LEGAL_SILENCE = re.compile(
     r"master license|unpaid royalties|revenue share|"
     r"investor|venture capital|due diligence|valuation|acquisition|merger|"
     r"term sheet|"
-    r"avvocato|studio legale|diffida|violazione del copyright|diritti d'autore"
+    r"avvocato|studio legale|diffida|violazione del copyright|diritti d'autore|"
+    # Platform enforcement letters (YouTube Legal, 17-set-2026) never say
+    # "copyright" or "lawyer": they cite terms, policies and a deadline. The
+    # first one missed every keyword above, fell into the human branch and got
+    # the "a colleague is taking this over" acknowledgement.
+    r"legal (?:team|department|dept|counsel|affairs|demand)|"
+    r"terms of (?:service|use) violations?|violations? of (?:the |our |its )?(?:terms|polic(?:y|ies))|"
+    r"(?:in )?violation of (?:the |our )?[\w .-]{0,40}(?:terms|polic(?:y|ies))|"
+    r"api services terms|developer polic(?:y|ies)|"
+    r"trademark|intellectual property|brand protection|counterfeit|"
+    r"cease (?:offering|and desist)|within \d+ (?:calendar |business )?days (?:from|of) the date of this (?:letter|notice)"
     r")\b"
     r"|\bi own the rights\b|\byou'?re using my music\b|\bremove my song\b"
     r"|\btake down my content\b|\byou owe me money\b|\bi want to invest\b"
@@ -910,8 +920,41 @@ _LEGAL_SILENCE = re.compile(
 )
 
 
-def _requires_legal_silence(text: str, subject: str = "") -> bool:
-    return bool(_LEGAL_SILENCE.search(f"{subject}\n{text}"))
+# Who sent it matters as much as what it says: a mailbox named legal@,
+# copyright@ or dmca@ is a legal notice whatever the wording.
+_LEGAL_SENDER = re.compile(
+    r"^(?:[^@]*[._+-])?(?:legal|copyright|dmca|takedown|ip[-_.]?enforcement|"
+    r"trademarks?|brand[-_.]?protection|lawyers?|counsel)"
+    r"(?:[._+-][^@]*)?@",
+    re.IGNORECASE,
+)
+
+
+def _legal_sender(thread: Any, payload: Any = None) -> bool:
+    messages = (thread or {}).get("messages", []) if isinstance(thread, dict) else []
+    handles = [
+        str(m.get(key) or "")
+        for m in messages
+        if isinstance(m, dict) and m.get("direction") == "inbound"
+        for key in ("author_handle", "reply_to_handle", "author_name")
+    ]
+    if isinstance(thread, dict):
+        handles += [str(thread.get(k) or "") for k in (
+            "first_inbound_author_handle", "last_inbound_author_handle")]
+        handles += [str(thread.get(k) or "") for k in (
+            "first_inbound_author_name", "last_inbound_author_name")]
+    message = (payload or {}).get("message", {}) if isinstance(payload, dict) else {}
+    if isinstance(message, dict):
+        handles += [str(message.get(k) or "") for k in ("author_handle", "reply_to_handle", "author_name")]
+    for handle in handles:
+        handle = handle.strip()
+        if _LEGAL_SENDER.match(handle) or ("@" not in handle and re.search(r"\blegal\b", handle, re.IGNORECASE)):
+            return True
+    return False
+
+
+def _requires_legal_silence(text: str, subject: str = "", thread: Any = None, payload: Any = None) -> bool:
+    return bool(_LEGAL_SILENCE.search(f"{subject}\n{text}")) or _legal_sender(thread, payload)
 
 
 # Support codes as they reach us: "WC014", "wc037", "error WC 014".
@@ -6379,7 +6422,7 @@ async def _notify_owner_legal(pool: Any, state: SupportState) -> None:
         "thread_id": state.thread_id,
         "subject": state.subject[:200],
         "excerpt": state.customer_message[:200],
-        "trigger": match.group(0) if match else "",
+        "trigger": match.group(0) if match else "legal sender",
     }
     text = (
         "LEGAL/COPYRIGHT — no reply sent, thread untouched.\n"
@@ -7068,7 +7111,7 @@ async def run(
             or _is_plain_latin(signal)
         ):
             state.facts["language"] = "en"
-    if _requires_legal_silence(message, state.subject):
+    if "legal" in _thread_tags(thread) or _requires_legal_silence(message, state.subject, thread, payload):
         # Silence overrides every other instruction, including answering an
         # otherwise ordinary-looking follow-up. No reply, no tag, no patch, no
         # task: the only action is telling the owner.

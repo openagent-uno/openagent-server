@@ -2525,8 +2525,34 @@ async def t_legal_silence(_ctx: TestContext) -> None:
         "I want to invest, are you raising?",
     ):
         assert lsc._requires_legal_silence(text) is True, text
-    for ordinary in ("the app crashes on open", "I want a refund", "premium is missing"):
+    for ordinary in ("the app crashes on open", "I want a refund", "premium is missing",
+                     "I read the terms of service, how do I cancel?",
+                     "my notifications stopped working"):
         assert lsc._requires_legal_silence(ordinary) is False, ordinary
+
+    # YouTube Legal, 17-set-2026: no "copyright", no "lawyer" - terms, policies
+    # and a deadline. It got the human-handoff acknowledgement.
+    youtube = (
+        "It appears Your Client is separating audio from the visuals of YouTube Content. "
+        "Your Client appears to be in violation of the YouTube API Services Terms of Service "
+        "and Developer Policies. Please immediately correct and cease offering Your Client "
+        "within 7 days from the date of this letter. Sincerely, The YouTube Legal Team"
+    )
+    assert lsc._requires_legal_silence(youtube, "YouTube Terms of Service Violation") is True
+    assert lsc._requires_legal_silence("hello", "YouTube Terms of Service Violation") is True
+    # The sender alone is enough, whatever the wording.
+    legal_thread = {"messages": [{"direction": "inbound",
+                                  "author_handle": "legal-youtube+0jz@google.com",
+                                  "body_text": "thanks"}]}
+    assert lsc._requires_legal_silence("thanks", "", legal_thread) is True
+    assert lsc._requires_legal_silence("thanks", "", {"messages": [
+        {"direction": "inbound", "author_name": "YouTube Legal", "author_handle": "x@google.com"}]}) is True
+    for handle in ("copyright@label.com", "dmca-agent@host.net", "ip.enforcement@brand.com"):
+        assert lsc._requires_legal_silence("hi", "", {"messages": [
+            {"direction": "inbound", "author_handle": handle}]}) is True, handle
+    for handle in ("legalize.it.fan@gmail.com", "mario@gmail.com", "noreply@google.com"):
+        assert lsc._requires_legal_silence("hi", "", {"messages": [
+            {"direction": "inbound", "author_handle": handle}]}) is False, handle
 
     notified: list[dict[str, Any]] = []
 
