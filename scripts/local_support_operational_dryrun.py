@@ -1004,8 +1004,16 @@ def _score_legal(
         if kind == "thread_tag":
             receipt = action.get("receipt") if isinstance(action.get("receipt"), dict) else {}
             tags = receipt.get("tags") if isinstance(receipt, dict) else None
-            if tags is not None and sorted(tags) not in (["legal"], ["legal", "legal-notice"]):
+            # _record_tags writes one tag per call, so each receipt holds one.
+            if tags is not None and not set(map(str, tags)) <= {"legal", "legal-notice"}:
                 errors.append("forbidden_tag:" + ",".join(map(str, tags)))
+    tagged = {
+        str(tag) for a in actions if a.get("kind") == "thread_tag" and a.get("success")
+        for tag in ((a.get("receipt") or {}).get("tags") or [])
+    }
+    if "legal-notice" not in tagged:
+        # The only tag that keeps a keyword-free follow-up silent.
+        errors.append("legal_notice_not_tagged")
     if not owner_notified:
         errors.append("owner_not_notified")
     if not any(a.get("kind") == "human_handoff" and a.get("success") for a in actions):
