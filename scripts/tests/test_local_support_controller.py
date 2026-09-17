@@ -2542,8 +2542,15 @@ async def t_legal_silence(_ctx: TestContext) -> None:
     assert lsc._requires_legal_silence("hello", "YouTube Terms of Service Violation") is True
     # Stronger words fire on their own.
     for text in ("your app violates our policies", "this is an infringement notice",
-                 "the service is illegal in our territory", "violazione dei termini"):
+                 "This violates YouTube's API Developer Policies", "violazione dei termini"):
         assert lsc._requires_legal_silence(text) is True, text
+    # "illegal" and a bare "violates" are also how customers talk, so alone
+    # they only send the message to the classifier (which fails closed).
+    for text in ("the service is illegal in our territory",
+                 "IT HAS TO BE ILLEGAL! This app is amazing",
+                 "the app violates my patience lol ads everywhere"):
+        assert lsc._requires_legal_silence(text) is False, text
+        assert lsc._LEGAL_CUE.search(text), text
     # Weak cues do not decide alone: a model reads the message.
     assert lsc._LEGAL_CUE.search("Please comply with our Terms within 7 days")
     assert not lsc._LEGAL_CUE.search("right now the app crashes")
@@ -2569,6 +2576,23 @@ async def t_legal_silence(_ctx: TestContext) -> None:
         assert await lsc._legal_with_model(_Agent(), {}, "what is your refund policy?", "s") is False
         # Fails closed: no verdict on a message with legal cues means silence.
         lsc._generate_support_model = unreachable
+        assert await lsc._legal_with_model(_Agent(), {}, "comply with our terms", "s") is True
+        # ...but only after a second attempt: one slow answer silenced two
+        # ordinary customers in the 17-Sep dry run.
+        calls: list[int] = []
+
+        async def slow_then_ordinary(*_a: Any, **_k: Any) -> Any:
+            calls.append(1)
+            if len(calls) == 1:
+                raise TimeoutError()
+            return _Resp('```json\n{"legal": false}\n```\n\nAn ordinary user.')
+        lsc._generate_support_model = slow_then_ordinary
+        assert await lsc._legal_with_model(_Agent(), {}, "no entiendo la política", "s") is False
+        assert len(calls) == 2
+        # A non-boolean answer is no answer.
+        async def says_maybe(*_a: Any, **_k: Any) -> Any:
+            return _Resp('{"legal": "maybe"}')
+        lsc._generate_support_model = says_maybe
         assert await lsc._legal_with_model(_Agent(), {}, "comply with our terms", "s") is True
     finally:
         lsc._generate_support_model = original
@@ -2628,6 +2652,106 @@ async def t_legal_silence(_ctx: TestContext) -> None:
     body = notified[0]["text"]
     for field in ("source:", "thread_id:", "subject:", "excerpt:", "trigger:"):
         assert field in body, (field, body)
+
+
+@test("local_support_controller", "legal corpus: every notice is silenced or read by the classifier, no customer by a keyword")
+async def t_legal_corpus_layers(_ctx: TestContext) -> None:
+    """The deterministic half of scripts/support_legal_corpus.py.
+
+    A notice that matches no keyword, no sender, no tag and no cue never
+    reaches the model: the bot answers it. That was true on 17-Sep-2026 for a
+    Russian and a Japanese notice, a Portuguese "notificação extrajudicial", a
+    Spanish court summons, a German law firm, the Garante, a real rights
+    holder's "I did not authorise my tracks", and "copyrighted". The other
+    direction: five real customers were silenced by "illegal" alone.
+    """
+    from scripts import support_legal_corpus as corpus
+    from src.core import local_support_controller as lsc
+
+    assert len(corpus.LEGAL) >= 40 and len(corpus.HANDLE) >= 25
+    for entry in corpus.LEGAL + corpus.HANDLE:
+        subject = entry.get("subject", "")
+        messages = [dict(item, direction="inbound") for item in entry.get("history", [])]
+        messages.append({"direction": "inbound", "body_text": entry["body"],
+                         "author_handle": entry.get("author_handle", ""),
+                         "author_name": entry.get("author_name", "")})
+        thread = {"tags": list(entry.get("tags", [])), "messages": messages}
+        history = "\n".join(m["body_text"] for m in messages)
+        decided = (
+            "legal" in lsc._thread_tags(thread)
+            or lsc._requires_legal_silence(entry["body"], subject, thread)
+            or bool(lsc._LEGAL_SILENCE.search(history))
+        )
+        cue = bool(lsc._LEGAL_CUE.search(f"{subject}\n{entry['body']}"))
+        if entry["expect"] == "silence":
+            assert decided or cue, ("never reaches a decision", entry["id"])
+            if entry["signal"] in {"strong", "sender", "tag", "history"}:
+                assert decided, ("keyword/sender/tag layer missed", entry["id"])
+        elif entry["expect"] == "handle":
+            assert not decided, ("silenced by a keyword", entry["id"])
+
+
+@test("local_support_controller", "legal sender in Replio's webhook shape and a keyword-free follow-up stay silent")
+async def t_legal_webhook_shape_and_history(_ctx: TestContext) -> None:
+    from src.core import local_support_controller as lsc
+
+    # Replio's thread_event_payload: sender next to `message`, not inside it;
+    # thread_brief: sender only in the nested summary.
+    assert lsc._legal_sender(None, {"payload": {
+        "thread_id": "t", "author_handle": "legal-youtube+0jz@google.com",
+        "message": {"body_text": "Thanks, we await your confirmation."}}}) is True
+    assert lsc._legal_sender({"thread": {"last_inbound_author_name": "YouTube Legal"},
+                              "messages": []}) is True
+    assert lsc._legal_sender({"messages": [{"direction": "inbound",
+                                            "author_handle": "depto.juridico@society.example"}]}) is True
+    assert lsc._legal_sender(None, {"payload": {"author_handle": "mario@gmail.com",
+                                                "author_name": "Mario Rossi"}}) is False
+
+    notified: list[str] = []
+
+    async def send_telegram(chat_id: str, text: str) -> dict[str, Any]:
+        notified.append(text)
+        return {"ok": True, "success": True}
+
+    class _NoModel:
+        async def generate(self, **_kwargs: Any) -> Any:
+            raise AssertionError("the thread history decides; no model call is needed")
+
+    follow_up = "Just following up on this, it would be helpful if you could come back to me"
+    doubles = _Doubles(thread={
+        "thread": {"id": "t-wcm", "subject": "WCM x Lyra Music", "tags": ["business"],
+                   "last_inbound_author_handle": "licensing.manager@publisher.example"},
+        "messages": [
+            {"direction": "inbound", "author_handle": "licensing.manager@publisher.example",
+             "body_text": "I'm reaching out on behalf of Warner Chappell Music to understand "
+                          "your current licensing arrangements."},
+            {"direction": "outbound", "body_text": "Thank you for reaching out."},
+            {"direction": "inbound", "author_handle": "licensing.manager@publisher.example",
+             "body_text": follow_up},
+        ],
+    })
+    pool = doubles.pool()
+    pool._toolkit_by_name["messaging"] = _Toolkit({"messaging_send_telegram": send_telegram})
+    previous = os.environ.get(lsc._WRITES_ENV)
+    os.environ[lsc._WRITES_ENV] = "1"
+    try:
+        output = json.loads((await lsc.run(
+            agent=SimpleNamespace(_mcp=pool, model=_NoModel()),
+            event={"slug": "replio-thread", "model": ""},
+            payload={"payload": {"thread_id": "t-wcm",
+                                 "author_handle": "licensing.manager@publisher.example",
+                                 "message": {"body_text": follow_up}}},
+            session_id="s", delivery_id="d",
+        )).text)
+    finally:
+        if previous is None:
+            os.environ.pop(lsc._WRITES_ENV, None)
+        else:
+            os.environ[lsc._WRITES_ENV] = previous
+    assert output["outcome"] == "legal_silence", output["outcome"]
+    assert output["reply"] == ""
+    assert "replio_threads_respond" not in doubles.names, doubles.names
+    assert notified, "the owner was never notified"
 
 
 @test("local_support_controller", "a Play review is answered in the reviewer's language")

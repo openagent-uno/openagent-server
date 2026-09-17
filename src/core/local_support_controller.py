@@ -889,7 +889,7 @@ def _is_praise(text: str, channel: str = "") -> bool:
 # the business branch when the same policy files it under silence.
 _LEGAL_SILENCE = re.compile(
     r"\b(?:"
-    r"copyright|dmca|takedown|take[- ]down|infringement|piracy|pirate|"
+    r"copyright(?:ed|s)?|dmca|takedown|take[- ]down|infringement|piracy|pirate|"
     r"unauthorized distribution|"
     r"lawsuit|litigation|subpoena|summons|injunction|cease and desist|"
     r"lawyer|attorney|solicitor|law firm|legal (?:action|notice|rights|representative)|"
@@ -911,13 +911,30 @@ _LEGAL_SILENCE = re.compile(
     r"(?:in )?violation of (?:the |our )?[\w .-]{0,40}(?:terms|polic(?:y|ies))|"
     r"api services terms|developer polic(?:y|ies)|"
     r"trademark|intellectual property|brand protection|counterfeit|"
-    r"violat(?:e|es|ed|ing|ion|ions)|infring(?:e|es|ed|ing|ement)|"
-    r"illegal|unlawful|illicit|non-?compliance|breach of (?:contract|terms|license|licence)|"
+    # "violation" and "infringe" are legal words. "violates" and "illegal"
+    # on their own are also how customers talk: "IT HAS TO BE ILLEGAL! This
+    # app is amazing", "ads everywhere, looks like an illegal website", "the
+    # app violates my patience" - five real threads that 0.21.10 silenced.
+    # Alone they are weak cues the model decides on; next to a legal object
+    # ("violates our policies") they still decide by themselves.
+    r"violation|violations|infring(?:e|es|ed|ing|ement|ements)|"
+    r"violat(?:e|es|ed|ing) (?:[\w'\u2019-]+ ){0,4}?(?:terms|polic(?:y|ies)|rights|copyrights?|"
+    r"trademarks?|licen[cs]es?|agreements?|laws?|guidelines|regulations?)|"
+    r"unlawful|illicit|non-?compliance|breach of (?:contract|terms|license|licence)|"
     r"regulator|regulatory|authorit(?:y|ies) (?:request|order|inquiry)|law enforcement|"
     r"violazione|violazioni|illecit[oaie]|diffidiamo|intimazione|"
     r"cease (?:offering|and desist)|within \d+ (?:calendar |business )?days (?:from|of) the date of this (?:letter|notice)"
     r")\b"
     r"|\bi own the rights\b|\byou'?re using my music\b|\bremove my song\b"
+    # A rights holder writing informally: "I did not authorise my tracks to
+    # be on Lyra. Remove them, unless you start paying" (real, April 2026).
+    # The classifier read it twice as an ordinary user asking for help.
+    r"|\b(?:i|we) (?:did not|didn'?t|never|have not|haven'?t|do not|don'?t) "
+    r"(?:authori[sz]e|consent|license|licence)\w*\b[^.\n]{0,20}"
+    r"\b(?:my|our) (?:own )?(?:tracks?|songs?|music|recordings?|works|catalog(?:ue)?|albums?)\b"
+    r"|\b(?:using|uses|used|available|offer(?:ing|ed|s)?|stream(?:ing|s|ed)?|"
+    r"distribut\w*|monetiz\w*|exploit\w*)\b[^.\n]{0,50}\bwithout (?:my|our|his|her|their|"
+    r"the artist'?s?|any) (?:permission|consent|authori[sz]ation|licen[cs]e)\b"
     r"|\btake down my content\b|\byou owe me money\b|\bi want to invest\b"
     r"|\bare you raising\b",
     re.IGNORECASE,
@@ -932,8 +949,25 @@ _LEGAL_CUE = re.compile(
     r"rights|liab(?:le|ility)|court|tribunal|jurisdiction|"
     r"counsel|demand|deadline|within \d+ (?:calendar |business )?days|"
     r"to whom it may concern|on behalf of|"
-    r"legale|termini|normativa|diritti|reclamo formale|per conto di|"
-    r"pol[ií]tica|t[eé]rminos|derechos|avis juridique|droits|rechtlich|anwalt|abmahnung)\b",
+    r"illegal|violat(?:e|es|ed|ing)|(?:un)?authori[sz](?:e|ed|ation)|licen[cs](?:e|es|ed|ing)|"
+    r"(?:remove|take down|delete) (?:all )?(?:of )?(?:my|our|them|these|those)(?: \w+)? "
+    r"(?:tracks|songs|music|recordings|works|catalog(?:ue)?|content)|"
+    r"legale|termini|normativa|diritti|diritto d'autore|reclamo formale|per conto di|"
+    r"avvocat[oiae]|garante|procedimento|entro \d+ giorni|"
+    r"pol[ií]tica|t[eé]rminos|derechos|abogad[oa]s?|juzgado|citaci[oó]n|requerimiento|"
+    r"jur[ií]dic[oa]s?|plazo de \d+|"
+    r"direitos|advogad[oa]s?|notifica[çc][ãa]o|extrajudicia(?:l|lmente)|prazo de \d+|"
+    r"avis juridique|droits|avocats?|mise en demeure|contrefa[çc]on|juridiction|"
+    r"rechtlich\w*|anwalt\w*|rechtsanwalt\w*|kanzlei|mandantin|mandant|abmahnung|"
+    r"unterlassung\w*|urheberrecht\w*|gericht\w*|"
+    r"telif|avukat|hukuk\w*)\b"
+    # Scripts with no word boundaries worth the name (CJK), and Cyrillic or
+    # Arabic legal stems: a notice written entirely in them carried no cue at
+    # all, so no model ever read it and the bot answered.
+    r"|(?:авторск|правообладател|нарушени|уведомлени|претензи|юрист|адвокат|суд[аеуо]?\b|"
+    r"著作権|権利|侵害|弁護士|法的|法律|版权|侵权|律师|法院|"
+    r"저작권|권리|침해|변호사|법적|"
+    r"حقوق|محامي|قانون|انتهاك)",
     re.IGNORECASE,
 )
 
@@ -944,6 +978,12 @@ async def _legal_with_model(agent: Any, event: dict, text: str, session_id: str)
     Fails CLOSED: a model that cannot answer on a message carrying legal cues
     means silence and a note to the owner. A customer kept waiting a few
     minutes costs less than an automated sentence in a legal file.
+
+    But a closed failure silences a customer too, so a single slow proxy
+    answer must not decide it: the dry run of 17-Sep-2026 timed out twice on
+    ordinary questions ("no entiendo la política de reembolso", "ist die App
+    rechtlich erlaubt?") under load, and both were silenced. One more attempt
+    before failing closed.
     """
     model = getattr(agent, "model", None)
     model_id = str(event.get("model") or "")
@@ -952,6 +992,19 @@ async def _legal_with_model(agent: Any, event: dict, text: str, session_id: str)
     if model is None:
         return True
     token = set_tool_allowlist([])
+    try:
+        for attempt in (1, 2):
+            verdict = await _legal_model_verdict(model, text, session_id)
+            if isinstance(verdict, bool):
+                return verdict
+            elog("support_controller.legal_classifier_failed", attempt=attempt, reason=verdict)
+        return True
+    finally:
+        reset_tool_allowlist(token)
+
+
+async def _legal_model_verdict(model: Any, text: str, session_id: str) -> bool | str:
+    """The classifier's boolean, or a short reason why there is none."""
     try:
         with strict_local_only_scope(True), stateless_completion_scope(True):
             response = await _generate_support_model(
@@ -962,28 +1015,36 @@ async def _legal_with_model(agent: Any, event: dict, text: str, session_id: str)
                     "any language: a legal, regulatory or platform-enforcement communication (terms of "
                     "service or policy violation notices from Google/YouTube/Apple/Meta or any company, "
                     "cease and desist, takedown, copyright/trademark/rights-holder claims, lawyers, "
-                    "courts, authorities, collecting societies, formal demands with deadlines), or an "
+                    "courts, authorities, collecting societies, formal demands with deadlines), an artist, "
+                    "label, publisher or rights owner saying their music is used without authorization "
+                    "or demanding its removal or payment (even when written informally), or an "
                     "investor/acquisition approach. Answer legal=false for an ordinary user asking for "
                     "help, even if they mention a refund policy, privacy, terms or say something is "
-                    "unfair. Output JSON only: {\"legal\": true|false}."
+                    "unfair or illegal. Output only the JSON object, with no explanation: "
+                    "{\"legal\": true|false}."
                 ),
                 session_id=f"{session_id}:support-legal",
                 timeout_env="OPENAGENT_ESOUND_CLASSIFIER_TIMEOUT_SECONDS",
             )
         verdict = (_extract_json(getattr(response, "content", "")) or {}).get("legal")
-        return verdict is not False
-    except Exception:
-        return True
-    finally:
-        reset_tool_allowlist(token)
+        return verdict if isinstance(verdict, bool) else "no_boolean_verdict"
+    except Exception as exc:  # noqa: BLE001 - the caller fails closed
+        return type(exc).__name__
 
 
 # Who sent it matters as much as what it says: a mailbox named legal@,
 # copyright@ or dmca@ is a legal notice whatever the wording.
 _LEGAL_SENDER = re.compile(
-    r"^(?:[^@]*[._+-])?(?:legal|copyright|dmca|takedown|ip[-_.]?enforcement|"
-    r"trademarks?|brand[-_.]?protection|lawyers?|counsel)"
+    r"^(?:[^@]*[._+-])?(?:legal|legale|copyright|dmca|takedown|ip[-_.]?enforcement|"
+    r"trademarks?|brand[-_.]?protection|lawyers?|counsel|attorneys?|"
+    r"juridico|juridica|juridique|avvocat[oi]|abogados?|advogados?|anwalt|kanzlei)"
     r"(?:[._+-][^@]*)?@",
+    re.IGNORECASE,
+)
+# A display name that says what the mailbox is: "YouTube Legal", "Sony
+# Copyright", "Departamento Jurídico". Replio's guard reads the same names.
+_LEGAL_SENDER_NAME = re.compile(
+    r"\b(?:legal|copyright|dmca|jur[ií]dic[oa]|juridique|ufficio legale|rechtsabteilung)\b",
     re.IGNORECASE,
 )
 
@@ -996,17 +1057,25 @@ def _legal_sender(thread: Any, payload: Any = None) -> bool:
         if isinstance(m, dict) and m.get("direction") == "inbound"
         for key in ("author_handle", "reply_to_handle", "author_name")
     ]
-    if isinstance(thread, dict):
-        handles += [str(thread.get(k) or "") for k in (
-            "first_inbound_author_handle", "last_inbound_author_handle")]
-        handles += [str(thread.get(k) or "") for k in (
+    # The brief nests the summary under `thread`; a threads_get result is flat.
+    summaries = [thread] if isinstance(thread, dict) else []
+    if isinstance(thread, dict) and isinstance(thread.get("thread"), dict):
+        summaries.append(thread["thread"])
+    for summary in summaries:
+        handles += [str(summary.get(k) or "") for k in (
+            "first_inbound_author_handle", "last_inbound_author_handle",
             "first_inbound_author_name", "last_inbound_author_name")]
-    message = (payload or {}).get("message", {}) if isinstance(payload, dict) else {}
-    if isinstance(message, dict):
-        handles += [str(message.get(k) or "") for k in ("author_handle", "reply_to_handle", "author_name")]
+    # Replio's webhook puts the sender at the top of the event payload, next
+    # to `message`, not inside it. Reading only `message` meant the sender the
+    # webhook named was never looked at: only the brief could catch it.
+    if isinstance(payload, dict):
+        for key in ("author_handle", "reply_to_handle", "author_name"):
+            value = _first_value(payload, (key,))
+            if isinstance(value, str):
+                handles.append(value)
     for handle in handles:
         handle = handle.strip()
-        if _LEGAL_SENDER.match(handle) or ("@" not in handle and re.search(r"\blegal\b", handle, re.IGNORECASE)):
+        if _LEGAL_SENDER.match(handle) or ("@" not in handle and _LEGAL_SENDER_NAME.search(handle)):
             return True
     return False
 
@@ -7158,8 +7227,14 @@ async def run(
             or _is_plain_latin(signal)
         ):
             state.facts["language"] = "en"
+    # The earlier inbound turns count too: a rights holder's "just following
+    # up on this" carries no keyword, and the licensing demand it follows up
+    # on is two messages up. Keywords only there - the model reads the new
+    # message alone, so a customer who once wrote "refund policy" does not
+    # pay a classifier call on every later turn.
     legal_silence = "legal" in _thread_tags(thread) or _requires_legal_silence(
-        message, state.subject, thread, payload)
+        message, state.subject, thread, payload) or bool(
+        _LEGAL_SILENCE.search(state.thread_customer_text or ""))
     if not legal_silence and _LEGAL_CUE.search(f"{state.subject}\n{message}"):
         legal_silence = await _legal_with_model(
             agent, event, f"Subject: {state.subject}\n\n{message}", session_id)
