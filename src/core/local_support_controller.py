@@ -5924,6 +5924,13 @@ def _strip_report_metadata(message: str) -> str:
 # "downloa|d |". A stem still matches its own inflections ("riproduz" ->
 # riproduzione, "reproduc" -> reproducción/reprodução), which is what the
 # multilingual vocabulary below relies on.
+_BILLING_TERMS: tuple[str, ...] = (
+    "purchase", "acquist", "refund", "rimbors", "reembols", "billing", "fattur",
+)
+_SUBSCRIBER_STATUS_TERMS: tuple[str, ...] = (
+    "premium", "abbonament", "subscription", "suscripcion", "assinatura",
+    "abonnement",
+)
 _DIAGNOSTIC_ROUTES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("playlist", "lista de reproduccion", "lista de reproducao"), "playlists"),
     # No bare "ad": in Italian `ad` is the euphonic form of the preposition
@@ -5934,9 +5941,13 @@ _DIAGNOSTIC_ROUTES: tuple[tuple[tuple[str, ...], str], ...] = (
     # Purchases sits above auth so an explicit billing word wins: "account" is
     # the commonest word in both kinds of report, and a refund thread that
     # merely mentions the account is not an authentication fault.
-    (("purchase", "premium", "acquist", "abbonament", "subscription",
-      "suscripcion", "assinatura", "abonnement", "refund", "rimbors",
-      "reembols", "billing", "fattur"), "purchases"),
+    (_BILLING_TERMS, "purchases"),
+    # Being a subscriber is not a billing fault. "ho pagato un premium" is how
+    # a paying customer asks to be taken seriously about something else, and
+    # above playback it captured `purchases` for a 12-second track load
+    # (thread eee46c2b, 18-set-2026). These words still outrank auth, so
+    # "il mio account premium non si attiva" stays a purchase report.
+    (_SUBSCRIBER_STATUS_TERMS, "purchases"),
     (("login", "log in", "sign in", "signin", "auth", "accesso", "accedere",
       "iniciar sesion", "connexion", "password", "passwort", "account",
       "cuenta", "conta", "compte", "konto", "registrar", "registrat"), "auth"),
@@ -5966,6 +5977,10 @@ _DIAGNOSTIC_ROUTE_PATTERNS: tuple[tuple[Any, str], ...] = tuple(
     for terms, category in _DIAGNOSTIC_ROUTES
 )
 
+_BILLING_PATTERN = re.compile(
+    r"\b(?:%s)" % "|".join(re.escape(t) for t in _BILLING_TERMS)
+)
+
 
 def _fold_accents(text: str) -> str:
     """`música` -> `musica`, `reprodução` -> `reproducao`, `écoute` -> `ecoute`.
@@ -5983,11 +5998,23 @@ def _fold_accents(text: str) -> str:
 
 def _diagnostic_category(message: str) -> str:
     """Pick one narrow, product-supported capture category from the symptom."""
-    low = _fold_accents(_strip_report_metadata(message)).lower()
-    for pattern, category in _DIAGNOSTIC_ROUTE_PATTERNS:
-        if pattern.search(low):
-            return category
-    return "general"
+    # `_route_text`, not just the trailer: the form's own "Hai gia' acquistato
+    # Premium?: Si'" matched `acquist`, so every web-form playback report
+    # captured `purchases` - one log line, for a successful purchase - and the
+    # player logs were never switched on.
+    low = _fold_accents(_route_text(message)).lower()
+    matched = [
+        category for pattern, category in _DIAGNOSTIC_ROUTE_PATTERNS
+        if pattern.search(low)
+    ]
+    if not matched:
+        return "general"
+    # The subscriber-status route sits above playback only to beat auth; a
+    # symptom the customer actually describes beats it.
+    if (matched[0] == "purchases" and "playback" in matched
+            and not _BILLING_PATTERN.search(low)):
+        return "playback"
+    return matched[0]
 
 
 # One category is not a capture, it is a slice of one. A failure to play shows
@@ -6056,10 +6083,14 @@ def _result_items(result: Any) -> list[Any]:
 
 
 async def _resolve_diagnostic_identity(
-    pool: Any, state: SupportState,
+    pool: Any, state: SupportState, *, app_account: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     server = "lyra-admin" if state.tenant.key == "lyra" else "esound-admin"
-    lookup_query = state.account_email or state.account_ref
+    # A capture only answers from the account the app is signed into. Reads
+    # whose answer goes back to the customer pass app_account=False: the form
+    # is a public POST, and its declared address is not proof of ownership.
+    declared = str(state.facts.get("form_account_email") or "") if app_account else ""
+    lookup_query = declared or state.account_email or state.account_ref
     if not lookup_query:
         return server, {}
     _tool, lookup = await _call_first(
@@ -6088,7 +6119,8 @@ async def _resolve_diagnostic_identity(
 
 async def _read_referral_status(pool: Any, state: SupportState) -> dict[str, Any]:
     try:
-        server, identity = await _resolve_diagnostic_identity(pool, state)
+        server, identity = await _resolve_diagnostic_identity(
+            pool, state, app_account=False)
         if not identity:
             return {}
         tool, result = await _call_first(pool, server,
@@ -7563,6 +7595,16 @@ async def run(
                 if not app_user_id:
                     app_user_id = str(profile.get("identity_id") or "").strip()
                 state.facts["brief_premium_active"] = profile.get("is_premium") is True
+        # The account the APP was signed into when the form was sent. The
+        # sender address is whoever wrote the e-mail: on 18-set-2026 a customer
+        # signed in through Facebook wrote from Gmail, the lookup found an
+        # empty Gmail account of his, and his capture ran on an account whose
+        # app nobody opens. Diagnostics follow the app, so they use this.
+        declared_email = str(
+            (_form_fields_in_thread(thread, message).get("account_email") or "")
+        ).strip()
+        if declared_email:
+            state.facts["form_account_email"] = declared_email
         if not email:
             # The address the form declared, from ANY message on the thread.
             # `_extract_email` falls back to a regex over the message in hand,
@@ -7575,9 +7617,7 @@ async def run(
             # because his reply was the word "directly from there" and his
             # signature. Read the declared field, not any address in the prose:
             # a quoted support address must never become the account we check.
-            email = str(
-                (_form_fields_in_thread(thread, message).get("account_email") or "")
-            ).strip()
+            email = declared_email
             if email:
                 state.facts["account_email_from_thread"] = True
         if not email:

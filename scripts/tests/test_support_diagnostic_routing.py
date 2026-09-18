@@ -213,3 +213,58 @@ async def t_form_questions_do_not_route_the_task(_ctx: TestContext):
         "Songs are not working, the next track never starts" + _FORM_TRAILER
     )
     assert en is not None and "purchase" not in en[0], en
+
+
+@test("support_diagnostic_routing", "the web form's own questions never pick the capture category")
+async def t_form_questions_do_not_route_the_capture(_ctx: TestContext):
+    # The task route already skipped "Hai gia' acquistato Premium?"; the capture
+    # route did not, so EVERY web-form playback report captured `purchases`.
+    questions = (
+        "Hai già acquistato Premium?: Sì\nDove hai acquistato Premium?: Google Play\n\n"
+    )
+    assert c._diagnostic_category(
+        questions + "i brani sono lenti a caricare" + _FORM_TRAILER) == "playback"
+    # A customer really writing about a purchase still routes there.
+    assert c._diagnostic_category(
+        questions + "Ho pagato il premium ma non si attiva" + _FORM_TRAILER) == "purchases"
+
+
+@test("support_diagnostic_routing", "being a subscriber does not outrank the symptom")
+async def t_subscriber_status_loses_to_playback(_ctx: TestContext):
+    # eSound, 18-set-2026: "carica per 12 secondi prima di riprodurre, ho pagato
+    # un premium" captured `purchases`; the player logs that held the answer
+    # were never switched on.
+    assert c._diagnostic_category(
+        "quando procedo nella riproduzione brani carica per 12 secondi prima di "
+        "riprodurre, ho pagato un premium e vorrei che risolvessimo in fretta"
+    ) == "playback"
+    assert c._diagnostic_category("I'm premium but songs stop playing") == "playback"
+    # An explicit billing act still wins over the symptom it complains about.
+    assert c._diagnostic_category("refund please, songs stop playing") == "purchases"
+    # ...and status words alone still beat `account`.
+    assert c._diagnostic_category("il mio account premium non si attiva") == "purchases"
+
+
+@test("support_diagnostic_routing", "a capture targets the account the app declared, not the sender")
+async def t_capture_uses_declared_account(_ctx: TestContext):
+    from unittest.mock import AsyncMock, patch
+
+    looked_up: list[str] = []
+
+    async def fake_call_first(_pool, _server, _names, args, required=False):
+        looked_up.append(args["query"])
+        return "search_users", {"users": [{"userId": 7}]}
+
+    state = c.SupportState("t", "i brani non partono", tenant=c._TENANTS["esound"])
+    state.account_email = "sender@example.com"
+    state.facts["form_account_email"] = "app-account@example.com"
+    with patch.object(c, "_call_first", AsyncMock(side_effect=fake_call_first)), \
+            patch.object(c, "_succeeded", lambda _r: True):
+        _server, identity = await c._resolve_diagnostic_identity(None, state)
+        assert identity == {"userId": 7}, identity
+        assert looked_up == ["app-account@example.com"], looked_up
+        # A read whose answer goes back to the customer keeps the verified
+        # identity: the form is a public POST, not proof of ownership.
+        looked_up.clear()
+        await c._resolve_diagnostic_identity(None, state, app_account=False)
+        assert looked_up == ["sender@example.com"], looked_up
